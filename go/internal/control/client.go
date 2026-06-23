@@ -104,7 +104,14 @@ func (c *Client) WaitGone(timeout time.Duration) bool {
 // A second instance is harmless: the daemon refuses to start when the socket is
 // already owned. The control plane can always spawn itself (CanHost returns
 // nil); the child's stdout and stderr append to the daemon log.
+//
+// The state dir is created first: the spawn opens LogPath before the daemon
+// process runs, so on a cold machine the log's parent (~/.cc-squash) must
+// already exist or the spawn fails ENOENT before the daemon ever starts.
 func (c *Client) EnsureRunning(timeout time.Duration) bool {
+	if err := paths.EnsureStateDir(); err != nil {
+		return false
+	}
 	return proc.Spawn{
 		Socket:    c.socket,
 		Args:      []string{"daemon"},

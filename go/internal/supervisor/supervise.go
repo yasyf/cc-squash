@@ -10,15 +10,34 @@ package supervisor
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/fusekit/version"
 )
 
 // SuperviseInterval is the proxy supervision cadence: a crashed proxy is
 // respawned (and live sessions re-minted) within ~10s rather than waiting on a
 // human.
 const SuperviseInterval = 10 * time.Second
+
+// proxyDevVersion is the version an unstamped dev build of ccs-proxy reports —
+// env!("CARGO_PKG_VERSION") from crates/Cargo.toml's [workspace.package]. The Go
+// daemon supervises the proxy against ProxyVersion(), which falls back to this
+// when its own build carries no -ldflags version, so a dev build of BOTH
+// binaries agrees and the supervisor never reads a same-repo proxy as
+// version-skewed. version_test.go asserts this equals the Cargo workspace
+// version, so a bump that drifts the two is a red test rather than a silent
+// return of the replace-loop flap.
+const proxyDevVersion = "0.1.0"
+
+// superviseIntervalEnv lets a test shrink the supervision cadence so a respawn
+// is detected in milliseconds rather than a full production tick. Parsed as a
+// Go duration (e.g. "50ms"); unset or unparseable falls back to
+// SuperviseInterval. Production never sets it.
+const superviseIntervalEnv = "CCS_SUPERVISE_INTERVAL"
 
 const (
 	// spawnBackoffBase / spawnBackoffCap bound the respawn backoff: consecutive
@@ -57,9 +76,10 @@ func BuildSupervisor(spawn proc.Spawn, policy proc.Policy, myVersion string) *pr
 
 // SuperviseLoop drives sup.Tick on a fixed cadence until ctx is cancelled. proc
 // owns no ticker — the consumer drives the loop — so this is the proxy's
-// supervision heartbeat.
+// supervision heartbeat. The cadence is SuperviseInterval unless
+// CCS_SUPERVISE_INTERVAL shrinks it (test-only).
 func SuperviseLoop(ctx context.Context, sup *proc.Supervisor) {
-	ticker := time.NewTicker(SuperviseInterval)
+	ticker := time.NewTicker(superviseInterval())
 	defer ticker.Stop()
 	for {
 		select {
@@ -69,4 +89,43 @@ func SuperviseLoop(ctx context.Context, sup *proc.Supervisor) {
 			sup.Tick(ctx)
 		}
 	}
+}
+
+// superviseInterval resolves the supervision cadence: CCS_SUPERVISE_INTERVAL
+// parsed as a Go duration when set and valid, else SuperviseInterval.
+func superviseInterval() time.Duration {
+	if d, err := time.ParseDuration(os.Getenv(superviseIntervalEnv)); err == nil && d > 0 {
+		return d
+	}
+	return SuperviseInterval
+}
+
+// ProxyVersion is the version the daemon supervises the ccs-proxy child at — the
+// version a same-repo proxy is expected to register, so the supervisor only
+// reads a GENUINELY skewed (on-disk-upgraded) proxy as needing a replace. It is
+// deliberately distinct from version.String() (the daemon's own display version,
+// which also drives the daemon-vs-daemon peer-evict check): the proxy's version
+// is minted by Cargo, not by the Go -ldflags, so the two are compared across a
+// toolchain boundary and must be reconciled to a common shape.
+//
+// Reconciliation: a release Go build carries -ldflags "v0.1.0" (and version.String
+// appends " (commit)" when Commit is set) while Cargo emits a bare "0.1.0", so the
+// semver field is taken (first whitespace-delimited token, dropping any commit
+// suffix) and a leading "v" is stripped. An unstamped dev build reports "dev",
+// which falls back to proxyDevVersion ("0.1.0") so a dev build of both binaries
+// agrees. Only the leading "v" prefix is stripped, so a Cargo prerelease like
+// "0.2.0-rc.1" round-trips untouched.
+func ProxyVersion() string {
+	return normalizeProxyVersion(version.String())
+}
+
+// normalizeProxyVersion reconciles the daemon's display version into the version
+// the ccs-proxy reports: an unstamped "dev" falls back to proxyDevVersion, and
+// any stamped version is reduced to its semver field (first whitespace token,
+// dropping a " (commit)" suffix) with a leading "v" stripped.
+func normalizeProxyVersion(displayVersion string) string {
+	if displayVersion == "dev" {
+		return proxyDevVersion
+	}
+	return strings.TrimPrefix(strings.Fields(displayVersion)[0], "v")
 }

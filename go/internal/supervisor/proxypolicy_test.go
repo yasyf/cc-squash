@@ -32,7 +32,7 @@ func shortHome(t *testing.T) {
 // policy's NoteRegistered, and returns the policy plus a function that connects a
 // fake child and registers it. repushed counts how many times the policy fired
 // the re-push callback.
-func liveSeam(t *testing.T) (policy *ProxyPolicy, connectChild func() net.Conn, repushed *atomic.Int32) {
+func liveSeam(t *testing.T) (policy *ProxyPolicy, connectChild func(version string) net.Conn, repushed *atomic.Int32) {
 	t.Helper()
 	shortHome(t)
 	seam, err := proxyseam.NewServer(log.New(io.Discard, "", 0))
@@ -48,14 +48,14 @@ func liveSeam(t *testing.T) (policy *ProxyPolicy, connectChild func() net.Conn, 
 	t.Cleanup(cancel)
 	go seam.Start(ctx, policy.NoteRegistered)
 
-	connectChild = func() net.Conn {
+	connectChild = func(version string) net.Conn {
 		conn, derr := net.DialTimeout("unix", paths.ProxySocketPath(), time.Second)
 		if derr != nil {
 			t.Fatalf("child dial: %v", derr)
 		}
 		t.Cleanup(func() { _ = conn.Close() })
 		frame, _ := proxyseam.Encode(proxyseam.Register{
-			Type: proxyseam.MsgRegister, Port: 50515, Version: "v9.9.9", PID: os.Getpid(),
+			Type: proxyseam.MsgRegister, Port: 50515, Version: version, PID: os.Getpid(),
 		})
 		if _, werr := conn.Write(frame); werr != nil {
 			t.Fatalf("child register: %v", werr)
@@ -89,7 +89,7 @@ func TestProxyPolicyProbeAndPeerAlive(t *testing.T) {
 		t.Fatal("PeerAlive true before any child connected")
 	}
 
-	conn := connectChild()
+	conn := connectChild("v9.9.9")
 	waitRegistered(t, policy)
 
 	v := policy.Probe()
@@ -135,7 +135,7 @@ func TestProxyPolicyReconcileRespawnRepushes(t *testing.T) {
 
 func TestProxyPolicyReconcileChildDiedClearsIdentity(t *testing.T) {
 	policy, connectChild, _ := liveSeam(t)
-	connectChild()
+	connectChild("v9.9.9")
 	waitRegistered(t, policy)
 
 	policy.Reconcile(context.Background(), proc.ReconcileEvent{Kind: proc.ChildDied})
@@ -159,7 +159,7 @@ func TestProxyPolicyKillNoPid(t *testing.T) {
 
 func TestProxyPolicyWaitGone(t *testing.T) {
 	policy, connectChild, _ := liveSeam(t)
-	conn := connectChild()
+	conn := connectChild("v9.9.9")
 	waitRegistered(t, policy)
 
 	// Still connected: WaitGone times out (the child has not left).
@@ -176,7 +176,7 @@ func TestProxyPolicyWaitGone(t *testing.T) {
 
 func TestProxyPolicyShutdownSendsOverSeam(t *testing.T) {
 	policy, connectChild, _ := liveSeam(t)
-	conn := connectChild()
+	conn := connectChild("v9.9.9")
 	waitRegistered(t, policy)
 
 	if err := policy.Shutdown(context.Background()); err != nil {
@@ -195,5 +195,100 @@ func TestProxyPolicyShutdownSendsOverSeam(t *testing.T) {
 	}
 	if _, ok := msg.(proxyseam.Shutdown); !ok {
 		t.Fatalf("child got %T, want Shutdown", msg)
+	}
+}
+
+// readShutdown reports whether a Shutdown frame reached the child within d. A
+// real Tick that decides to Replace calls Policy.Shutdown, which sends exactly
+// this frame; a steady-state Tick sends nothing, so the read times out. This is
+// the observable that tells a converged supervisor from one that re-replaces.
+func readShutdown(t *testing.T, child net.Conn, d time.Duration) bool {
+	t.Helper()
+	buf := make([]byte, 256)
+	_ = child.SetReadDeadline(time.Now().Add(d))
+	switch n, err := child.Read(buf); {
+	case err != nil:
+		return false // timed out: no frame sent
+	default:
+		msg, derr := proxyseam.Decode(buf[:n-1])
+		if derr != nil {
+			t.Fatalf("decode frame the child received: %v", derr)
+		}
+		if _, ok := msg.(proxyseam.Shutdown); !ok {
+			t.Fatalf("child received %T, want Shutdown", msg)
+		}
+		return true
+	}
+}
+
+// TestSupervisorTickConvergesOnMatchedVersion drives a REAL proc.Supervisor.Tick
+// against a real registering proxy — the path the unit suite previously skipped
+// (it only drove Tick against stub Probes that never matched a registered
+// version against MyVersion). It pins the exact defect that flapped the proxy:
+// a Tick whose MyVersion matches the proxy's registered version must NOT replace
+// it, while a skewed MyVersion must. The match case uses ProxyVersion() and the
+// proxy's real dev report, so it regression-guards the version-skew loop end to
+// end.
+func TestSupervisorTickConvergesOnMatchedVersion(t *testing.T) {
+	cases := []struct {
+		id              string
+		registered      string // version the proxy registers with
+		myVersion       string // version the supervisor runs at
+		wantReplaceTick bool   // a Tick should send a Shutdown (replace) iff true
+	}{
+		{
+			id:              "matched dev version is steady state",
+			registered:      proxyDevVersion,
+			myVersion:       ProxyVersion(),
+			wantReplaceTick: false,
+		},
+		{
+			id:              "genuinely skewed version replaces",
+			registered:      "0.1.0",
+			myVersion:       "0.2.0",
+			wantReplaceTick: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.id, func(t *testing.T) {
+			policy, connectChild, _ := liveSeam(t)
+			child := connectChild(c.registered)
+			waitRegistered(t, policy)
+
+			// A no-op spawn keeps a replace from exec'ing a real binary; Available
+			// reports the seam's live registration so EnsureRunning short-circuits.
+			// The supervisor still drives the full Tick -> isSkew -> (Replace ->
+			// Shutdown) decision over the real seam.
+			spawn := proc.Spawn{
+				Socket:    paths.ProxySocketPath(),
+				Available: policy.Registered,
+				CanHost:   func() error { return nil },
+				Override:  func() error { return nil },
+			}
+			// goneWait/spawn-timeout cap the replace legs to the test's timescale: on
+			// the replace path the child drops its seam right after the Shutdown (the
+			// proxy stepping down), so WaitGone returns promptly rather than running to
+			// a production-length deadline.
+			sup := BuildSupervisor(spawn, policy, c.myVersion)
+			sup.GoneWait = time.Second
+
+			done := make(chan struct{})
+			go func() { defer close(done); sup.Tick(context.Background()) }()
+
+			got := readShutdown(t, child, 500*time.Millisecond)
+			if got {
+				_ = child.Close() // the proxy steps down: release the seam so WaitGone returns
+			}
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("Tick did not return; a replace leg blocked past its bound")
+			}
+
+			if got != c.wantReplaceTick {
+				t.Fatalf("Tick at MyVersion=%q against registered=%q sent shutdown=%v, want replace=%v",
+					c.myVersion, c.registered, got, c.wantReplaceTick)
+			}
+		})
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -27,6 +28,12 @@ const evictTimeout = 5 * time.Second
 // mintReadyTimeout bounds how long OpMint waits for a cold-started proxy to
 // register before it falls open and replies with whatever it knows.
 const mintReadyTimeout = 3 * time.Second
+
+// proxyStartupGrace bounds how long bringUp waits for the first proxy to
+// register before starting the supervise loop anyway — long enough for a normal
+// bind+connect+register (sub-second), so the first tick never races a healthy
+// cold start into a spurious respawn.
+const proxyStartupGrace = 5 * time.Second
 
 // Server is the cc-squash control-plane daemon: it binds the control socket
 // (single-entrant under a flock), binds the proxy.sock seam, spawns and
@@ -168,6 +175,16 @@ func (s *Server) serve(ctx context.Context) error {
 // seam accept loop (capturing the proxy's register), spawns the data-plane
 // child, builds the supervisor, and drives the supervise loop until ctx is
 // cancelled.
+//
+// The supervise loop only starts once the first proxy has registered (or the
+// startup grace elapses): the spawn-and-wait here and the loop's revive are two
+// spawn entry points, and a tick that fires before the just-spawned proxy
+// registers would read it unreachable, spuriously fire ChildDied (clearing
+// identity, burning a crash-loop count), and exec a SECOND proxy that binds a
+// different ephemeral port and orphans. Waiting on proxyReady collapses the two
+// entry points into one. A proxy that never registers falls through after the
+// grace to the loop's normal revive/backoff — the genuinely-dead-on-startup
+// case the supervisor exists to handle.
 func (s *Server) bringUp(ctx context.Context) {
 	go s.seam.Start(ctx, s.onRegister)
 
@@ -181,7 +198,14 @@ func (s *Server) bringUp(ctx context.Context) {
 	if err := spawn.EnsureRunning(); err != nil {
 		s.log.Printf("spawn proxy: %v", err)
 	}
-	s.sup = supervisor.BuildSupervisor(spawn, s.policy, version.String())
+	select {
+	case <-s.proxyReady:
+	case <-ctx.Done():
+		return
+	case <-time.After(proxyStartupGrace):
+		s.log.Printf("proxy did not register within %s; starting supervision (revive will retry)", proxyStartupGrace)
+	}
+	s.sup = supervisor.BuildSupervisor(spawn, s.policy, supervisor.ProxyVersion())
 	supervisor.SuperviseLoop(ctx, s.sup)
 }
 
@@ -189,6 +213,13 @@ func (s *Server) bringUp(ctx context.Context) {
 // (status mirror + port-file), and unblocks any OpMint waiting on the cold
 // start. Runs on the seam's accept goroutine.
 func (s *Server) onRegister(reg proxyseam.Register) {
+	if want := supervisor.ProxyVersion(); reg.Version != want {
+		// The registered proxy is not the version this daemon supervises against, so
+		// the supervisor will Replace it every tick (it reads any other version as a
+		// skewed, on-disk-upgraded child) — the proxy flaps until the operator
+		// restarts the daemon so both converge on the on-disk binary.
+		s.log.Printf("WARNING: proxy version %q != supervised version %q; the supervisor will keep replacing it — restart the daemon to converge", reg.Version, want)
+	}
 	s.policy.NoteRegistered(reg)
 	s.mu.Lock()
 	s.proxyPort = reg.Port
@@ -204,10 +235,13 @@ func (s *Server) onRegister(reg proxyseam.Register) {
 }
 
 // spawnProxyChild is the proc.Spawn.Override: it execs the detached Rust
-// ccs-proxy on the seam socket with an ephemeral TCP port, routed through the
-// spawnProxy seam so tests inject a fake child the same way production spawns
-// the real one. Returns nil so a started child is awaited by EnsureRunning's
-// come-up loop (the child registers, flipping Available true).
+// ccs-proxy on the seam socket, routed through the spawnProxy seam so tests
+// inject a fake child the same way production spawns the real one. The port is
+// read dynamically (currentProxyPort): 0 lets the OS assign one on the very
+// first start, and the prior registered port is reused on every respawn, so a
+// crash-replaced proxy re-binds the SAME port and every outstanding `ccs url`
+// token keeps resolving. Returns nil so a started child is awaited by
+// EnsureRunning's come-up loop (the child registers, flipping Available true).
 func (s *Server) spawnProxyChild() error {
 	if s.spawnProxy != nil {
 		return s.spawnProxy()
@@ -221,7 +255,7 @@ func (s *Server) spawnProxyChild() error {
 		return err
 	}
 	defer func() { _ = logFile.Close() }()
-	cmd := exec.Command(bin, "--socket", s.proxySock, "--port", "0")
+	cmd := exec.Command(bin, "--socket", s.proxySock, "--port", strconv.Itoa(s.currentProxyPort()))
 	cmd.Stdin = nil
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from our session
@@ -230,6 +264,17 @@ func (s *Server) spawnProxyChild() error {
 	}
 	go func() { _ = cmd.Wait() }() // reap so the exited child never strands a zombie
 	return nil
+}
+
+// currentProxyPort is the port the next spawned proxy must bind: 0 before any
+// proxy has registered (OS-assigned on the first start), the prior registered
+// port thereafter. Reading it per spawn is what pins a respawned proxy to the
+// same port — onRegister captures it once and ChildDied leaves it intact across
+// a crash, so the replacement re-binds it and live tokens survive.
+func (s *Server) currentProxyPort() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.proxyPort
 }
 
 // listen binds the control socket single-entrant under a flock, refusing a live
