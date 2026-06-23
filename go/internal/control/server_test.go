@@ -91,6 +91,45 @@ func (f *fakeProxy) readMint() (string, error) {
 	return tok, nil
 }
 
+// readFrame blocks until the daemon pushes one control frame and returns it
+// decoded — the generic counterpart of readMint, used to observe the shutdown
+// frame the teardown sends.
+func (f *fakeProxy) readFrame() (any, error) {
+	f.mu.Lock()
+	reader := f.reader
+	f.mu.Unlock()
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		return nil, err
+	}
+	return proxyseam.Decode(line[:len(line)-1])
+}
+
+// stepDownOnShutdown drains frames until a Shutdown arrives, then closes the
+// seam connection — modelling the real proxy stepping down so the daemon's
+// WaitGone observes the drop. It reports the observed shutdown on a channel.
+func (f *fakeProxy) stepDownOnShutdown(t *testing.T) <-chan struct{} {
+	t.Helper()
+	seen := make(chan struct{})
+	go func() {
+		for {
+			msg, err := f.readFrame()
+			if err != nil {
+				return
+			}
+			if _, ok := msg.(proxyseam.Shutdown); ok {
+				f.mu.Lock()
+				conn := f.conn
+				f.mu.Unlock()
+				_ = conn.Close()
+				close(seen)
+				return
+			}
+		}
+	}()
+	return seen
+}
+
 // startServer runs srv.Run in the background under the test's isolated HOME and
 // waits for its control socket to accept connections.
 func startServer(t *testing.T, srv *Server) (cancel context.CancelFunc) {
@@ -362,5 +401,93 @@ func TestServerStatusFileWritten(t *testing.T) {
 	// The published port-file matches.
 	if port, err := ReadPort(); err != nil || port != 50900 {
 		t.Fatalf("port-file = %d (err %v), want 50900", port, err)
+	}
+}
+
+// TestServerKillReflectedInStatusFile is the BUG A regression: a kill/shadow
+// toggle must refresh status.json so out-of-process readers (`ccs status`, `ccs
+// kill status`, both via ReadStatus) see the live value, not a stale snapshot
+// from the last register.
+func TestServerKillReflectedInStatusFile(t *testing.T) {
+	f := &fakeProxy{port: 51000, pid: 17}
+	srv := newServerWithProxy(t, f)
+	startServer(t, srv)
+	c := NewClient()
+
+	// Wait for the cold-start register so status.json exists with kill=off,
+	// then drain the register's effect by reading the first status.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if snap, err := ReadStatus(); err == nil && snap.ProxyPort == 51000 {
+			if snap.Kill || snap.Shadow {
+				t.Fatalf("cold status.json already toggled on: %+v", snap)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("status.json never reflected the cold-start proxy port")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if _, err := c.Kill(true); err != nil {
+		t.Fatalf("kill on: %v", err)
+	}
+	if snap, err := ReadStatus(); err != nil || !snap.Kill {
+		t.Fatalf("status.json kill = %v (err %v) after `kill on`, want true", snap.Kill, err)
+	}
+
+	if _, err := c.Shadow(true); err != nil {
+		t.Fatalf("shadow on: %v", err)
+	}
+	if snap, err := ReadStatus(); err != nil || !snap.Shadow {
+		t.Fatalf("status.json shadow = %v (err %v) after `shadow on`, want true", snap.Shadow, err)
+	}
+
+	if _, err := c.Kill(false); err != nil {
+		t.Fatalf("kill off: %v", err)
+	}
+	snap, err := ReadStatus()
+	if err != nil {
+		t.Fatalf("read status after kill off: %v", err)
+	}
+	if snap.Kill {
+		t.Fatalf("status.json kill = true after `kill off`, want false: %+v", snap)
+	}
+	// Shadow stays on — the toggles are independent.
+	if !snap.Shadow {
+		t.Fatalf("status.json shadow flipped off when only kill was toggled: %+v", snap)
+	}
+}
+
+// TestServerShutdownStepsDownProxy is the BUG B regression: an intentional
+// daemon shutdown (ctx cancellation, the OpShutdown / SIGTERM teardown path)
+// must send the proxy an explicit seam Shutdown frame so `ccs stop` takes the
+// proxy down with the daemon — not leave it orphaned on a bare seam drop.
+func TestServerShutdownStepsDownProxy(t *testing.T) {
+	f := &fakeProxy{port: 51100, pid: 19}
+	srv := newServerWithProxy(t, f)
+	cancel := startServer(t, srv)
+
+	// Wait for the proxy to register so the seam has a live connection to push the
+	// shutdown frame to.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if snap, err := ReadStatus(); err == nil && snap.ProxyPort == 51100 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("proxy never registered before shutdown")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	seen := f.stepDownOnShutdown(t)
+	cancel() // intentional daemon shutdown (the `ccs stop` / SIGTERM teardown)
+
+	select {
+	case <-seen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("proxy never received a Shutdown frame on intentional daemon shutdown — it would orphan")
 	}
 }

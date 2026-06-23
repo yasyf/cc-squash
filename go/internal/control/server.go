@@ -35,6 +35,11 @@ const mintReadyTimeout = 3 * time.Second
 // cold start into a spurious respawn.
 const proxyStartupGrace = 5 * time.Second
 
+// proxyShutdownGrace bounds how long an intentional daemon shutdown waits for the
+// supervised proxy to step down after the seam shutdown frame, before the daemon
+// returns and the seam Close drops the connection.
+const proxyShutdownGrace = 3 * time.Second
+
 // Server is the cc-squash control-plane daemon: it binds the control socket
 // (single-entrant under a flock), binds the proxy.sock seam, spawns and
 // supervises the Rust ccs-proxy data plane, and answers the CLI's
@@ -167,8 +172,35 @@ func (s *Server) serve(ctx context.Context) error {
 	}
 
 	s.wg.Wait()
+	s.shutdownProxy()
 	s.log.Printf("daemon stopped")
 	return nil
+}
+
+// shutdownProxy gracefully stops the supervised proxy on an intentional daemon
+// shutdown: it sends the seam shutdown frame and waits (bounded) for the child to
+// step down, so `ccs stop` / SIGTERM takes the proxy down with the daemon.
+//
+// Runs only after the supervise loop has quiesced (wg.Wait above), so no Tick
+// races a respawn against this teardown, and BEFORE the deferred seam Close — the
+// distinguisher that preserves crash fail-open. An EXPLICIT shutdown frame is the
+// intentional-stop signal; a bare seam drop (daemon crash, no frame) still leaves
+// the proxy serving standalone so live `ccs url` tokens survive until the daemon
+// respawns. The wait uses a fresh context because the daemon's own ctx is already
+// cancelled by the time teardown runs.
+func (s *Server) shutdownProxy() {
+	if err := s.policy.Shutdown(context.Background()); err != nil {
+		if errors.Is(err, proxyseam.ErrProxyNotConnected) {
+			return // no proxy connected; nothing to step down
+		}
+		s.log.Printf("shutdown proxy: %v", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), proxyShutdownGrace)
+	defer cancel()
+	if !s.policy.WaitGone(ctx, proxyShutdownGrace) {
+		s.log.Printf("proxy did not step down within %s; closing seam", proxyShutdownGrace)
+	}
 }
 
 // bringUp runs the deferred heavy startup off the accept path: it starts the
@@ -229,9 +261,7 @@ func (s *Server) onRegister(reg proxyseam.Register) {
 	if err := WritePort(reg.Port); err != nil {
 		s.log.Printf("write port-file: %v", err)
 	}
-	if err := WriteStatus(s.snapshot()); err != nil {
-		s.log.Printf("write status: %v", err)
-	}
+	s.publishStatus()
 }
 
 // spawnProxyChild is the proc.Spawn.Override: it execs the detached Rust
@@ -400,8 +430,10 @@ func (s *Server) awaitProxyReady(ctx context.Context) {
 	}
 }
 
-// handleKill toggles the proxy kill switch, records it, and pushes it over the
-// seam (fail-open).
+// handleKill records the kill toggle as the daemon's own state (the single
+// source of truth — it is exactly what the proxy is now running), pushes it over
+// the seam (fail-open), and refreshes status.json so both `ccs status` and `ccs
+// kill status` reflect it immediately.
 func (s *Server) handleKill(on bool) Response {
 	s.mu.Lock()
 	s.kill = on
@@ -409,11 +441,13 @@ func (s *Server) handleKill(on bool) Response {
 	if err := s.seam.SendKill(on); err != nil {
 		s.log.Printf("kill: push to proxy failed: %v", err)
 	}
+	s.publishStatus()
 	return Response{OK: true, Kill: on}
 }
 
-// handleShadow toggles the proxy's shadow mode, records it, and pushes it over
-// the seam (fail-open).
+// handleShadow records the shadow toggle as the daemon's own state, pushes it
+// over the seam (fail-open), and refreshes status.json so the status views
+// reflect it immediately.
 func (s *Server) handleShadow(on bool) Response {
 	s.mu.Lock()
 	s.shadow = on
@@ -421,7 +455,18 @@ func (s *Server) handleShadow(on bool) Response {
 	if err := s.seam.SendShadow(on); err != nil {
 		s.log.Printf("shadow: push to proxy failed: %v", err)
 	}
+	s.publishStatus()
 	return Response{OK: true, Shadow: on}
+}
+
+// publishStatus mirrors the live snapshot to status.json so out-of-process
+// readers (`ccs status`, `ccs kill status`) see the daemon's current state
+// without querying the socket. A write failure is logged, not fatal — the
+// in-memory snapshot OpStatus serves stays authoritative.
+func (s *Server) publishStatus() {
+	if err := WriteStatus(s.snapshot()); err != nil {
+		s.log.Printf("write status: %v", err)
+	}
 }
 
 // repushTokens re-mints every live session token to a freshly respawned proxy,
