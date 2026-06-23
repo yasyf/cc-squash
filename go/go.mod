@@ -2,7 +2,10 @@ module github.com/yasyf/cc-squash/go
 
 go 1.26.4
 
-require github.com/spf13/cobra v1.10.2
+require (
+	github.com/spf13/cobra v1.10.2
+	github.com/yasyf/fusekit v0.9.0
+)
 
 require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
