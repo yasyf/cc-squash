@@ -11,7 +11,10 @@ name = "ccs-proxy"
 path = "src/main.rs"
 
 [dependencies]
+pingora = { workspace = true }
 tokio = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 memchr = { workspace = true }

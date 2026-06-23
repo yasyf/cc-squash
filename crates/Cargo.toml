@@ -8,10 +8,19 @@ edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/yasyf/cc-squash"
 
-# Shared dependency versions. Layer 1 uses the light subset; pingora/pingora-proxy
-# land in Phase B (the spike), where their buildability is part of the relay gate.
+# Shared dependency versions. pingora/pingora-proxy are the relay core (Phase B
+# spike); their buildability on this target is part of the relay gate.
 [workspace.dependencies]
+# rustls avoids the openssl-sys system dep (§4). Note: pingora-core pulls flate2's
+# zlib-ng backend unconditionally, so a `cmake` build tool is still required — a
+# fully pure-Rust build is not achievable on pingora 0.8.1 without patching flate2.
+pingora = { version = "0.8", default-features = false, features = ["proxy", "rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "io-util", "signal"] }
+# bytes::Bytes is pingora's body chunk type; pin to the same major so the
+# synthesized SSE chunks are the exact type write_response_body() expects.
+bytes = "1"
+# pingora's ProxyHttp is an #[async_trait] trait, so implementors need the macro.
+async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 memchr = "2"

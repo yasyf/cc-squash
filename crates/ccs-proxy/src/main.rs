@@ -12,16 +12,30 @@
 //! path — a relay that panics is a worse failure than a relay that passes
 //! through unchanged (build plan §5/§9).
 
+mod relay;
+mod synth;
+
+use std::net::TcpListener;
+
 use clap::Parser;
+use pingora::proxy::http_proxy_service;
+use pingora::server::Server;
+
+use crate::relay::CcsProxy;
 
 /// Command-line arguments for the supervised proxy child. The user-facing CLI is
 /// the Go `ccs` binary; the proxy only parses its spawn args.
 #[derive(Parser, Debug)]
 #[command(name = "ccs-proxy", version)]
 struct Args {
-    /// Path to the Go control-plane seam socket (`proxy.sock`).
+    /// Path to the Go control-plane seam socket (`proxy.sock`). Accepted but
+    /// unused in the Phase-0 spike.
     #[arg(long)]
-    socket: String,
+    socket: Option<String>,
+
+    /// TCP port to listen on (127.0.0.1). 0 lets the OS assign a free port.
+    #[arg(long, default_value_t = 0)]
+    port: u16,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -32,7 +46,44 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    warn_if_unset("ENABLE_TOOL_SEARCH");
+    warn_if_unset("DISABLE_AUTO_COMPACT");
+
     let args = Args::parse();
-    tracing::info!(socket = %args.socket, "ccs-proxy starting (Layer 1 skeleton)");
-    Ok(())
+    if let Some(socket) = args.socket.as_deref() {
+        tracing::info!(socket, "control-plane seam socket (unused in spike)");
+    }
+
+    let port = resolve_port(args.port)?;
+    let addr = format!("127.0.0.1:{port}");
+
+    // The Go control plane reads the chosen port from stderr to point Claude
+    // Code at the relay.
+    eprintln!("ccs-proxy listening on http://{addr}");
+    tracing::info!(%addr, "ccs-proxy relay starting (Layer 1 spike)");
+
+    let mut server = Server::new(None)?;
+    server.bootstrap();
+
+    let mut proxy = http_proxy_service(&server.configuration, CcsProxy);
+    proxy.add_tcp(&addr);
+    server.add_service(proxy);
+
+    server.run_forever();
+}
+
+/// Resolve the listen port: honour an explicit `--port`, or ask the OS for a
+/// free one by binding ephemerally and reading back the assignment.
+fn resolve_port(requested: u16) -> anyhow::Result<u16> {
+    if requested != 0 {
+        return Ok(requested);
+    }
+    let probe = TcpListener::bind("127.0.0.1:0")?;
+    Ok(probe.local_addr()?.port())
+}
+
+fn warn_if_unset(var: &str) {
+    if std::env::var_os(var).is_none() {
+        tracing::warn!(env = var, "expected environment variable is unset");
+    }
 }

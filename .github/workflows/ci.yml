@@ -55,29 +55,21 @@ jobs:
         with:
           workspaces: crates
 
-      # pingora (added in Phase B) needs these system libs; harmless before then.
+      # pingora's tree needs cmake (zlib-ng via flate2) and, on x86_64 Linux,
+      # nasm (aws-lc-sys assembly, pulled by rustls 0.23's default crypto provider).
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y cmake
+        run: sudo apt-get update && sudo apt-get install -y cmake nasm
 
       - name: Format check
         run: cargo fmt --all --check
 
-      - name: Clippy
+      # The fail-open hot-path gate (no .unwrap()/.expect() in relay/intercept/
+      # synth/demux/auth) is enforced in-source: each hot-path module root carries
+      # #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))],
+      # so clippy fails the build on a hot-path unwrap while leaving test modules
+      # exempt. This is robust where a grep over inline #[cfg(test)] blocks is not.
+      - name: Clippy (incl. fail-open deny)
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --all
-
-      - name: Fail-open lint (no .unwrap()/.expect() on the hot path)
-        run: |
-          hot="ccs-proxy/src/relay ccs-proxy/src/intercept ccs-proxy/src/synth ccs-proxy/src/demux ccs-proxy/src/auth"
-          found=0
-          for d in $hot; do
-            [ -d "$d" ] || continue
-            # exclude #[cfg(test)] modules and test files
-            matches="$(grep -rnE '\.(unwrap|expect)\(' "$d" --include='*.rs' | grep -vE '/tests?/|_test\.rs' || true)"
-            if [ -n "$matches" ]; then
-              echo "::error::hot-path .unwrap()/.expect() found (fail-open violation):"; echo "$matches"; found=1
-            fi
-          done
-          exit $found
