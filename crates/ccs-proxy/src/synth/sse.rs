@@ -7,7 +7,11 @@
 //! `message_stop`. The stream reports plausible non-zero token usage; an empty or
 //! malformed stream trips Claude Code's "check for a proxy or gateway" guard.
 
+use axum::body::Body;
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use http::StatusCode;
 use serde_json::json;
 
 use super::detect::BriefInputs;
@@ -23,7 +27,7 @@ const SUMMARY: &str = "<summary>\n\
 - Phase-0 answers `/compact` locally with a synthesized summary.\n\
 - TLS terminates at the relay; the upstream peer uses SNI `api.anthropic.com`.\n\n\
 ## In-Flight Work\n\
-- Wiring the pingora relay-gate prototype for Layer 1.\n\n\
+- Wiring the axum relay-gate prototype for Layer 1.\n\n\
 ## Narrative\n\
 - This is a placeholder summary emitted by the cc-squash relay spike to prove \
 the synthesis short-circuit end to end.\n\
@@ -86,6 +90,19 @@ pub fn synth_events(inputs: &BriefInputs) -> Vec<Bytes> {
         frame("message_stop", json!({"type": "message_stop"})),
     ]
     .into()
+}
+
+/// Build the complete local SSE response for a recognised compaction request.
+///
+/// Every frame is rendered into a single [`Bytes`] before the response exists,
+/// so synthesis cannot fail partway and leave a truncated stream on the wire.
+pub fn synth_response(inputs: &BriefInputs) -> Response {
+    let body = Bytes::from_iter(synth_events(inputs).into_iter().flatten());
+    Response::builder()
+        .header(CONTENT_TYPE, "text/event-stream")
+        .header(CACHE_CONTROL, "no-cache")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
 fn frame(event: &str, data: serde_json::Value) -> Bytes {

@@ -11,17 +11,20 @@ name = "ccs-proxy"
 path = "src/main.rs"
 
 [dependencies]
-pingora = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+http = { workspace = true }
+tower-http = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
-async-trait = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 memchr = { workspace = true }
-dashmap = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-arc-swap = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+proptest = "1"
+futures-util = "0.3"

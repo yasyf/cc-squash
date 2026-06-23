@@ -55,16 +55,11 @@ jobs:
         with:
           workspaces: crates
 
-      # pingora's tree needs cmake (zlib-ng via flate2) and, on x86_64 Linux,
-      # nasm (aws-lc-sys assembly, pulled by rustls 0.23's default crypto provider).
-      - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y cmake nasm
-
       - name: Format check
         run: cargo fmt --all --check
 
-      # The fail-open hot-path gate (no .unwrap()/.expect() in relay/intercept/
-      # synth/demux/auth) is enforced in-source: each hot-path module root carries
+      # The fail-open hot-path gate (no .unwrap()/.expect() in relay/forward/
+      # synth) is enforced in-source: each hot-path module root carries
       # #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))],
       # so clippy fails the build on a hot-path unwrap while leaving test modules
       # exempt. This is robust where a grep over inline #[cfg(test)] blocks is not.
