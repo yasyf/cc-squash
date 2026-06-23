@@ -6,6 +6,7 @@
 //! `content_block_delta`* → `content_block_stop` → `message_delta` →
 //! `message_stop`. The stream reports plausible non-zero token usage; an empty or
 //! malformed stream trips Claude Code's "check for a proxy or gateway" guard.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use axum::body::Body;
 use axum::response::{IntoResponse, Response};

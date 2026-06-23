@@ -1,17 +1,22 @@
 //! ccs-proxy binary entrypoint: parse spawn args, bind, serve until signalled.
 //! The library crate (`ccs_proxy`) holds the relay itself.
 
+use std::sync::Arc;
+
+use ccs_proxy::seam::run_seam;
 use ccs_proxy::{router, AppState};
 use clap::Parser;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixStream};
+use tokio::sync::Notify;
 
 /// Command-line arguments for the supervised proxy child. The user-facing CLI is
 /// the Go `ccs` binary; the proxy only parses its spawn args.
 #[derive(Parser, Debug)]
 #[command(name = "ccs-proxy", version)]
 struct Args {
-    /// Path to the Go control-plane seam socket (`proxy.sock`). Accepted but
-    /// unused in the Phase-0 spike.
+    /// Path to the Go control-plane seam socket (`proxy.sock`). When present the
+    /// proxy connects, registers, and applies control frames; when absent it
+    /// serves standalone (no-seam dev mode).
     #[arg(long)]
     socket: Option<String>,
 
@@ -33,9 +38,6 @@ async fn main() -> anyhow::Result<()> {
     warn_if_unset("DISABLE_AUTO_COMPACT");
 
     let args = Args::parse();
-    if let Some(socket) = args.socket.as_deref() {
-        tracing::info!(socket, "control-plane seam socket (unused in spike)");
-    }
 
     // Bind directly and read back the assignment — no separate probe socket, so
     // no TOCTOU window between choosing a port and listening on it.
@@ -47,15 +49,42 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("ccs-proxy listening on http://{addr}");
     tracing::info!(%addr, "ccs-proxy relay starting (Layer 1)");
 
-    axum::serve(listener, router(AppState::new()?))
-        .with_graceful_shutdown(shutdown_signal())
+    let state = AppState::new()?;
+
+    // A seam `shutdown` frame and a SIGTERM/SIGINT both resolve through this one
+    // notify, so the control plane can step the proxy down over the socket.
+    let shutdown = Arc::new(Notify::new());
+
+    // Connect the control-plane seam if a socket was given; fail open to
+    // standalone if it is absent or the connect fails.
+    if let Some(socket) = args.socket.as_deref() {
+        match UnixStream::connect(socket).await {
+            Ok(stream) => {
+                tokio::spawn(run_seam(
+                    stream,
+                    state.clone(),
+                    shutdown.clone(),
+                    addr.port(),
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(socket, error = %e, "seam connect failed; serving standalone");
+            }
+        }
+    } else {
+        tracing::info!("no --socket; serving standalone (no-seam dev mode)");
+    }
+
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown_signal(shutdown))
         .await?;
     Ok(())
 }
 
 /// Resolve when to stop accepting connections: SIGTERM (sent by the Go
-/// supervisor) or SIGINT. In-flight streams drain rather than cut mid-response.
-async fn shutdown_signal() {
+/// supervisor), SIGINT, or a seam `shutdown` frame routed through `seam`.
+/// In-flight streams drain rather than cut mid-response.
+async fn shutdown_signal(seam: Arc<Notify>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -73,6 +102,7 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+        _ = seam.notified() => {},
     }
 }
 

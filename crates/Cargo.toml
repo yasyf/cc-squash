@@ -21,11 +21,16 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 http = "1"
 # CatchPanicLayer degrades a hot-path panic to a 500 instead of dropping the socket.
 tower-http = { version = "0.6", features = ["catch-panic"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "io-util", "sync"] }
 # bytes::Bytes is the body chunk type shared by axum and reqwest.
 bytes = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 memchr = "2"
+# Per-session demux table: lock-free concurrent map keyed by session token.
+dashmap = "6"
+# Atomic hot-swap of the relay config the control plane pushes in.
+arc-swap = "1"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 tracing = "0.1"

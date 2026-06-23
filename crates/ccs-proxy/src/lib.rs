@@ -13,9 +13,12 @@
 //! through unchanged (build plan §5/§9).
 
 pub mod app;
+pub mod config;
+pub mod demux;
 pub mod forward;
 pub mod headers;
 pub mod relay;
+pub mod seam;
 pub mod synth;
 
 pub use app::{router, AppState};

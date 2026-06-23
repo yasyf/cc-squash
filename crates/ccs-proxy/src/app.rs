@@ -1,14 +1,20 @@
 //! Application wiring: shared state and the router.
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{any, post};
 use axum::Router;
+use dashmap::DashMap;
 use reqwest::Url;
 use tower_http::catch_panic::CatchPanicLayer;
 
+use crate::config::RelayConfig;
+use crate::demux::{SessionCtx, SessionToken};
 use crate::relay;
 
 const UPSTREAM_HOST: &str = "api.anthropic.com";
@@ -19,12 +25,24 @@ const UPSTREAM_HOST: &str = "api.anthropic.com";
 /// minutes).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Shared, cheap-to-clone handler state. `reqwest::Client` is internally an `Arc`,
-/// so cloning per request is a refcount bump over one pooled connection set.
+/// Shared, cheap-to-clone handler state. Every field beyond `client`/`upstream`
+/// is an `Arc` (or `Arc`-internally, like `reqwest::Client`), so cloning per
+/// request is a handful of refcount bumps, never a deep copy.
 #[derive(Clone)]
 pub struct AppState {
     pub client: reqwest::Client,
     pub upstream: Url,
+    /// Registered sessions keyed by token; the demux resolves `/s/{token}/…`
+    /// against this lock-free map.
+    pub sessions: Arc<DashMap<SessionToken, SessionCtx>>,
+    /// The control plane's panic button: when set, every request is a verbatim
+    /// passthrough with no inspection.
+    pub kill: Arc<AtomicBool>,
+    /// Dry-run inspection: when set, the relay computes a decision but forwards
+    /// the original anyway, logging the action it would have taken.
+    pub shadow: Arc<AtomicBool>,
+    /// The relay config the control plane hot-swaps in; read on the hot path.
+    pub config: Arc<ArcSwap<RelayConfig>>,
 }
 
 impl AppState {
@@ -42,15 +60,22 @@ impl AppState {
                 .connect_timeout(CONNECT_TIMEOUT)
                 .build()?,
             upstream,
+            sessions: Arc::new(DashMap::new()),
+            kill: Arc::new(AtomicBool::new(false)),
+            shadow: Arc::new(AtomicBool::new(false)),
+            config: Arc::new(ArcSwap::from_pointee(RelayConfig::default())),
         })
     }
 }
 
-/// The relay router. `POST /v1/messages` is inspected for a compaction request;
-/// every other path/method is a verbatim streaming passthrough. `CatchPanicLayer`
+/// The relay router. A registered session's `POST /s/{token}/v1/messages` is
+/// inspected for a compaction request; every other path/method — session-scoped
+/// or the no-token dev path — is a verbatim streaming passthrough. An unknown
+/// `/s/{token}` fails open to passthrough rather than 404. `CatchPanicLayer`
 /// degrades a hot-path panic to a response instead of dropping the connection.
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/s/*rest", any(crate::demux::session))
         .route("/v1/messages", post(relay::relay))
         .fallback(relay::passthrough)
         .layer(CatchPanicLayer::new())

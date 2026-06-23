@@ -7,6 +7,7 @@
 //! conservative: a cheap `memmem` pre-scan rejects the common case, and a full
 //! parse must corroborate every signal before we claim a match. Any ambiguity
 //! returns [`None`] so the caller relays the request upstream unchanged.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use memchr::memmem;
 use serde_json::Value;
