@@ -1,0 +1,24 @@
+[package]
+name = "ccs-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cc-squash data plane: the streaming cache-economics proxy (RelayCore)."
+
+[[bin]]
+name = "ccs-proxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+memchr = { workspace = true }
+dashmap = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+arc-swap = { workspace = true }

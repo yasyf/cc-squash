@@ -10,35 +10,74 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  go:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.13", "3.14"]
+    defaults:
+      run:
+        working-directory: go
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.2.0
+      - uses: actions/setup-go@v5
         with:
-          python-version: ${{ matrix.python-version }}
-          cache-dependency-glob: uv.lock
+          go-version: "1.26.x"
+          cache-dependency-path: go/go.sum
 
-      - name: Sync (dev)
-        run: uv sync --extra dev
-
-      - name: Type check (ty, warnings only)
-        continue-on-error: true
-        run: uvx prek run ty --all-files
-
-      - name: Test (pytest)
-        run: uv run pytest
-
-      - name: Build + smoke-test wheel in a fresh venv
+      - name: Format check (gofmt)
         run: |
-          uv build
-          rm -rf .wheel-smoke
-          uv venv --seed .wheel-smoke
-          uv pip install --python .wheel-smoke/bin/python dist/*.whl
-          .wheel-smoke/bin/cc-squash --help
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test (race)
+        run: go test -race ./...
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      # pingora (added in Phase B) needs these system libs; harmless before then.
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all
+
+      - name: Fail-open lint (no .unwrap()/.expect() on the hot path)
+        run: |
+          hot="ccs-proxy/src/relay ccs-proxy/src/intercept ccs-proxy/src/synth ccs-proxy/src/demux ccs-proxy/src/auth"
+          found=0
+          for d in $hot; do
+            [ -d "$d" ] || continue
+            # exclude #[cfg(test)] modules and test files
+            matches="$(grep -rnE '\.(unwrap|expect)\(' "$d" --include='*.rs' | grep -vE '/tests?/|_test\.rs' || true)"
+            if [ -n "$matches" ]; then
+              echo "::error::hot-path .unwrap()/.expect() found (fail-open violation):"; echo "$matches"; found=1
+            fi
+          done
+          exit $found

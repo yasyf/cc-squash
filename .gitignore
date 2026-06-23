@@ -11,35 +11,19 @@
 .context/
 .claude/settings.local.json
 
-# Python bytecode (guard hooks are Python even in non-Python repos)
+# Python bytecode (guard hooks are Python even in a Go/Rust repo)
 __pycache__/
 *.py[cod]
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-build/
+# Go
+go/bin/
+*.test
+*.out
+
+# Rust
+crates/target/
+**/*.rs.bk
+
+# Release tooling
 dist/
-*.egg-info/
-.eggs/
-
-# Virtualenv / uv
-.venv/
-venv/
-
-# Tooling caches
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.coverage
-.coverage.*
-htmlcov/
-coverage.xml
-
-# CI wheel smoke test
-.wheel-smoke/
-
-# Great Docs build output
-great-docs/
+tap-staging/

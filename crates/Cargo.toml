@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["ccs-proxy"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/yasyf/cc-squash"
+
+# Shared dependency versions. Layer 1 uses the light subset; pingora/pingora-proxy
+# land in Phase B (the spike), where their buildability is part of the relay gate.
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "io-util", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+memchr = "2"
+dashmap = "6"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+arc-swap = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
