@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/spf13/cobra v1.10.2
-	github.com/yasyf/fusekit v0.9.0
+	github.com/yasyf/fusekit v0.14.1
 )
 
 require (
