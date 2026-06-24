@@ -1,0 +1,34 @@
+//! ccs-policy — the pure, deterministic decision engine.
+//!
+//! The serde parse boundary ([`wire`]), segmentation ([`segment`]), salience
+//! ([`salience`]), the per-segment decision and its self-repair ([`decision`]),
+//! the lossy-ladder [`Strategy`] ([`strategy`]), candidate selection and batching
+//! ([`candidate`]), cache-breakpoint planning ([`breakpoint`]), the two-layer
+//! budget ([`budget`]), and the continuous [`Controller`] ([`controller`]).
+//! Consumes inputs and emits prescriptions only — no I/O, no clock, no RNG.
+
+pub mod breakpoint;
+pub mod budget;
+pub mod candidate;
+pub mod config;
+pub mod controller;
+pub mod decision;
+pub mod salience;
+pub mod segment;
+pub mod strategy;
+pub mod wire;
+
+pub use breakpoint::{
+    cap_cache_hints, plan_breakpoints, BreakpointPlan, CACHE_HINT_CAP, LOOKBACK_POSITIONS,
+};
+pub use budget::{default_compact, hard_target, soft_pressure, Pressure};
+pub use candidate::{select_strategy, SquashBatch, SquashCandidate, HUMAN_VERBATIM_MAX};
+pub use config::PolicyConfig;
+pub use controller::{
+    Controller, FreeBustTrigger, HoldReason, PromptState, SquashDecision, Status,
+};
+pub use decision::{ContentDecision, PRE_GATE_MIN_CHARS};
+pub use salience::{is_pinned, Constraint, Decision, InFlightWork, WorkingState};
+pub use segment::{fresh_boundary, segment_prompt, Segment, RECENCY_WINDOW_N};
+pub use strategy::{Strategy, StrategyKind, LADDER_PRIORITY};
+pub use wire::{ContentBlock, Role, WireBody, WireMessage};

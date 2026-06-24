@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ccs-proxy"]
+members = ["ccs-proxy", "ccs-core", "ccs-economics", "ccs-policy"]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,6 +27,8 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 memchr = "2"
+# strum::Display + serde rename give the pure engine's tag enums exact wire spellings.
+strum = { version = "0.26", features = ["derive"] }
 # Per-session demux table: lock-free concurrent map keyed by session token.
 dashmap = "6"
 # Atomic hot-swap of the relay config the control plane pushes in.
@@ -35,6 +37,8 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Property-based tests for the deterministic engine crates (dev-dep everywhere).
+proptest = "1"
 
 [profile.release]
 lto = "thin"

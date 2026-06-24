@@ -1,0 +1,14 @@
+[package]
+name = "ccs-economics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cc-squash pure cache-economics cost model (bust/saving/break-even/NPV)."
+
+[dependencies]
+ccs-core = { path = "../ccs-core" }
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

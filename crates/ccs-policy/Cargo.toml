@@ -1,0 +1,18 @@
+[package]
+name = "ccs-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cc-squash pure decision engine: segmentation, salience, the lossy ladder, and the controller."
+
+[dependencies]
+ccs-core = { path = "../ccs-core" }
+ccs-economics = { path = "../ccs-economics" }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+memchr = { workspace = true }
+strum = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
