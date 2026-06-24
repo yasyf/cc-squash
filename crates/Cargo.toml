@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ccs-proxy", "ccs-core", "ccs-economics", "ccs-policy"]
+members = ["ccs-proxy", "ccs-core", "ccs-economics", "ccs-policy", "ccs-refs", "ccs-summarizer"]
 
 [workspace.package]
 version = "0.1.0"
@@ -39,6 +39,21 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Property-based tests for the deterministic engine crates (dev-dep everywhere).
 proptest = "1"
+
+# Layer 3 — ccs-refs (content-addressed reversible store).
+# Async sqlite over a single connection: ccs-refs is the sole writer + sole Rust
+# reader. `bundled` compiles SQLite from source — no system libsqlite link, so the
+# universal binary stays deterministic.
+tokio-rusqlite = { version = "0.7", features = ["bundled"] }
+# Content addressing: the spec-mandated full sha256:<64hex> ref id.
+sha2 = "0.10"
+# REF_MARKER = ref=(sha256:[0-9a-f]{64}) — re-finds live refs for sticky-on + GC.
+regex = "1"
+# Typed library errors (ccs-refs, ccs-summarizer).
+thiserror = "2"
+# Layer-3 dev deps: real ephemeral temp DBs; mocked Anthropic upstream.
+tempfile = "3"
+wiremock = "0.6"
 
 [profile.release]
 lto = "thin"

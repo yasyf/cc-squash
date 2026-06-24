@@ -4,40 +4,51 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use ccs_core::{MessageId, SegmentKind};
+use serde::{Deserialize, Serialize};
 
 use crate::segment::Segment;
 
 /// A constraint the assistant must keep honoring. Live iff `superseded_by` is `None`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializes both ways: the Layer 3 Rsum folder deserializes it straight from the
+/// summarizer's JSON and re-serializes the prior state into the next fold prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Constraint {
     pub text: String,
     pub source_message: MessageId,
+    #[serde(default)]
     pub superseded_by: Option<MessageId>,
 }
 
 /// A decision made during the conversation. Live iff `superseded_by` is `None`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decision {
     pub text: String,
     pub rationale: String,
     pub planned: bool,
+    #[serde(default)]
     pub superseded_by: Option<MessageId>,
 }
 
 /// The current in-flight task and its recovery anchors.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InFlightWork {
     pub task: String,
     pub last_safe_point: String,
+    #[serde(default)]
     pub open_files: Vec<String>,
+    #[serde(default)]
     pub skill_paths: Vec<String>,
 }
 
 /// The salient working state extracted from the conversation so far.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingState {
+    #[serde(default)]
     pub constraints: Vec<Constraint>,
+    #[serde(default)]
     pub decisions: Vec<Decision>,
+    #[serde(default)]
     pub in_flight: Option<InFlightWork>,
 }
 

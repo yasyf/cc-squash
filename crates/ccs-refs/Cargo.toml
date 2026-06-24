@@ -1,0 +1,21 @@
+[package]
+name = "ccs-refs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cc-squash content-addressed reversible store: put/materialize/gc, REF_MARKER + placeholder rendering, dedup-with-backref, and BM25 retrieve."
+
+[dependencies]
+ccs-core = { path = "../ccs-core" }
+tokio = { workspace = true }
+tokio-rusqlite = { workspace = true }
+sha2 = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }

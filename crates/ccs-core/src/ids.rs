@@ -19,6 +19,10 @@ pub struct ModelId(String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageId(String);
 
+/// A Claude Code session identifier — the GC/persistence scope of a [`RefId`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionId(String);
+
 /// A content-addressed reference: `sha256:` followed by exactly 64 lowercase hex
 /// characters. Parse-only — there is deliberately no constructor that hashes raw
 /// content, so a `RefId` can only ever name a digest `ccs-refs` already minted.
@@ -55,6 +59,18 @@ impl MessageId {
     }
 
     /// The underlying message-id string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl SessionId {
+    /// Brand a raw session id.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The underlying session-id string.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -188,5 +204,6 @@ mod tests {
     fn model_and_message_ids_brand_strings() {
         assert_eq!(ModelId::new("claude-opus-4-8").as_str(), "claude-opus-4-8");
         assert_eq!(MessageId::new("uuid-1").as_str(), "uuid-1");
+        assert_eq!(SessionId::new("sess-1").as_str(), "sess-1");
     }
 }
