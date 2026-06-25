@@ -71,6 +71,21 @@ pub async fn stage_next(
         return;
     };
     let segments = segment_prompt(&body);
+
+    // Nothing squashable ⇒ no plan to stage and no working-state fold worth an
+    // off-path LLM round-trip. Skip the summarizer entirely: this spares a
+    // per-turn Sonnet call on trivial turns and keeps a no-candidate forward to
+    // exactly one upstream request. True-human constraints stay protected by the
+    // verbatim pin regardless of the working state, so the fold can wait until
+    // there is genuinely squashable content.
+    if !segments
+        .iter()
+        .any(|seg| is_squash_candidate(seg, &working))
+    {
+        clear_guard(&econ);
+        return;
+    }
+
     let client = SummarizerClient::new(auth);
 
     let mut plan = StagedPlan::default();
