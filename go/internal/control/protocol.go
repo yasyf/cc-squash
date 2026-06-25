@@ -23,6 +23,7 @@ const (
 	OpMint     Op = "mint"     // mint a session token for the proxy
 	OpKill     Op = "kill"     // toggle the proxy kill switch
 	OpShadow   Op = "shadow"   // toggle proxy shadow mode
+	OpGc       Op = "gc"       // sweep the proxy's ref store to its reachable set
 	OpShutdown Op = "shutdown" // step down gracefully and release the socket
 )
 
@@ -41,6 +42,7 @@ type StatusSnapshot struct {
 	Version     string    `json:"version"`
 	GeneratedAt time.Time `json:"generated_at"`
 	ProxyPort   int       `json:"proxy_port"`
+	ProxyMCPort int       `json:"proxy_mcp_port"`
 	ProxyPID    int       `json:"proxy_pid"`
 	Sessions    int       `json:"sessions"`
 	Kill        bool      `json:"kill"`
@@ -54,8 +56,9 @@ type Response struct {
 	Error   string          `json:"error,omitempty"`
 	Version string          `json:"version,omitempty"` // health
 	Port    int             `json:"port,omitempty"`
-	Token   string          `json:"token,omitempty"`  // mint
-	Status  *StatusSnapshot `json:"status,omitempty"` // status
+	MCPPort int             `json:"mcp_port,omitempty"` // mint: the rmcp retrieve server port
+	Token   string          `json:"token,omitempty"`    // mint
+	Status  *StatusSnapshot `json:"status,omitempty"`   // status
 	Kill    bool            `json:"kill,omitempty"`
 	Shadow  bool            `json:"shadow,omitempty"`
 }

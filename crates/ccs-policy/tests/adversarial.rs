@@ -130,7 +130,7 @@ fn salience_needle_survives_pressure_matrix() {
                             summary_content: Some("a terse summary".to_owned()),
                         };
                         assert_eq!(
-                            select_strategy(&pinned_seg, &decision, &cand(), &econ, &cache(), remaining_turns, now),
+                            select_strategy(&pinned_seg, &decision, &cand(), &econ, &cache(), remaining_turns, now, 0.0),
                             Strategy::Keep,
                             "pinned seg rewritten ({choice}) at idle={idle} turns={remaining_turns} free_bust={free_bust:?} pressure={pressure:?}",
                         );
@@ -153,7 +153,8 @@ fn salience_needle_survives_pressure_matrix() {
             &econ,
             &cache(),
             200.0,
-            0.0
+            0.0,
+            0.0,
         ),
         Strategy::Summarize("terse".to_owned()),
         "the unpinned twin must actually rewrite, else the pin assertion is vacuous",
@@ -188,8 +189,17 @@ fn injection_in_content_is_inert() {
     let clean = seg(SegmentKind::AssistantTurn, false, false, None);
     let injected = seg(SegmentKind::AssistantTurn, false, false, None);
 
-    let out_clean = select_strategy(&clean, &decision, &cand(), &econ, &cache(), 200.0, 0.0);
-    let out_injected = select_strategy(&injected, &decision, &cand(), &econ, &cache(), 200.0, 0.0);
+    let out_clean = select_strategy(&clean, &decision, &cand(), &econ, &cache(), 200.0, 0.0, 0.0);
+    let out_injected = select_strategy(
+        &injected,
+        &decision,
+        &cand(),
+        &econ,
+        &cache(),
+        200.0,
+        0.0,
+        0.0,
+    );
     assert_eq!(out_clean, out_injected);
     assert_eq!(out_clean, Strategy::Truncate(ranges));
 }
@@ -209,6 +219,7 @@ fn injection_in_summary_cannot_unpin() {
         &cache(),
         200.0,
         0.0,
+        0.0,
     );
     assert_eq!(baseline, Strategy::Keep);
 
@@ -221,7 +232,8 @@ fn injection_in_summary_cannot_unpin() {
                 &econ,
                 &cache(),
                 200.0,
-                0.0
+                0.0,
+                0.0,
             ),
             baseline,
             "injection {inj:?} moved a pinned decision",

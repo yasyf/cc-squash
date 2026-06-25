@@ -131,24 +131,49 @@ impl RefStore {
             .await?)
     }
 
-    /// Retrieve `ref_id`, optionally BM25-searched-within by `query`.
+    /// Retrieve `ref_id` *within the scope of `session_id`*, optionally
+    /// BM25-searched-within by `query`.
     ///
-    /// A miss is [`RetrieveResult::Miss`] — the caller renders the recovery hint
-    /// rather than erroring.
+    /// The scope is enforced in the same atomic statement that bumps the access
+    /// accounting: a ref minted under another session never matches, so a
+    /// cross-session request is an indistinguishable [`RetrieveResult::Miss`]
+    /// and never bumps `access_count`. The caller renders the recovery hint on a
+    /// miss rather than erroring.
     pub async fn retrieve(
         &self,
         ref_id: &RefId,
+        session_id: &SessionId,
         query: Option<&str>,
         now: f64,
     ) -> Result<RetrieveResult, RefError> {
-        Ok(match self.materialize(ref_id, now).await? {
+        let id = ref_id.clone();
+        let session = session_id.as_str().to_owned();
+        let hit: Option<(String, u64)> = self
+            .connection
+            .call(move |conn| {
+                conn.query_row(
+                    "UPDATE refs SET access_count = access_count + 1, last_access_at = ?3
+                     WHERE ref_id = ?1 AND session_id = ?2
+                     RETURNING original, access_count",
+                    params![id.as_str(), session, now],
+                    |r| {
+                        Ok((
+                            String::from_utf8_lossy(&r.get::<_, Vec<u8>>(0)?).into_owned(),
+                            r.get::<_, u64>(1)?,
+                        ))
+                    },
+                )
+                .optional()
+            })
+            .await?;
+        Ok(match hit {
             None => RetrieveResult::Miss,
-            Some(m) => RetrieveResult::Hit {
+            Some((text, access_count)) => RetrieveResult::Hit {
                 text: match query {
-                    Some(q) => bm25::search_within(&m.text, q),
-                    None => m.text,
+                    Some(q) => bm25::search_within(&text, q),
+                    None => text,
                 },
-                access_count: m.access_count,
+                access_count,
             },
         })
     }

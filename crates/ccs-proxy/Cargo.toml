@@ -11,12 +11,18 @@ name = "ccs-proxy"
 path = "src/main.rs"
 
 [dependencies]
+ccs-core = { path = "../ccs-core" }
+ccs-economics = { path = "../ccs-economics" }
+ccs-policy = { path = "../ccs-policy" }
+ccs-refs = { path = "../ccs-refs" }
+ccs-summarizer = { path = "../ccs-summarizer" }
 axum = { workspace = true }
 reqwest = { workspace = true }
 http = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
+futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 memchr = { workspace = true }
@@ -26,8 +32,21 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Circuit breaker for the L0 cache-usage tap (consumed in sub-phase 4b).
+failsafe = "1.3"
+# rmcp streamable-HTTP MCP server: the `cc_squash_retrieve` tool (sub-phase 4e).
+rmcp = { version = "1.8", features = ["server", "macros", "transport-streamable-http-server", "tower"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+
+[features]
+# Test-only fault injection: a sentinel ref id panics inside the MCP tool handler
+# so the panic-isolation test can prove the relay listener survives.
+test-panic = []
 
 [dev-dependencies]
 wiremock = "0.6"
 proptest = { workspace = true }
-futures-util = "0.3"
+tempfile = { workspace = true }
+# The rmcp streamable-HTTP CLIENT drives the MCP route end-to-end in tests.
+rmcp = { version = "1.8", features = ["client", "transport-streamable-http-client-reqwest"] }
+tokio-util = "0.7"

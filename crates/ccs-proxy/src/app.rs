@@ -13,6 +13,8 @@ use dashmap::DashMap;
 use reqwest::Url;
 use tower_http::catch_panic::CatchPanicLayer;
 
+use ccs_refs::RefStore;
+
 use crate::config::RelayConfig;
 use crate::demux::{SessionCtx, SessionToken};
 use crate::relay;
@@ -43,17 +45,23 @@ pub struct AppState {
     pub shadow: Arc<AtomicBool>,
     /// The relay config the control plane hot-swaps in; read on the hot path.
     pub config: Arc<ArcSwap<RelayConfig>>,
+    /// The content-addressed reversible store. Always present — opened against
+    /// `state_dir/refs.db` under the seam, or an ephemeral temp db in no-seam
+    /// dev mode and tests. Construct it with [`RefStore::open`] in async main
+    /// and hand the `Arc` here.
+    pub store: Arc<RefStore>,
 }
 
 impl AppState {
-    /// Production state: a rustls client pointed at `api.anthropic.com`.
-    pub fn new() -> anyhow::Result<Self> {
-        Self::with_upstream(Url::parse(&format!("https://{UPSTREAM_HOST}"))?)
+    /// Production state: a rustls client pointed at `api.anthropic.com`, backed
+    /// by `store`.
+    pub fn new(store: Arc<RefStore>) -> anyhow::Result<Self> {
+        Self::with_upstream(Url::parse(&format!("https://{UPSTREAM_HOST}"))?, store)
     }
 
     /// State with an arbitrary upstream base — the seam integration tests use to
-    /// point the relay at a mock Anthropic server.
-    pub fn with_upstream(upstream: Url) -> anyhow::Result<Self> {
+    /// point the relay at a mock Anthropic server, backed by `store`.
+    pub fn with_upstream(upstream: Url, store: Arc<RefStore>) -> anyhow::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .use_rustls_tls()
@@ -64,6 +72,7 @@ impl AppState {
             kill: Arc::new(AtomicBool::new(false)),
             shadow: Arc::new(AtomicBool::new(false)),
             config: Arc::new(ArcSwap::from_pointee(RelayConfig::default())),
+            store,
         })
     }
 }

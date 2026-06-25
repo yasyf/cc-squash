@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +29,7 @@ func quietLogger(t *testing.T) *log.Logger {
 // binary through, so no real proxy is ever started.
 type fakeProxy struct {
 	port    int
+	mcpPort int
 	pid     int
 	version string
 
@@ -55,7 +57,7 @@ func (f *fakeProxy) connect(t *testing.T) error {
 		time.Sleep(10 * time.Millisecond)
 	}
 	frame, err := proxyseam.Encode(proxyseam.Register{
-		Type: proxyseam.MsgRegister, Port: f.port, Version: f.version, PID: f.pid,
+		Type: proxyseam.MsgRegister, Port: f.port, MCPPort: f.mcpPort, Version: f.version, PID: f.pid,
 	})
 	if err != nil {
 		return err
@@ -89,6 +91,23 @@ func (f *fakeProxy) readMint() (string, error) {
 	f.mints = append(f.mints, tok)
 	f.mu.Unlock()
 	return tok, nil
+}
+
+// readMintFrame blocks until the daemon pushes one mint frame and returns it
+// whole, so a test can assert the per-session config rode along with the token.
+func (f *fakeProxy) readMintFrame() (proxyseam.Mint, error) {
+	f.mu.Lock()
+	reader := f.reader
+	f.mu.Unlock()
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		return proxyseam.Mint{}, err
+	}
+	msg, err := proxyseam.Decode(line[:len(line)-1])
+	if err != nil {
+		return proxyseam.Mint{}, err
+	}
+	return msg.(proxyseam.Mint), nil
 }
 
 // readFrame blocks until the daemon pushes one control frame and returns it
@@ -215,6 +234,106 @@ func TestServerColdStartMint(t *testing.T) {
 	}
 	if got != resp.Token {
 		t.Fatalf("proxy saw token %q, daemon replied %q", got, resp.Token)
+	}
+}
+
+// TestServerMintReturnsMCPPort is the 4e contract assertion: the proxy's
+// register frame carries the SECOND listener's mcp_port, the daemon records it,
+// and the mint reply surfaces it so `ccs run` can build the retrieve --mcp-config
+// URL off one round-trip.
+func TestServerMintReturnsMCPPort(t *testing.T) {
+	f := &fakeProxy{port: 50516, mcpPort: 50517, pid: 4242}
+	srv := newServerWithProxy(t, f)
+	startServer(t, srv)
+
+	resp, err := NewClient().Mint()
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	if resp.MCPPort != 50517 {
+		t.Fatalf("mint mcp_port = %d, want 50517", resp.MCPPort)
+	}
+	if _, err := f.readMint(); err != nil {
+		t.Fatalf("drain mint: %v", err)
+	}
+
+	// The status snapshot mirrors the recorded mcp_port too.
+	st, err := NewClient().Status()
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if st.Status.ProxyMCPort != 50517 {
+		t.Fatalf("status proxy_mcp_port = %d, want 50517", st.Status.ProxyMCPort)
+	}
+}
+
+// TestServerGcForwardsFrame is the `ccs gc` dispatch assertion: an OpGc control
+// request forwards a single {"type":"gc"} seam frame to the proxy, which runs
+// store.gc against the reachable set.
+func TestServerGcForwardsFrame(t *testing.T) {
+	f := &fakeProxy{port: 50520, mcpPort: 50521, pid: 99}
+	srv := newServerWithProxy(t, f)
+	startServer(t, srv)
+
+	// Wait for the cold-start register so the seam has a live child to push to.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if snap, err := ReadStatus(); err == nil && snap.ProxyPort == 50520 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("proxy never registered before gc")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	resp, err := NewClient().Gc()
+	if err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("gc not OK: %+v", resp)
+	}
+	frame, err := f.readFrame()
+	if err != nil {
+		t.Fatalf("read gc frame: %v", err)
+	}
+	if _, ok := frame.(proxyseam.Gc); !ok {
+		t.Fatalf("proxy saw %T, want proxyseam.Gc", frame)
+	}
+}
+
+// TestServerMintCarriesConfig is the 4a seam assertion: handleMint must push the
+// config loaded from config.toml (not nil) over the seam, so the proxy mints each
+// session with the user's relay knobs. A daemon with a config.toml on disk pushes
+// exactly that JSON on the mint frame.
+func TestServerMintCarriesConfig(t *testing.T) {
+	f := &fakeProxy{port: 51200, pid: 23}
+	srv := newServerWithProxy(t, f) // sets the isolated HOME via shortHome
+	writeTestConfig(t, "[economics]\nnpv_floor = 0.25\n")
+	startServer(t, srv)
+
+	if _, err := NewClient().Mint(); err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	mint, err := f.readMintFrame()
+	if err != nil {
+		t.Fatalf("read mint frame: %v", err)
+	}
+	if string(mint.Config) != `{"economics":{"npv_floor":0.25}}` {
+		t.Fatalf("mint config = %s, want the loaded config.toml (not nil/{})", mint.Config)
+	}
+}
+
+// writeTestConfig writes config.toml under the already-isolated test HOME so the
+// daemon's startup config.Load reads it.
+func writeTestConfig(t *testing.T, toml string) {
+	t.Helper()
+	if err := os.MkdirAll(paths.StateDir(), 0o700); err != nil {
+		t.Fatalf("mkdir state dir: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigPath(), []byte(toml), 0o600); err != nil {
+		t.Fatalf("write config.toml: %v", err)
 	}
 }
 

@@ -17,8 +17,14 @@ pub mod config;
 pub mod demux;
 pub mod forward;
 pub mod headers;
+pub mod intercept;
+pub mod mcp;
 pub mod relay;
 pub mod seam;
+pub mod session;
+pub mod staging;
 pub mod synth;
+pub mod usage_tap;
 
 pub use app::{router, AppState};
+pub use mcp::mcp_router;

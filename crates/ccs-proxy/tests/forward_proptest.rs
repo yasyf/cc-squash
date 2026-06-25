@@ -3,11 +3,14 @@
 //! generalises the exact-body regression across sizes and contents.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use ccs_proxy::{router, AppState};
+use ccs_refs::RefStore;
 use proptest::prelude::*;
 use reqwest::Url;
+use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -16,6 +19,7 @@ struct Harness {
     rt: Runtime,
     upstream: MockServer,
     proxy: SocketAddr,
+    _refs_dir: TempDir,
 }
 
 fn harness() -> &'static Harness {
@@ -25,6 +29,7 @@ fn harness() -> &'static Harness {
             .enable_all()
             .build()
             .expect("runtime");
+        let refs_dir = TempDir::new().expect("temp dir");
         let (upstream, proxy) = rt.block_on(async {
             let upstream = MockServer::start().await;
             Mock::given(method("POST"))
@@ -32,8 +37,13 @@ fn harness() -> &'static Harness {
                 .respond_with(ResponseTemplate::new(200))
                 .mount(&upstream)
                 .await;
-            let state =
-                AppState::with_upstream(Url::parse(&upstream.uri()).expect("url")).expect("state");
+            let store = Arc::new(
+                RefStore::open(refs_dir.path().join("refs.db"))
+                    .await
+                    .expect("open refs db"),
+            );
+            let state = AppState::with_upstream(Url::parse(&upstream.uri()).expect("url"), store)
+                .expect("state");
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind");
@@ -47,6 +57,7 @@ fn harness() -> &'static Harness {
             rt,
             upstream,
             proxy,
+            _refs_dir: refs_dir,
         }
     })
 }

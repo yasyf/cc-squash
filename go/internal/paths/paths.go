@@ -29,6 +29,11 @@ func ProxySocketPath() string {
 	return stateDir.Path("proxy.sock")
 }
 
+// RefsDbPath is the SQLite database the Rust proxy opens for staged refs.
+func RefsDbPath() string {
+	return stateDir.Path("refs.db")
+}
+
 // LogPath is the daemon's log file.
 func LogPath() string {
 	return stateDir.Path("daemon.log")

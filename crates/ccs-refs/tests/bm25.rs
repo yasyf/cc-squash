@@ -47,7 +47,12 @@ async fn retrieve_with_query_searches_within_the_stored_original() {
         .unwrap();
 
     match store
-        .retrieve(&rec.ref_id, Some("rate limiting sliding window"), 2.0)
+        .retrieve(
+            &rec.ref_id,
+            &SessionId::new("s"),
+            Some("rate limiting sliding window"),
+            2.0,
+        )
         .await
         .unwrap()
     {

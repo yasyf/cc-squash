@@ -19,6 +19,7 @@ const (
 	baseURLEnv      = "ANTHROPIC_BASE_URL"
 	toolSearchEnv   = "ENABLE_TOOL_SEARCH"
 	firstPartyEnv   = "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"
+	mcpConfigEnv    = "CC_SQUASH_MCP_CONFIG"
 	toolSearchValue = "true"
 	firstPartyValue = "1"
 )
@@ -42,19 +43,41 @@ diagnostic goes to stderr, so ` + "`ANTHROPIC_BASE_URL=$(ccs url)`" + ` captures
 	}
 }
 
-// resolveURL ensures the daemon is up, mints a session token, and returns the
-// proxy base URL the minted session answers at.
-func resolveURL() (string, error) {
+// resolveMint ensures the daemon is up and mints a fresh session, returning the
+// whole reply so a caller can read both the relay port/token and the rmcp
+// retrieve server's MCP port off one round-trip.
+func resolveMint() (control.Response, error) {
 	c := control.NewClient()
 	if !c.EnsureRunning(proxyEnsureTimeout) {
-		return "", control.ErrDaemonUnavailable
+		return control.Response{}, control.ErrDaemonUnavailable
 	}
 	resp, err := c.Mint()
 	if err != nil {
-		return "", err
+		return control.Response{}, err
 	}
 	if !resp.OK {
-		return "", fmt.Errorf("mint failed: %s", resp.Error)
+		return control.Response{}, fmt.Errorf("mint failed: %s", resp.Error)
 	}
-	return fmt.Sprintf("http://127.0.0.1:%d/s/%s", resp.Port, resp.Token), nil
+	return resp, nil
+}
+
+// sessionURL is the proxy base URL a minted session answers at.
+func sessionURL(resp control.Response) string {
+	return fmt.Sprintf("http://127.0.0.1:%d/s/%s", resp.Port, resp.Token)
+}
+
+// mcpURL is the rmcp cc_squash_retrieve endpoint for a minted session: the
+// SECOND listener's port plus the session-scoped /mcp path.
+func mcpURL(resp control.Response) string {
+	return fmt.Sprintf("http://127.0.0.1:%d/s/%s/mcp", resp.MCPPort, resp.Token)
+}
+
+// resolveURL ensures the daemon is up, mints a session token, and returns the
+// proxy base URL the minted session answers at.
+func resolveURL() (string, error) {
+	resp, err := resolveMint()
+	if err != nil {
+		return "", err
+	}
+	return sessionURL(resp), nil
 }

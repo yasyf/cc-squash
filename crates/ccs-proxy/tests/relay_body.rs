@@ -5,17 +5,38 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, LazyLock};
+
 use bytes::Bytes;
 use ccs_proxy::{router, AppState};
+use ccs_refs::RefStore;
 use futures_util::StreamExt;
 use reqwest::Url;
+use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// An ephemeral refs store under a process-lifetime temp dir; each call gets its
+/// own db file.
+async fn test_store() -> Arc<RefStore> {
+    static TEST_DIR: LazyLock<TempDir> = LazyLock::new(|| TempDir::new().expect("temp dir"));
+    static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    let path = TEST_DIR.path().join(format!(
+        "refs-{}.db",
+        DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    Arc::new(RefStore::open(path).await.expect("open refs db"))
+}
+
 /// Spawn the real relay app against `upstream`, returning its local address.
 async fn spawn_proxy(upstream: &str) -> SocketAddr {
-    let state =
-        AppState::with_upstream(Url::parse(upstream).expect("upstream url")).expect("state");
+    let state = AppState::with_upstream(
+        Url::parse(upstream).expect("upstream url"),
+        test_store().await,
+    )
+    .expect("state");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind proxy");

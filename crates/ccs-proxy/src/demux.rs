@@ -13,6 +13,8 @@
 //! path and query verbatim) ever sees it.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+use std::sync::{Arc, Mutex};
+
 use axum::extract::{Path, Request, State};
 use axum::http::uri::{PathAndQuery, Uri};
 use axum::http::Method;
@@ -21,6 +23,7 @@ use axum::response::Response;
 use crate::app::AppState;
 use crate::config::RelayConfig;
 use crate::relay::{serve, Inspect};
+use crate::session::SessionEcon;
 
 /// The inner endpoint a registered session's request is inspected on.
 const MESSAGES_PATH: &str = "/v1/messages";
@@ -31,11 +34,23 @@ const MESSAGES_PATH: &str = "/v1/messages";
 pub struct SessionToken(pub String);
 
 /// Per-session relay state the control plane registers when it spawns a session.
-/// Layer 1 holds only the session's [`RelayConfig`], which defaults to the
-/// global config.
-#[derive(Debug, Clone, Default)]
+/// Holds the session's [`RelayConfig`] (defaulting to the global config), its
+/// [`SessionId`] — the GC/retrieve scope, set to the mint token at registration —
+/// and the lazily-initialised [`SessionEcon`] the L0 usage tap folds into.
+///
+/// `econ` is `None` at mint and lazy-initialised on the first inspected request,
+/// when the request body's model is known. It lives behind an `Arc<Mutex<…>>` so
+/// the tap's drain task can fold an observation under a brief synchronous lock
+/// (never held across an `.await`) while the relay keeps a cheap clone.
+///
+/// [`SessionId`]: ccs_core::SessionId
+#[derive(Debug, Clone)]
 pub struct SessionCtx {
     pub config: RelayConfig,
+    // TODO(4e): scopes cc_squash_retrieve
+    #[allow(dead_code)]
+    pub session_id: ccs_core::SessionId,
+    pub econ: Option<Arc<Mutex<SessionEcon>>>,
 }
 
 /// `/s/*rest` for any method: the entire per-session surface. `rest` is
@@ -56,16 +71,17 @@ pub async fn session(
     serve(state, strip_prefix(req, token), inspect).await
 }
 
-/// Inspect only a registered session's `POST /v1/messages`. An unknown/expired/
-/// absent token, a non-POST method, or any other inner path fails open to
-/// passthrough. Never 404.
+/// Inspect only a registered session's `POST /v1/messages`, carrying the session
+/// token so the forward path can fold cache usage into that session. An
+/// unknown/expired/absent token, a non-POST method, or any other inner path fails
+/// open to passthrough. Never 404.
 fn inspect_for(state: &AppState, method: &Method, inner_path: &str, token: &str) -> Inspect {
     match (
         method == Method::POST,
         inner_path == MESSAGES_PATH,
         state.sessions.contains_key(&SessionToken(token.to_owned())),
     ) {
-        (true, true, true) => Inspect::Yes,
+        (true, true, true) => Inspect::Yes(Some(SessionToken(token.to_owned()))),
         _ => Inspect::No,
     }
 }

@@ -1,10 +1,12 @@
 //! ccs-proxy binary entrypoint: parse spawn args, bind, serve until signalled.
 //! The library crate (`ccs_proxy`) holds the relay itself.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ccs_proxy::seam::run_seam;
-use ccs_proxy::{router, AppState};
+use ccs_proxy::{mcp_router, router, AppState};
+use ccs_refs::RefStore;
 use clap::Parser;
 use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::Notify;
@@ -23,6 +25,11 @@ struct Args {
     /// TCP port to listen on (127.0.0.1). 0 lets the OS assign a free port.
     #[arg(long, default_value_t = 0)]
     port: u16,
+
+    /// Directory for the refs database (`<state_dir>/refs.db`). When absent the
+    /// store opens at an ephemeral temp path (no-seam dev mode).
+    #[arg(long)]
+    state_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -44,12 +51,19 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", args.port)).await?;
     let addr = listener.local_addr()?;
 
+    // The SECOND listener — the rmcp `cc_squash_retrieve` MCP server — always on an
+    // OS-assigned 127.0.0.1 port, isolated from the relay listener so a panic in the
+    // MCP handler can never drop a relay connection.
+    let mcp_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let mcp_addr = mcp_listener.local_addr()?;
+
     // The Go control plane reads the chosen port from stderr to point Claude
     // Code at the relay.
     eprintln!("ccs-proxy listening on http://{addr}");
-    tracing::info!(%addr, "ccs-proxy relay starting (Layer 1)");
+    tracing::info!(%addr, %mcp_addr, "ccs-proxy relay starting (Layer 1)");
 
-    let state = AppState::new()?;
+    let store = Arc::new(RefStore::open(refs_db_path(args.state_dir.as_deref())).await?);
+    let state = AppState::new(store)?;
 
     // A seam `shutdown` frame and a SIGTERM/SIGINT both resolve through this one
     // notify, so the control plane can step the proxy down over the socket.
@@ -65,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
                     state.clone(),
                     shutdown.clone(),
                     addr.port(),
+                    mcp_addr.port(),
                 ));
             }
             Err(e) => {
@@ -74,6 +89,16 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::info!("no --socket; serving standalone (no-seam dev mode)");
     }
+
+    // The MCP server runs as its own task on its own listener, isolated from the
+    // relay: a panic or error here cannot drop a relay connection. It has no
+    // graceful-shutdown of its own — when the relay's `serve` returns (signal or
+    // seam `shutdown`), `main` returns and the runtime tears this task down. Drains
+    // are a relay concern (minutes-long SSE); a retrieve is a sub-second round trip.
+    let mcp_state = state.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(mcp_listener, mcp_router(mcp_state)).await;
+    });
 
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal(shutdown))
@@ -109,5 +134,15 @@ async fn shutdown_signal(seam: Arc<Notify>) {
 fn warn_if_unset(var: &str) {
     if std::env::var_os(var).is_none() {
         tracing::warn!(env = var, "expected environment variable is unset");
+    }
+}
+
+/// The refs database path: `<state_dir>/refs.db` under the seam, else an
+/// ephemeral temp path keyed by pid for no-seam dev mode. The store is always
+/// present, so dev mode still gets a real (throwaway) db.
+fn refs_db_path(state_dir: Option<&str>) -> PathBuf {
+    match state_dir {
+        Some(dir) => PathBuf::from(dir).join("refs.db"),
+        None => std::env::temp_dir().join(format!("ccs-refs-{}.db", std::process::id())),
     }
 }

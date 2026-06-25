@@ -4,20 +4,39 @@
 //! passthrough even for a body that would otherwise synthesize.
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use ccs_proxy::config::RelayConfig;
 use ccs_proxy::demux::{SessionCtx, SessionToken};
 use ccs_proxy::{router, AppState};
+use ccs_refs::RefStore;
 use reqwest::Url;
+use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// An ephemeral refs store under a process-lifetime temp dir; each call gets its
+/// own db file.
+async fn test_store() -> Arc<RefStore> {
+    static TEST_DIR: LazyLock<TempDir> = LazyLock::new(|| TempDir::new().expect("temp dir"));
+    static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    let path = TEST_DIR.path().join(format!(
+        "refs-{}.db",
+        DB_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    Arc::new(RefStore::open(path).await.expect("open refs db"))
+}
 
 /// Spawn the real relay app against `upstream`, returning its local address and
 /// the shared `AppState` so a test can register sessions and flip control flags.
 async fn spawn_proxy_with_state(upstream: &str) -> (SocketAddr, AppState) {
-    let state =
-        AppState::with_upstream(Url::parse(upstream).expect("upstream url")).expect("state");
+    let state = AppState::with_upstream(
+        Url::parse(upstream).expect("upstream url"),
+        test_store().await,
+    )
+    .expect("state");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind proxy");
@@ -62,6 +81,8 @@ fn register(state: &AppState, token: &str) {
         SessionToken(token.to_owned()),
         SessionCtx {
             config: RelayConfig::default(),
+            session_id: ccs_core::SessionId::new(token),
+            econ: None,
         },
     );
 }

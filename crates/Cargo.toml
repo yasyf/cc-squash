@@ -24,6 +24,8 @@ tower-http = { version = "0.6", features = ["catch-panic"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "io-util", "sync"] }
 # bytes::Bytes is the body chunk type shared by axum and reqwest.
 bytes = "1"
+# Stream combinators for the L0 usage tap: map the upstream byte stream verbatim.
+futures-util = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 memchr = "2"

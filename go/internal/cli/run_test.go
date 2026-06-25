@@ -3,6 +3,8 @@ package cli
 import (
 	"slices"
 	"testing"
+
+	"github.com/yasyf/cc-squash/go/internal/control"
 )
 
 func TestProxyEnvBakesProxyVars(t *testing.T) {
@@ -29,5 +31,40 @@ func TestProxyEnvBakesProxyVars(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("got %d ANTHROPIC_BASE_URL entries, want exactly 1", n)
+	}
+}
+
+// TestMCPConfigJSON pins the exact --mcp-config blob ccs run injects: a single
+// http server keyed "cc-squash" pointing at the per-session mcpPort+token /mcp
+// endpoint (the rmcp cc_squash_retrieve listener).
+func TestMCPConfigJSON(t *testing.T) {
+	resp := control.Response{MCPPort: 50517, Token: "tok-abc"}
+	got, err := mcpConfigJSON(mcpURL(resp))
+	if err != nil {
+		t.Fatalf("mcpConfigJSON: %v", err)
+	}
+	want := `{"mcpServers":{"cc-squash":{"type":"http","url":"http://127.0.0.1:50517/s/tok-abc/mcp"}}}`
+	if got != want {
+		t.Fatalf("mcp config = %s, want %s", got, want)
+	}
+}
+
+// TestClaudeArgvPrependsMCPConfig is the argv-placement assertion: --mcp-config
+// and its JSON lead the argv, ahead of the user's verbatim args, so retrieve is
+// registered regardless of what the user passes.
+func TestClaudeArgvPrependsMCPConfig(t *testing.T) {
+	resp := control.Response{Port: 8080, MCPPort: 50517, Token: "tok-abc"}
+	got, err := claudeArgv(resp, []string{"--resume", "--model", "opus"})
+	if err != nil {
+		t.Fatalf("claudeArgv: %v", err)
+	}
+	want := []string{
+		"claude",
+		"--mcp-config",
+		`{"mcpServers":{"cc-squash":{"type":"http","url":"http://127.0.0.1:50517/s/tok-abc/mcp"}}}`,
+		"--resume", "--model", "opus",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("claudeArgv = %q, want %q", got, want)
 	}
 }

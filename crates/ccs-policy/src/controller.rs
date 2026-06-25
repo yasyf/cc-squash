@@ -78,13 +78,18 @@ pub enum SquashDecision {
     },
 }
 
-/// The continuous squash controller: the economics view, the live cache state, and
-/// the EWMA estimate of remaining turns.
+/// The continuous squash controller: the economics view, the live cache state, the
+/// EWMA estimate of remaining turns, and the NPV bar a flush must clear.
+///
+/// `npv_floor` is `EconomicsConfig.npv_floor` (the per-egress economics seam);
+/// `select_strategy` reads the SAME floor so both gate sites compare against one
+/// value. The default `0.0` keeps the original strict-positive behavior.
 #[derive(Debug, Clone)]
 pub struct Controller {
     pub econ: ModelEconomics,
     pub cache: CacheState,
     pub remaining_turns: f64,
+    pub npv_floor: f64,
 }
 
 impl Controller {
@@ -110,7 +115,8 @@ impl Controller {
         let status = Status {
             cold: self.cache.is_cold(now),
             sub_floor: self.post_squash_below_floor(prompt, pending),
-            warm_clears: npv(pending, &self.cache, &self.econ, self.remaining_turns, now) > 0.0,
+            warm_clears: npv(pending, &self.cache, &self.econ, self.remaining_turns, now)
+                > self.npv_floor,
             free_bust_imminent: prompt.free_bust.is_some(),
         };
         // Matched alongside `prompt.free_bust` so the free-bust arm recovers the

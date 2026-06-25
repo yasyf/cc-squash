@@ -13,8 +13,10 @@ use std::time::Duration;
 use ccs_proxy::demux::SessionToken;
 use ccs_proxy::seam::run_seam;
 use ccs_proxy::{router, AppState};
+use ccs_refs::RefStore;
 use reqwest::Url;
 use serde_json::Value;
+use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
@@ -29,8 +31,28 @@ fn socket_path(tag: &str) -> std::path::PathBuf {
     path
 }
 
-fn state() -> AppState {
-    AppState::with_upstream(Url::parse("http://127.0.0.1:1").expect("upstream url")).expect("state")
+/// An ephemeral refs store under a process-lifetime temp dir; each call gets its
+/// own db file so concurrent tests never share state.
+async fn test_store() -> std::sync::Arc<RefStore> {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::LazyLock;
+
+    static TEST_DIR: LazyLock<TempDir> = LazyLock::new(|| TempDir::new().expect("temp dir"));
+    static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    let path = TEST_DIR.path().join(format!(
+        "refs-{}.db",
+        DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::sync::Arc::new(RefStore::open(path).await.expect("open refs db"))
+}
+
+async fn state() -> AppState {
+    AppState::with_upstream(
+        Url::parse("http://127.0.0.1:1").expect("upstream url"),
+        test_store().await,
+    )
+    .expect("state")
 }
 
 /// Read one line-delimited JSON frame from the accepted peer side.
@@ -45,12 +67,18 @@ async fn read_frame(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Value {
 async fn registers_then_applies_mint_kill_and_shutdown() {
     let path = socket_path("control");
     let listener = UnixListener::bind(&path).expect("bind seam");
-    let state = state();
+    let state = state().await;
     let shutdown = Arc::new(Notify::new());
 
     // Drive the proxy's seam client against the fake peer.
     let client = UnixStream::connect(&path).await.expect("connect seam");
-    let seam = tokio::spawn(run_seam(client, state.clone(), shutdown.clone(), 54321));
+    let seam = tokio::spawn(run_seam(
+        client,
+        state.clone(),
+        shutdown.clone(),
+        54321,
+        54322,
+    ));
 
     let (peer, _) = listener.accept().await.expect("accept proxy");
     let (peer_read, mut peer_write) = peer.into_split();
@@ -60,6 +88,7 @@ async fn registers_then_applies_mint_kill_and_shutdown() {
     let reg = read_frame(&mut peer_read).await;
     assert_eq!(reg["type"], "register");
     assert_eq!(reg["port"], 54321);
+    assert_eq!(reg["mcp_port"], 54322);
     assert_eq!(reg["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(
         reg["pid"].as_u64().expect("pid is a number"),
@@ -105,11 +134,11 @@ async fn registers_then_applies_mint_kill_and_shutdown() {
 async fn evict_removes_a_minted_session() {
     let path = socket_path("evict");
     let listener = UnixListener::bind(&path).expect("bind seam");
-    let state = state();
+    let state = state().await;
     let shutdown = Arc::new(Notify::new());
 
     let client = UnixStream::connect(&path).await.expect("connect seam");
-    tokio::spawn(run_seam(client, state.clone(), shutdown, 40000));
+    tokio::spawn(run_seam(client, state.clone(), shutdown, 40000, 40010));
 
     let (peer, _) = listener.accept().await.expect("accept proxy");
     let (peer_read, mut peer_write) = peer.into_split();
@@ -136,11 +165,11 @@ async fn evict_removes_a_minted_session() {
 async fn malformed_frame_does_not_stop_the_loop() {
     let path = socket_path("malformed");
     let listener = UnixListener::bind(&path).expect("bind seam");
-    let state = state();
+    let state = state().await;
     let shutdown = Arc::new(Notify::new());
 
     let client = UnixStream::connect(&path).await.expect("connect seam");
-    tokio::spawn(run_seam(client, state.clone(), shutdown, 40001));
+    tokio::spawn(run_seam(client, state.clone(), shutdown, 40001, 40011));
 
     let (peer, _) = listener.accept().await.expect("accept proxy");
     let (peer_read, mut peer_write) = peer.into_split();
@@ -203,8 +232,11 @@ async fn absent_socket_does_not_panic_and_relay_still_serves() {
 
 /// Spawn the relay app against `upstream` with no seam, returning its address.
 async fn spawn_standalone_proxy(upstream: &str) -> SocketAddr {
-    let state =
-        AppState::with_upstream(Url::parse(upstream).expect("upstream url")).expect("state");
+    let state = AppState::with_upstream(
+        Url::parse(upstream).expect("upstream url"),
+        test_store().await,
+    )
+    .expect("state");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind proxy");

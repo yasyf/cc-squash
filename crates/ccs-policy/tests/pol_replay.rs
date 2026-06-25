@@ -82,6 +82,7 @@ fn controller(ttl: f64, remaining_turns: f64) -> Controller {
         econ: opus(),
         cache: cache(ttl),
         remaining_turns,
+        npv_floor: 0.0,
     }
 }
 

@@ -78,6 +78,11 @@ func (c *Client) Shadow(on bool) (Response, error) {
 	return c.do(Request{Op: OpShadow, On: on}, 2*time.Second)
 }
 
+// Gc asks the daemon to sweep the proxy's ref store to its reachable set.
+func (c *Client) Gc() (Response, error) {
+	return c.do(Request{Op: OpGc}, 3*time.Second)
+}
+
 // Shutdown asks the daemon to step down and release the socket. An OK reply
 // means it accepted; use WaitGone to confirm the socket went dead.
 func (c *Client) Shutdown() (Response, error) {

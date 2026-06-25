@@ -90,11 +90,18 @@ impl BatchView for SquashBatch {
 ///    anything else stays `Keep`.
 /// 2. The pre-gate refuses tiny or net-lengthening rewrites (`Keep`).
 /// 3. The cache-cost fold keeps a segment that is pinned, whose single-candidate
-///    NPV is non-positive, or that is under the pre-gate floor.
+///    NPV does not clear `npv_floor`, or that is under the pre-gate floor.
 /// 4. Otherwise dispatch on the LLM's `choice`; `compress` lowers to a reversible
 ///    reference.
 ///
+/// `npv_floor` is `EconomicsConfig.npv_floor` — the SAME bar the [`Controller`]'s
+/// warm-flush gate uses, so a segment and its batch agree on the threshold. The
+/// default `0.0` keeps the original "strictly positive NPV" behavior.
+///
+/// [`Controller`]: crate::controller::Controller
+///
 /// Never returns `Drop` — `Drop` is the HARD-ladder fallback tier only.
+#[allow(clippy::too_many_arguments)] // the NPV gate's inputs are irreducible: segment, decision, candidate, economics, cache, turns, now, floor.
 pub fn select_strategy(
     seg: &Segment,
     decision: &ContentDecision,
@@ -103,6 +110,7 @@ pub fn select_strategy(
     cache: &CacheState,
     remaining_turns: f64,
     now: f64,
+    npv_floor: f64,
 ) -> Strategy {
     let chars = approx_chars(seg);
 
@@ -122,7 +130,7 @@ pub fn select_strategy(
 
     let batch = SquashBatch::of_single(cand);
     if seg.pinned
-        || npv(&batch, cache, econ, remaining_turns, now) <= 0.0
+        || npv(&batch, cache, econ, remaining_turns, now) <= npv_floor
         || chars < PRE_GATE_MIN_CHARS
     {
         return Strategy::Keep;

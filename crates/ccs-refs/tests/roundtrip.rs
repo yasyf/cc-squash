@@ -126,11 +126,17 @@ async fn retrieve_unknown_is_miss_not_panic() {
     let (_dir, store) = store().await;
     let unknown = content_address(b"missing");
     assert_eq!(
-        store.retrieve(&unknown, None, 1.0).await.unwrap(),
+        store
+            .retrieve(&unknown, &SessionId::new("s"), None, 1.0)
+            .await
+            .unwrap(),
         RetrieveResult::Miss
     );
     assert_eq!(
-        store.retrieve(&unknown, Some("q"), 1.0).await.unwrap(),
+        store
+            .retrieve(&unknown, &SessionId::new("s"), Some("q"), 1.0)
+            .await
+            .unwrap(),
         RetrieveResult::Miss
     );
     // The caller renders the recovery hint on a Miss.
@@ -151,12 +157,51 @@ async fn retrieve_without_query_returns_full_text() {
         )
         .await
         .unwrap();
-    match store.retrieve(&rec.ref_id, None, 2.0).await.unwrap() {
+    match store
+        .retrieve(&rec.ref_id, &SessionId::new("s"), None, 2.0)
+        .await
+        .unwrap()
+    {
         RetrieveResult::Hit { text, access_count } => {
             assert_eq!(text, original);
             assert_eq!(access_count, 1);
         }
         RetrieveResult::Miss => panic!("expected a hit"),
+    }
+}
+
+#[tokio::test]
+async fn retrieve_is_scoped_to_the_minting_session() {
+    let (_dir, store) = store().await;
+    let rec = store
+        .put(
+            b"secret owned by session a",
+            &MessageId::new("u"),
+            &SessionId::new("sess-a"),
+            SegmentKind::Tools,
+            1.0,
+        )
+        .await
+        .unwrap();
+
+    // A retrieve scoped to a different session is an indistinguishable Miss, and
+    // it must not bump access_count.
+    assert_eq!(
+        store
+            .retrieve(&rec.ref_id, &SessionId::new("sess-b"), None, 2.0)
+            .await
+            .unwrap(),
+        RetrieveResult::Miss,
+    );
+    // The owning session still sees access_count == 1 (the cross-session attempt
+    // never touched the row).
+    match store
+        .retrieve(&rec.ref_id, &SessionId::new("sess-a"), None, 3.0)
+        .await
+        .unwrap()
+    {
+        RetrieveResult::Hit { access_count, .. } => assert_eq!(access_count, 1),
+        RetrieveResult::Miss => panic!("the owning session must hit"),
     }
 }
 

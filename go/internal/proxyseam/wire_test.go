@@ -24,10 +24,11 @@ func TestRoundTripDispatch(t *testing.T) {
 		id  string
 		msg any
 	}{
-		{"register", Register{Type: MsgRegister, Port: 50516, Version: "0.1.0", PID: 4242}},
+		{"register", Register{Type: MsgRegister, Port: 50516, MCPPort: 50517, Version: "0.1.0", PID: 4242}},
 		{"evict", Evict{Type: MsgEvict, Token: "tok-abc"}},
 		{"shadow", Shadow{Type: MsgShadow, On: true}},
 		{"kill", Kill{Type: MsgKill, On: true}},
+		{"gc", Gc{Type: MsgGc}},
 		{"shutdown", Shutdown{Type: MsgShutdown}},
 	} {
 		t.Run(tc.id, func(t *testing.T) {
@@ -64,6 +65,24 @@ func TestRoundTripMint(t *testing.T) {
 	}
 	if got.Type != want.Type || got.Token != want.Token || !bytes.Equal(got.Config, want.Config) {
 		t.Fatalf("mint mismatch: got %+v, want %+v", got, want)
+	}
+}
+
+// TestRegisterDecodesMCPPort pins the Rust->Go register-frame contract: the
+// proxy serializes its SECOND listener's port under the JSON key "mcp_port", and
+// Go must read it onto Register.MCPPort. The literal here is the shape seam.rs
+// emits.
+func TestRegisterDecodesMCPPort(t *testing.T) {
+	decoded, err := Decode([]byte(`{"type":"register","port":50516,"mcp_port":50517,"version":"0.1.0","pid":4242}`))
+	if err != nil {
+		t.Fatalf("decode register: %v", err)
+	}
+	reg, ok := decoded.(Register)
+	if !ok {
+		t.Fatalf("decoded %T, want Register", decoded)
+	}
+	if reg.Port != 50516 || reg.MCPPort != 50517 {
+		t.Fatalf("register = port %d mcp_port %d, want 50516/50517", reg.Port, reg.MCPPort)
 	}
 }
 

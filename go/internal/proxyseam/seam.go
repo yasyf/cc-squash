@@ -110,7 +110,7 @@ func (s *Server) serveConn(conn net.Conn, onRegister func(Register)) {
 		default:
 			switch m := msg.(type) {
 			case Register:
-				s.log.Printf("proxyseam: proxy registered (port=%d version=%s pid=%d)", m.Port, m.Version, m.PID)
+				s.log.Printf("proxyseam: proxy registered (port=%d mcp_port=%d version=%s pid=%d)", m.Port, m.MCPPort, m.Version, m.PID)
 				onRegister(m)
 			default:
 				s.log.Printf("proxyseam: ignoring unexpected %T frame from proxy", m)
@@ -145,6 +145,11 @@ func (s *Server) SendShadow(on bool) error {
 // SendKill toggles the proxy's kill switch.
 func (s *Server) SendKill(on bool) error {
 	return s.send(Kill{Type: MsgKill, On: on})
+}
+
+// SendGc tells the proxy to sweep its ref store down to the reachable set.
+func (s *Server) SendGc() error {
+	return s.send(Gc{Type: MsgGc})
 }
 
 // SendShutdown tells the proxy to step down.

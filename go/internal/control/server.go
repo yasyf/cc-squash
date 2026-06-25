@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yasyf/cc-squash/go/internal/config"
 	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
 	"github.com/yasyf/cc-squash/go/internal/supervisor"
@@ -67,6 +68,13 @@ type Server struct {
 	// handler establishes the happens-before, so handlers read it without a lock.
 	triggerShutdown context.CancelFunc
 
+	// relayConfig is the seam JSON parsed from config.toml once at daemon start
+	// and pushed verbatim with every mint. Set in serve before the accept loop or
+	// bring-up spawns, so the go-statements establish the happens-before and the
+	// mint/repush readers take no lock. A load error fails open to {} so a bad
+	// config never blocks minting.
+	relayConfig json.RawMessage
+
 	// wg tracks every daemon goroutine (the startup bring-up, the supervise loop,
 	// each connection handler); serve Waits on it before returning.
 	wg sync.WaitGroup
@@ -79,6 +87,7 @@ type Server struct {
 	mu        sync.Mutex
 	tokens    map[Token]struct{}
 	proxyPort int
+	mcpPort   int
 	proxyPID  int
 	kill      bool
 	shadow    bool
@@ -129,6 +138,16 @@ func (s *Server) serve(ctx context.Context) error {
 	// stop cancels ctx, so it doubles as the over-the-socket shutdown trigger
 	// (OpShutdown). Set before the accept loop spawns any handler.
 	s.triggerShutdown = stop
+
+	// Load the relay config once, before any goroutine that pushes a mint spawns.
+	// Fail-open: a missing or malformed config.toml degrades to {} (engine
+	// defaults) and is logged, never blocks minting.
+	cfg, err := config.Load()
+	if err != nil {
+		s.log.Printf("config: load failed, pushing engine defaults: %v", err)
+		cfg = json.RawMessage("{}")
+	}
+	s.relayConfig = cfg
 
 	// Bind the proxy.sock seam BEFORE spawning the child, so the child has
 	// something to connect to the instant it binds its TCP port.
@@ -255,6 +274,7 @@ func (s *Server) onRegister(reg proxyseam.Register) {
 	s.policy.NoteRegistered(reg)
 	s.mu.Lock()
 	s.proxyPort = reg.Port
+	s.mcpPort = reg.MCPPort
 	s.proxyPID = reg.PID
 	s.mu.Unlock()
 	s.readyOnce.Do(func() { close(s.proxyReady) })
@@ -285,7 +305,7 @@ func (s *Server) spawnProxyChild() error {
 		return err
 	}
 	defer func() { _ = logFile.Close() }()
-	cmd := exec.Command(bin, "--socket", s.proxySock, "--port", strconv.Itoa(s.currentProxyPort()))
+	cmd := exec.Command(bin, "--socket", s.proxySock, "--port", strconv.Itoa(s.currentProxyPort()), "--state-dir", paths.StateDir())
 	cmd.Stdin = nil
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from our session
@@ -376,6 +396,8 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 		return s.handleKill(req.On)
 	case OpShadow:
 		return s.handleShadow(req.On)
+	case OpGc:
+		return s.handleGc()
 	case OpShutdown:
 		s.triggerShutdown()
 		return Response{OK: true, Version: version.String()}
@@ -394,6 +416,7 @@ func (s *Server) handleMint(ctx context.Context) Response {
 
 	s.mu.Lock()
 	port := s.proxyPort
+	mcpPort := s.mcpPort
 	s.mu.Unlock()
 	if port == 0 {
 		return Response{OK: false, Error: "proxy data plane is not ready"}
@@ -407,12 +430,12 @@ func (s *Server) handleMint(ctx context.Context) Response {
 	s.tokens[token] = struct{}{}
 	s.mu.Unlock()
 
-	if err := s.seam.SendMint(string(token), nil); err != nil {
+	if err := s.seam.SendMint(string(token), s.relayConfig); err != nil {
 		// Fail-open: the token is recorded and will be re-pushed on the next proxy
 		// respawn; the URL must still be usable now.
 		s.log.Printf("mint: push to proxy failed (token recorded, re-pushed on respawn): %v", err)
 	}
-	return Response{OK: true, Port: port, Token: string(token)}
+	return Response{OK: true, Port: port, MCPPort: mcpPort, Token: string(token)}
 }
 
 // awaitProxyReady blocks until the proxy registers, the wait times out, or ctx
@@ -459,6 +482,21 @@ func (s *Server) handleShadow(on bool) Response {
 	return Response{OK: true, Shadow: on}
 }
 
+// handleGc forwards a sweep request to the proxy over the seam, which computes
+// the reachable set from every session's staged refs and evicts the rest. It is
+// fail-open: with no proxy connected there is nothing to sweep, so the
+// not-connected sentinel is reported as a benign error, not a daemon fault.
+func (s *Server) handleGc() Response {
+	if err := s.seam.SendGc(); err != nil {
+		if errors.Is(err, proxyseam.ErrProxyNotConnected) {
+			return Response{OK: false, Error: "proxy data plane is not connected; nothing to sweep"}
+		}
+		s.log.Printf("gc: push to proxy failed: %v", err)
+		return Response{OK: false, Error: err.Error()}
+	}
+	return Response{OK: true}
+}
+
 // publishStatus mirrors the live snapshot to status.json so out-of-process
 // readers (`ccs status`, `ccs kill status`) see the daemon's current state
 // without querying the socket. A write failure is logged, not fatal — the
@@ -481,7 +519,7 @@ func (s *Server) repushTokens() {
 	}
 	s.mu.Unlock()
 	for _, t := range tokens {
-		if err := s.seam.SendMint(string(t), nil); err != nil {
+		if err := s.seam.SendMint(string(t), s.relayConfig); err != nil {
 			s.log.Printf("re-push token to respawned proxy: %v", err)
 		}
 	}
@@ -496,6 +534,7 @@ func (s *Server) snapshot() StatusSnapshot {
 		Version:     version.String(),
 		GeneratedAt: time.Now().UTC(),
 		ProxyPort:   s.proxyPort,
+		ProxyMCPort: s.mcpPort,
 		ProxyPID:    s.proxyPID,
 		Sessions:    len(s.tokens),
 		Kill:        s.kill,

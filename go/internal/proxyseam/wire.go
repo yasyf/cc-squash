@@ -23,14 +23,17 @@ const (
 	MsgEvict    MsgType = "evict"
 	MsgShadow   MsgType = "shadow"
 	MsgKill     MsgType = "kill"
+	MsgGc       MsgType = "gc"
 	MsgShutdown MsgType = "shutdown"
 )
 
 // Register is the proxy's announcement, sent once right after it binds its TCP
-// port: the bound 127.0.0.1 port, its semver, and its OS pid.
+// ports: the bound 127.0.0.1 relay port, the SECOND listener's MCP port (the
+// rmcp cc_squash_retrieve server), its semver, and its OS pid.
 type Register struct {
 	Type    MsgType `json:"type"`
 	Port    int     `json:"port"`
+	MCPPort int     `json:"mcp_port"`
 	Version string  `json:"version"`
 	PID     int     `json:"pid"`
 }
@@ -59,6 +62,12 @@ type Shadow struct {
 type Kill struct {
 	Type MsgType `json:"type"`
 	On   bool    `json:"on"`
+}
+
+// Gc tells the proxy to sweep its ref store: it computes the reachable set from
+// every session's staged refs and evicts the rest under the grace/byte budget.
+type Gc struct {
+	Type MsgType `json:"type"`
 }
 
 // Shutdown tells the proxy to step down.
@@ -95,6 +104,8 @@ func Decode(line []byte) (any, error) {
 		return unmarshal[Shadow](line)
 	case MsgKill:
 		return unmarshal[Kill](line)
+	case MsgGc:
+		return unmarshal[Gc](line)
 	case MsgShutdown:
 		return unmarshal[Shutdown](line)
 	default:
