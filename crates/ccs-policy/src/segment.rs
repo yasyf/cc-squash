@@ -7,6 +7,7 @@
 
 use ccs_core::{estimate_chars_proxy, ByteOffset, Generation, MessageId, SegmentKind, TokenCount};
 
+use crate::config::PolicyConfig;
 use crate::wire::{ContentBlock, MessageContent, Role, WireBody};
 
 /// The recency window: the most recent N segments are always kept verbatim.
@@ -158,16 +159,17 @@ pub fn fresh_boundary(segments: &[Segment]) -> Generation {
 }
 
 /// Whether `seg` sits inside the recency window — the most recent
-/// [`RECENCY_WINDOW_N`] segments, which are never compaction candidates regardless
-/// of pressure. A hard, position-based floor that stacks on the structural pins.
-pub fn is_recency_protected(seg: &Segment, segments: &[Segment]) -> bool {
-    seg.index >= segments.len().saturating_sub(RECENCY_WINDOW_N)
+/// [`PolicyConfig::recency_window_n`] segments, which are never compaction
+/// candidates regardless of pressure. A hard, position-based floor that stacks on
+/// the structural pins.
+pub fn is_recency_protected(seg: &Segment, segments: &[Segment], cfg: &PolicyConfig) -> bool {
+    seg.index >= segments.len().saturating_sub(cfg.recency_window_n)
 }
 
 /// Whether `seg` may be compacted: it is neither structurally pinned (last segment
 /// or in-flight tool_use) nor inside the recency window.
-pub fn is_prune_candidate(seg: &Segment, segments: &[Segment]) -> bool {
-    !seg.pinned && !is_recency_protected(seg, segments)
+pub fn is_prune_candidate(seg: &Segment, segments: &[Segment], cfg: &PolicyConfig) -> bool {
+    !seg.pinned && !is_recency_protected(seg, segments, cfg)
 }
 
 struct Build<'a> {

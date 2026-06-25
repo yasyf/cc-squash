@@ -2,7 +2,7 @@
 //! `wiremock` server, the agent (client + decision + folder) stays real.
 
 use ccs_core::ChoiceTag;
-use ccs_policy::WorkingState;
+use ccs_policy::{PolicyConfig, WorkingState};
 use ccs_summarizer::{decide, fold, SessionAuthContext, SummarizerClient};
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::Url;
@@ -51,7 +51,13 @@ async fn decide_parses_canned_json() {
     let upstream = mock_with_text(r#"{"choice":"summarize","summary_content":"condensed"}"#).await;
     let client = SummarizerClient::new(auth_context(&upstream.uri()));
 
-    let decision = decide(&client, &long_content(), &["NARRATIVE"]).await;
+    let decision = decide(
+        &client,
+        &long_content(),
+        &["NARRATIVE"],
+        &PolicyConfig::default(),
+    )
+    .await;
 
     assert_eq!(decision.choice, ChoiceTag::Summarize);
     assert_eq!(decision.summary_content.as_deref(), Some("condensed"));
@@ -65,7 +71,7 @@ async fn decide_extracts_json_amid_prose() {
     .await;
     let client = SummarizerClient::new(auth_context(&upstream.uri()));
 
-    let decision = decide(&client, &long_content(), &[]).await;
+    let decision = decide(&client, &long_content(), &[], &PolicyConfig::default()).await;
 
     assert_eq!(decision.choice, ChoiceTag::Truncate);
     assert_eq!(decision.ranges_to_keep.len(), 1);
@@ -76,7 +82,9 @@ async fn normalize_self_repair() {
     let truncate_no_ranges = mock_with_text(r#"{"choice":"truncate"}"#).await;
     let client = SummarizerClient::new(auth_context(&truncate_no_ranges.uri()));
     assert_eq!(
-        decide(&client, &long_content(), &[]).await.choice,
+        decide(&client, &long_content(), &[], &PolicyConfig::default())
+            .await
+            .choice,
         ChoiceTag::Keep,
         "truncate without ranges self-repairs to Keep",
     );
@@ -84,7 +92,9 @@ async fn normalize_self_repair() {
     let summarize_no_content = mock_with_text(r#"{"choice":"summarize"}"#).await;
     let client = SummarizerClient::new(auth_context(&summarize_no_content.uri()));
     assert_eq!(
-        decide(&client, &long_content(), &[]).await.choice,
+        decide(&client, &long_content(), &[], &PolicyConfig::default())
+            .await
+            .choice,
         ChoiceTag::Compress,
         "summarize without content self-repairs to Compress",
     );
@@ -101,7 +111,9 @@ async fn fail_to_keep_on_500() {
     let client = SummarizerClient::new(auth_context(&upstream.uri()));
 
     assert_eq!(
-        decide(&client, &long_content(), &[]).await.choice,
+        decide(&client, &long_content(), &[], &PolicyConfig::default())
+            .await
+            .choice,
         ChoiceTag::Keep,
     );
 }
@@ -117,7 +129,7 @@ async fn pregate_zero_http() {
         .await;
     let client = SummarizerClient::new(auth_context(&upstream.uri()));
 
-    let decision = decide(&client, "tiny", &[]).await;
+    let decision = decide(&client, "tiny", &[], &PolicyConfig::default()).await;
 
     assert_eq!(decision.choice, ChoiceTag::Keep);
     let received = upstream
@@ -141,7 +153,7 @@ async fn request_carries_model_and_auth() {
         .await;
     let client = SummarizerClient::new(auth_context(&upstream.uri()));
 
-    decide(&client, &long_content(), &[]).await;
+    decide(&client, &long_content(), &[], &PolicyConfig::default()).await;
 
     let received = upstream
         .received_requests()

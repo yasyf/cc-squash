@@ -7,7 +7,7 @@ mod common;
 use ccs_core::{MessageId, SegmentKind};
 use ccs_policy::segment::{is_prune_candidate, segment_prompt};
 use ccs_policy::wire::parse_body;
-use ccs_policy::Segment;
+use ccs_policy::{PolicyConfig, Segment};
 
 use common::{client_tool_pair, in_flight_tool_use, prompt, server_tool_turn};
 
@@ -95,7 +95,7 @@ fn in_flight_tool_use_is_pinned_current_and_never_a_candidate() {
     assert!(last.is_current, "the in-flight head is current");
     assert!(last.pinned, "the in-flight head is pinned");
     assert!(
-        !is_prune_candidate(last, &segs),
+        !is_prune_candidate(last, &segs, &PolicyConfig::default()),
         "the in-flight head is never a prune candidate",
     );
 }

@@ -15,8 +15,6 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct RelayConfig {
     pub economics: EconomicsKnobs,
-    // TODO(4e): consumed by select_strategy's policy knobs
-    #[allow(dead_code)]
     pub policy: PolicyKnobs,
 }
 

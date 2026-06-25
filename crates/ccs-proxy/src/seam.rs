@@ -396,7 +396,12 @@ mod tests {
             .unwrap()
             .ref_id;
 
-        let mut econ = SessionEcon::new(test_cache(), test_auth(), 0.0);
+        let mut econ = SessionEcon::new(
+            test_cache(),
+            test_auth(),
+            0.0,
+            ccs_policy::PolicyConfig::default(),
+        );
         econ.staged = Some(StagedPlan {
             by_content: HashMap::from([(
                 staged_id.clone(),
@@ -427,7 +432,6 @@ mod tests {
             },
         );
 
-        // The reachable set is exactly the staged ref.
         let reachable = reachable_refs(&state);
         assert_eq!(reachable.len(), 1);
         assert!(reachable.contains(&staged_id));

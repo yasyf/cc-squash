@@ -1,20 +1,23 @@
 //! The L2 on-path interceptor. Fails open to identity on any uncertainty.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ccs_core::{estimate_chars_proxy, RefId, TokenCount};
+use ccs_core::{estimate_chars_proxy, RefId, SegmentKind, TokenCount, TokenScale};
 use ccs_economics::{CacheState, Cost, ModelEconomics};
 use ccs_policy::budget::{default_compact, hard_target, soft_pressure, Pressure};
-use ccs_policy::wire::{parse_body, MessageContent, WireBody};
+use ccs_policy::wire::{parse_body, WireBody};
 use ccs_policy::{
-    is_recency_protected, segment_payload_bytes, segment_prompt, select_strategy, splice, validate,
-    BreakpointPlan, Controller, FreeBustTrigger, HoldReason, PromptState, RenderedSegment, Segment,
-    SegmentTarget, SquashBatch, SquashCandidate, SquashDecision, Strategy,
+    is_recency_protected, segment_payload_bytes, segment_prompt, select_strategy, splice,
+    squash_targets, validate, BreakpointPlan, Controller, FreeBustTrigger, HoldReason,
+    PolicyConfig, PromptState, RenderedSegment, ReplacementKind, Segment, SquashBatch,
+    SquashCandidate, SquashDecision, Strategy,
 };
-use ccs_refs::{content_address, render_placeholder};
+use ccs_refs::{
+    can_dedupe_from, content_address, dedupe_key, render_backref, render_placeholder, should_dedupe,
+};
 
 use crate::staging::{StagedEntry, StagedPlan};
 
@@ -26,6 +29,8 @@ const FUSE_UP: bool = false;
 
 const DROP_PLACEHOLDER: &str = "[cc-squash: dropped under budget pressure]";
 
+const DEDUPE_ALLOW_ASSISTANT: bool = true;
+
 pub struct Intercepted {
     pub bytes: Bytes,
     pub predicted_bust: Option<Cost>,
@@ -35,9 +40,11 @@ pub struct InterceptInputs {
     pub econ: ModelEconomics,
     pub cache: CacheState,
     pub npv_floor: f64,
+    pub policy: PolicyConfig,
     pub remaining_turns: f64,
     pub hot_refs: HashSet<RefId>,
     pub staged: Option<StagedPlan>,
+    pub token_scale: TokenScale,
     pub now: f64,
 }
 
@@ -89,7 +96,7 @@ fn intercept(bytes: &Bytes, inputs: &InterceptInputs) -> Intercepted {
 
     match &inputs.staged {
         Some(plan) => continuous(bytes, &body, &segments, plan, inputs),
-        None => deterministic_compact(bytes, &body, &segments),
+        None => deterministic_compact(bytes, &body, &segments, &inputs.policy),
     }
 }
 
@@ -106,7 +113,7 @@ fn continuous(
             let entry = plan
                 .by_content
                 .get(&content_address(&segment_payload_bytes(seg, body)))?;
-            let cand = live_candidate(seg, segments, body, entry)?;
+            let cand = live_candidate(seg, segments, body, entry, inputs.token_scale)?;
             let strategy = select_strategy(
                 seg,
                 &entry.decision,
@@ -116,6 +123,7 @@ fn continuous(
                 inputs.remaining_turns,
                 inputs.now,
                 inputs.npv_floor,
+                &inputs.policy,
             );
             (!matches!(strategy, Strategy::Keep)).then_some((seg.index, entry, cand))
         })
@@ -148,6 +156,8 @@ fn continuous(
         cache: inputs.cache.clone(),
         remaining_turns: inputs.remaining_turns,
         npv_floor: inputs.npv_floor,
+        policy: inputs.policy,
+        token_scale: inputs.token_scale,
     };
 
     match controller.decide(&prompt, &batch, inputs.now) {
@@ -155,10 +165,18 @@ fn continuous(
             breakpoint_plan,
             predicted_bust,
             ..
-        } => apply(bytes, body, &live, &breakpoint_plan, predicted_bust),
+        } => apply(
+            bytes,
+            body,
+            segments,
+            &live,
+            &breakpoint_plan,
+            predicted_bust,
+        ),
         SquashDecision::RideFreeBust { .. } => apply(
             bytes,
             body,
+            segments,
             &live,
             &BreakpointPlan::default(),
             Cost {
@@ -176,14 +194,15 @@ fn continuous(
 fn apply(
     bytes: &Bytes,
     body: &WireBody,
+    segments: &[Segment],
     live: &[(usize, &StagedEntry, SquashCandidate)],
     breakpoint_plan: &BreakpointPlan,
     predicted_bust: Cost,
 ) -> Intercepted {
-    let Some(rendered) = render_segments(body, live) else {
+    let Some(rendered) = render_segments(body, segments, live) else {
         return identity(bytes.clone());
     };
-    let plan = safe_breakpoints(body, breakpoint_plan, &rendered);
+    let plan = safe_breakpoints(breakpoint_plan, &rendered);
     match splice_and_gate(bytes, body, &rendered, &plan) {
         Some(rewritten) => Intercepted {
             bytes: rewritten,
@@ -221,13 +240,11 @@ fn splice_and_gate(
     }
 }
 
-// A hint on an untouched string-content message promotes it to an array, growing its
-// span — the gate's per-message shrink check would then reject the whole squash.
-fn safe_breakpoints(
-    body: &WireBody,
-    plan: &BreakpointPlan,
-    rendered: &[RenderedSegment],
-) -> BreakpointPlan {
+// A cache_control hint added to any UNTOUCHED message grows its span (a string
+// promotes to an array, an array gains the hint block) — the gate's per-message
+// shrink check then rejects the whole squash. Only a rewritten message shrank enough
+// to absorb the hint, so the plan keeps only those positions.
+fn safe_breakpoints(plan: &BreakpointPlan, rendered: &[RenderedSegment]) -> BreakpointPlan {
     let rewritten: std::collections::HashSet<usize> =
         rendered.iter().map(|r| r.target.message).collect();
     BreakpointPlan {
@@ -235,84 +252,128 @@ fn safe_breakpoints(
             .positions
             .iter()
             .copied()
-            .filter(|&i| {
-                rewritten.contains(&i)
-                    || body.messages.get(i).is_some_and(|m| !m.content.is_string())
-            })
+            .filter(|&i| rewritten.contains(&i))
             .collect(),
     }
 }
 
+// Each candidate must yield at least one block target; a candidate with none fails
+// the whole rewrite open (never a partial body).
+//
+// §3d dedup-with-backref: a payload squashed at more than one position renders the
+// FIRST occurrence as the full placeholder (the REF_TARGET) and each later identical
+// occurrence as the smaller `render_backref` marker, gated by `should_dedupe` /
+// `can_dedupe_from`. The backref keeps the block's `ReplacementKind`, so a
+// tool_result collapse preserves its `tool_use_id` and never severs a TOOL_PAIR.
 fn render_segments(
     body: &WireBody,
+    segments: &[Segment],
     live: &[(usize, &StagedEntry, SquashCandidate)],
 ) -> Option<Vec<RenderedSegment>> {
+    let mut first_seen: HashMap<RefId, &str> = HashMap::new();
     live.iter()
         .map(|(seg_index, entry, _)| {
-            let target = string_content_target(body, *seg_index)?;
-            let summary = entry.decision.summary_content.as_deref().unwrap_or("");
-            Some(RenderedSegment {
-                target,
-                block_json: placeholder_block_json(&render_placeholder(
-                    &entry.rec, summary, FUSE_UP,
-                )),
-            })
+            let seg = segments.get(*seg_index)?;
+            let role = segment_role(seg.kind);
+            let placeholder = render_placeholder(
+                &entry.rec,
+                entry.decision.summary_content.as_deref().unwrap_or(""),
+                FUSE_UP,
+            );
+            let key = dedupe_key(&segment_payload_bytes(seg, body));
+            let rendered: Vec<RenderedSegment> = squash_targets(body, seg)
+                .into_iter()
+                .map(|t| {
+                    let body_text = match first_seen.get(&key) {
+                        Some(prev) if backref_allowed(prev, role, entry, seg) => {
+                            render_backref(&entry.rec.ref_id)
+                        }
+                        _ => {
+                            first_seen.entry(key.clone()).or_insert(role);
+                            placeholder.clone()
+                        }
+                    };
+                    RenderedSegment {
+                        block_json: placeholder_block_json(&t.kind, &body_text),
+                        target: t.target,
+                    }
+                })
+                .collect();
+            (!rendered.is_empty()).then_some(rendered)
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()
+        .map(|per_candidate| per_candidate.into_iter().flatten().collect())
 }
 
-fn placeholder_block_json(text: &str) -> String {
-    serde_json::json!([{"type": "text", "text": text}]).to_string()
-}
-
-fn string_content_target(body: &WireBody, seg_index: usize) -> Option<SegmentTarget> {
-    let segments = segment_prompt(body);
-    let seg = segments.get(seg_index)?;
-    if seg.source_uuids.len() != 1 {
-        return None;
-    }
-    let message = seg.source_uuids.first()?.as_str().parse::<usize>().ok()?;
-    match body.messages.get(message)?.content {
-        MessageContent::Text { .. } => Some(SegmentTarget {
-            message,
-            block: None,
-        }),
-        MessageContent::Blocks(_) => None,
+fn segment_role(kind: SegmentKind) -> &'static str {
+    match kind {
+        SegmentKind::AssistantTurn => "assistant",
+        _ => "user",
     }
 }
 
-fn content_span_len(body: &WireBody, seg_index: usize) -> Option<usize> {
-    let segments = segment_prompt(body);
-    let seg = segments.get(seg_index)?;
-    if seg.source_uuids.len() != 1 {
-        return None;
-    }
-    let message = seg.source_uuids.first()?.as_str().parse::<usize>().ok()?;
-    Some(
-        body.messages
-            .get(message)?
-            .content
-            .raws()
-            .iter()
-            .map(|r| r.get().len())
-            .sum(),
-    )
+fn backref_allowed(prev: &str, cur: &str, entry: &StagedEntry, seg: &Segment) -> bool {
+    should_dedupe(
+        cur,
+        entry.rec.byte_len as usize,
+        seg.pinned,
+        DEDUPE_ALLOW_ASSISTANT,
+    ) && can_dedupe_from(prev, cur)
 }
 
+fn placeholder_block_json(kind: &ReplacementKind, text: &str) -> String {
+    match kind {
+        ReplacementKind::ToolResult {
+            tool_use_id,
+            is_error,
+        } => serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "is_error": is_error,
+            "content": text,
+        })
+        .to_string(),
+        ReplacementKind::TextBlock => serde_json::json!({"type": "text", "text": text}).to_string(),
+        ReplacementKind::StringContent => {
+            serde_json::json!([{"type": "text", "text": text}]).to_string()
+        }
+    }
+}
+
+// Price only the replaced blocks: the sum of their original token estimates minus
+// the placeholder each becomes. A TOOL_PAIR keeps its tool_use, so its segment-level
+// `token_estimate` would overstate savings and risk tripping the realized-bust breaker.
+//
+// `suffix_tokens` and `net_removed` are raw char-proxy estimates, so `token_scale`
+// calibrates both into observed-token space before they enter NPV/cost. The
+// placeholder estimate is part of `net_removed`, so it rides the same scale.
 fn live_candidate(
     seg: &Segment,
     segments: &[Segment],
     body: &WireBody,
     entry: &StagedEntry,
+    token_scale: TokenScale,
 ) -> Option<SquashCandidate> {
-    string_content_target(body, seg.index)?;
-    let summary = entry.decision.summary_content.as_deref().unwrap_or("");
-    let placeholder_tokens =
-        i64::from(estimate_chars_proxy(&render_placeholder(&entry.rec, summary, FUSE_UP)).get());
+    let targets = squash_targets(body, seg);
+    if targets.is_empty() {
+        return None;
+    }
+    let placeholder_tokens = i64::from(
+        estimate_chars_proxy(&render_placeholder(
+            &entry.rec,
+            entry.decision.summary_content.as_deref().unwrap_or(""),
+            FUSE_UP,
+        ))
+        .get(),
+    );
+    let net_removed: i64 = targets
+        .iter()
+        .map(|t| i64::from(t.original_tokens.get()) - placeholder_tokens)
+        .sum();
     Some(SquashCandidate {
         earliest_offset: seg.byte_offset,
-        suffix_tokens: suffix_tokens(seg, segments),
-        net_removed: i64::from(seg.token_estimate.get()) - placeholder_tokens,
+        suffix_tokens: token_scale.apply(suffix_tokens(seg, segments)),
+        net_removed: token_scale.apply_signed(net_removed),
         quality_gain: 0.0,
         ref_id: entry.rec.ref_id.clone(),
         strategy: Strategy::Keep,
@@ -333,7 +394,12 @@ fn free_bust(body: &WireBody, cache: &CacheState) -> Option<FreeBustTrigger> {
     (body.model != cache.model).then_some(FreeBustTrigger::ModelSwitch)
 }
 
-fn deterministic_compact(bytes: &Bytes, body: &WireBody, segments: &[Segment]) -> Intercepted {
+fn deterministic_compact(
+    bytes: &Bytes,
+    body: &WireBody,
+    segments: &[Segment],
+    policy: &PolicyConfig,
+) -> Intercepted {
     let window = TokenCount(body.max_tokens);
     let just_added = segments
         .last()
@@ -348,31 +414,18 @@ fn deterministic_compact(bytes: &Bytes, body: &WireBody, segments: &[Segment]) -
         segments,
         hard_target(window, TokenCount(body.max_tokens)),
     );
-    let drop_block = placeholder_block_json(DROP_PLACEHOLDER);
-    let touched: Vec<&Segment> = plan
+    let rendered: Vec<RenderedSegment> = plan
         .strip
         .iter()
         .chain(&plan.dropped)
         .filter_map(|&i| segments.get(i))
-        .filter(|seg| {
-            !seg.pinned
-                && !is_recency_protected(seg, segments)
-                && content_span_len(body, seg.index).is_some_and(|len| len > drop_block.len())
-        })
-        .collect();
-    if touched.is_empty() {
-        return identity(bytes.clone());
-    }
-
-    // Edit back-to-front by byte offset so an earlier edit never shifts a later target.
-    let mut ordered = touched;
-    ordered.sort_by_key(|seg| std::cmp::Reverse(seg.byte_offset.as_usize()));
-    let rendered: Vec<RenderedSegment> = ordered
-        .iter()
-        .filter_map(|seg| {
-            Some(RenderedSegment {
-                target: string_content_target(body, seg.index)?,
-                block_json: drop_block.clone(),
+        .filter(|seg| !seg.pinned && !is_recency_protected(seg, segments, policy))
+        .flat_map(|seg| squash_targets(body, seg))
+        .filter_map(|t| {
+            let block_json = placeholder_block_json(&t.kind, DROP_PLACEHOLDER);
+            (t.original_len > block_json.len()).then_some(RenderedSegment {
+                block_json,
+                target: t.target,
             })
         })
         .collect();
@@ -395,7 +448,8 @@ mod tests {
     use super::*;
     use ccs_core::{MessageId, ModelId, SegmentKind, SessionId};
     use ccs_economics::economics_for;
-    use ccs_refs::RefRecord;
+    use ccs_policy::SegmentTarget;
+    use ccs_refs::{RefRecord, RefStore};
 
     fn thinking_body() -> Vec<u8> {
         let long =
@@ -454,7 +508,7 @@ mod tests {
                 message: 0,
                 block: None,
             },
-            block_json: placeholder_block_json(&"x".repeat(4096)),
+            block_json: placeholder_block_json(&ReplacementKind::StringContent, &"x".repeat(4096)),
         }];
         assert!(
             splice_and_gate(&bytes, &body, &rendered, &BreakpointPlan::default()).is_none(),
@@ -472,7 +526,10 @@ mod tests {
                 message: 0,
                 block: None,
             },
-            block_json: placeholder_block_json(&render_placeholder(&rec(id, 80), "tiny", false)),
+            block_json: placeholder_block_json(
+                &ReplacementKind::StringContent,
+                &render_placeholder(&rec(id, 80), "tiny", false),
+            ),
         }];
         let out =
             splice_and_gate(&bytes, &body, &rendered, &BreakpointPlan::default()).expect("shrinks");
@@ -490,9 +547,11 @@ mod tests {
                 breakpoints: Vec::new(),
             },
             npv_floor: 0.0,
+            policy: ccs_policy::PolicyConfig::default(),
             remaining_turns: 50.0,
             hot_refs: Default::default(),
             staged,
+            token_scale: TokenScale::default(),
             now: 1_000_000.0,
         }
     }
@@ -536,5 +595,199 @@ mod tests {
         let original = Bytes::from(thinking_body());
         let out = run(original.clone(), inputs(None)).await;
         assert_eq!(out.bytes, original, "no plan + in-budget forwards identity");
+    }
+
+    // A body whose FIRST historical segment is a long assistant turn with a real
+    // squash target; later turns push it out of the recency window.
+    fn historical_body() -> Vec<u8> {
+        let long = "the assistant explained a great deal of detailed context here. ".repeat(20);
+        serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "kick off the work"},
+                {"role": "assistant", "content": long},
+                {"role": "user", "content": "second turn"},
+                {"role": "assistant", "content": "second reply"},
+                {"role": "user", "content": "third turn"},
+                {"role": "assistant", "content": "third reply"},
+                {"role": "user", "content": "fourth turn that is current"},
+            ],
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn historical_entry(body: &WireBody, segments: &[Segment]) -> (usize, StagedEntry) {
+        let seg = segments
+            .iter()
+            .find(|s| s.kind == SegmentKind::AssistantTurn && !squash_targets(body, s).is_empty())
+            .expect("a squashable historical assistant turn");
+        let payload = ccs_policy::segment_payload_bytes(seg, body);
+        let ref_id = content_address(&payload);
+        (
+            seg.index,
+            StagedEntry {
+                rec: rec(ref_id, payload.len()),
+                decision: ccs_policy::ContentDecision {
+                    choice: ccs_core::ChoiceTag::Compress,
+                    ranges_to_keep: Vec::new(),
+                    summary_content: Some("tiny summary".to_owned()),
+                },
+            },
+        )
+    }
+
+    // A calibrated factor >1 (estimator under-counts) must raise the candidate's
+    // priced quantities proportionally: both `suffix_tokens` and `net_removed` scale
+    // by exactly the factor, so the bust and recurring-saving the cost model derives
+    // from them rise in lockstep.
+    #[test]
+    fn token_scale_raises_priced_quantities_proportionally() {
+        let bytes = Bytes::from(historical_body());
+        let body = parse_body(&bytes).unwrap();
+        let segments = segment_prompt(&body);
+        let (seg_index, entry) = historical_entry(&body, &segments);
+        let seg = &segments[seg_index];
+
+        let base = live_candidate(seg, &segments, &body, &entry, TokenScale::default())
+            .expect("identity candidate");
+        let scaled = live_candidate(
+            seg,
+            &segments,
+            &body,
+            &entry,
+            TokenScale::default().fold(2.0, 1.0),
+        )
+        .expect("scaled candidate");
+
+        assert!(base.net_removed > 0, "the base removal must be positive");
+        assert_eq!(
+            scaled.suffix_tokens,
+            TokenScale::default()
+                .fold(2.0, 1.0)
+                .apply(base.suffix_tokens),
+            "a 2x calibration doubles the priced suffix",
+        );
+        assert_eq!(
+            scaled.net_removed,
+            base.net_removed * 2,
+            "a 2x calibration doubles the priced net removal",
+        );
+    }
+
+    // Two byte-identical ToolPair segments — the same large file-read tool_result
+    // squashed at two positions, the same `tu_1`, so both canonicalize to one ref_id.
+    fn dup_tool_result_body() -> Vec<u8> {
+        let file = "the contents of a large file read tool result. ".repeat(40);
+        let pair = |id: &str| {
+            serde_json::json!([
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": id, "name": "Read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": id, "content": file}
+                ]},
+            ])
+        };
+        let mut messages = pair("tu_1").as_array().unwrap().clone();
+        messages.extend(pair("tu_1").as_array().unwrap().clone());
+        messages.extend([
+            serde_json::json!({"role": "assistant", "content": "third reply"}),
+            serde_json::json!({"role": "user", "content": "fourth turn that is current"}),
+        ]);
+        serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 4096,
+            "messages": messages,
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn dedup_renders_backref_for_the_later_identical_occurrence() {
+        let bytes = Bytes::from(dup_tool_result_body());
+        let body = parse_body(&bytes).unwrap();
+        let segments = segment_prompt(&body);
+
+        let pairs: Vec<&Segment> = segments
+            .iter()
+            .filter(|s| s.kind == SegmentKind::ToolPair && !squash_targets(&body, s).is_empty())
+            .collect();
+        assert_eq!(pairs.len(), 2, "two squashable tool pairs");
+
+        let payload = segment_payload_bytes(pairs[0], &body);
+        assert_eq!(
+            payload,
+            segment_payload_bytes(pairs[1], &body),
+            "the two pairs must canonicalize byte-identically",
+        );
+        assert!(payload.len() >= 1024, "the payload clears the dedup floor");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = RefStore::open(dir.path().join("refs.db")).await.unwrap();
+        let session = SessionId::new("s");
+        let record = store
+            .put(
+                &payload,
+                &MessageId::new("0"),
+                &session,
+                SegmentKind::ToolPair,
+                0.0,
+            )
+            .await
+            .unwrap();
+
+        let entry = StagedEntry {
+            rec: record.clone(),
+            decision: ccs_policy::ContentDecision {
+                choice: ccs_core::ChoiceTag::Compress,
+                ranges_to_keep: Vec::new(),
+                summary_content: Some("a one-line summary".to_owned()),
+            },
+        };
+        let cand =
+            live_candidate(pairs[0], &segments, &body, &entry, TokenScale::default()).unwrap();
+        let live = vec![
+            (pairs[0].index, &entry, cand.clone()),
+            (pairs[1].index, &entry, cand),
+        ];
+
+        let rendered = render_segments(&body, &segments, &live).expect("renders both pairs");
+        assert_eq!(rendered.len(), 2, "one block target per pair");
+
+        let first = &rendered[0].block_json;
+        let later = &rendered[1].block_json;
+        assert!(
+            first.contains("[cc-squash: squashed segment"),
+            "the first occurrence renders the full placeholder",
+        );
+        assert!(
+            later.contains("[same as earlier message"),
+            "the later occurrence renders the backref",
+        );
+        assert!(
+            later.len() < first.len(),
+            "the backref block is strictly smaller than the placeholder",
+        );
+        for block in [first, later] {
+            let parsed: serde_json::Value = serde_json::from_str(block).unwrap();
+            assert_eq!(parsed["type"], "tool_result", "a tool_result block");
+            assert_eq!(parsed["tool_use_id"], "tu_1", "the tool_use_id survives");
+        }
+
+        let out = splice_and_gate(&bytes, &body, &rendered, &BreakpointPlan::default())
+            .expect("the gate accepts the dedup rewrite");
+        assert!(out.len() < bytes.len(), "the rewrite shrinks the body");
+
+        let resolved = store
+            .retrieve(&record.ref_id, &session, None, 0.0)
+            .await
+            .unwrap();
+        assert!(
+            matches!(resolved, ccs_refs::RetrieveResult::Hit { .. }),
+            "retrieve still resolves the deduped ref",
+        );
     }
 }

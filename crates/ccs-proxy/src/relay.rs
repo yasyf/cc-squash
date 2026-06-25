@@ -97,7 +97,10 @@ pub async fn serve(state: AppState, req: Request, inspect: Inspect) -> Response 
                 tracing::info!(%method, %path, would = "synth", "shadow");
                 ("shadow", forward(&state, parts, bytes, None).await)
             }
-            Decision::Synthesize(inputs) => ("synth", synth_response(&inputs)),
+            Decision::Synthesize(mut inputs) => {
+                inputs.working = working_snapshot(&state, token.as_ref());
+                ("synth", synth_response(&inputs))
+            }
             Decision::Forward => {
                 let setup = token
                     .as_ref()
@@ -120,6 +123,13 @@ pub async fn serve(state: AppState, req: Request, inspect: Inspect) -> Response 
                     }
                     None => bytes.clone(),
                 };
+                // Stash this request's estimated prefix (over the EGRESS body —
+                // exactly what Anthropic will count) so the response's usage
+                // observation calibrates the proxy against it. Must precede
+                // `forward`, since the tap can observe before `forward` returns.
+                if let Some(econ) = &econ {
+                    stash_estimated_prefix(econ, estimate_prefix(&egress));
+                }
                 let response = forward(&state, parts, egress, sink).await;
                 // L1 OFF-PATH staging runs AFTER the response is forwarded — never
                 // on the hot path, and on the ORIGINAL incoming bytes (CC resends
@@ -214,9 +224,11 @@ fn intercept_inputs(econ: &Mutex<SessionEcon>, now: f64) -> Option<InterceptInpu
             econ: model_econ,
             cache: guard.cache.clone(),
             npv_floor: guard.npv_floor,
+            policy: guard.policy,
             remaining_turns: guard.remaining_turns,
             hot_refs: guard.hot_refs.clone(),
             staged: guard.staged.take(),
+            token_scale: guard.token_scale,
             now,
         }),
         _ => None,
@@ -232,6 +244,31 @@ fn stash_predicted_bust(econ: &Mutex<SessionEcon>, predicted: ccs_economics::Cos
     }
 }
 
+/// Stash the egress request's estimated prefix, so the response's usage observation
+/// calibrates the char-proxy against the real token count Anthropic reports. Taken
+/// and dropped under a brief synchronous lock.
+fn stash_estimated_prefix(econ: &Mutex<SessionEcon>, estimated: ccs_core::TokenCount) {
+    if let Ok(mut guard) = econ.lock() {
+        guard.last_estimated_prefix = Some(estimated);
+    }
+}
+
+/// The estimated prefix tokens of `body`: the sum of its segment `token_estimate`s
+/// (the raw char-proxy). A malformed body yields `0` — no estimate to calibrate
+/// against, so the observation leaves the scale untouched.
+fn estimate_prefix(body: &[u8]) -> ccs_core::TokenCount {
+    ccs_core::TokenCount(
+        ccs_policy::wire::parse_body(body)
+            .map(|w| {
+                ccs_policy::segment_prompt(&w)
+                    .iter()
+                    .map(|s| s.token_estimate.get())
+                    .sum()
+            })
+            .unwrap_or(0),
+    )
+}
+
 /// Test-and-set the per-session overlap guard under a brief synchronous lock:
 /// `true` when this turn won the guard (no staging was in flight), `false` when a
 /// `stage_next` is already running for the session (skip — latest-wins, never two
@@ -244,6 +281,18 @@ fn claim_staging(econ: &Mutex<SessionEcon>) -> bool {
             .is_ok(),
         Err(_) => false,
     }
+}
+
+/// Snapshot the session's live [`WorkingState`] for `/compact` synthesis. Clones it
+/// out under one brief synchronous lock; a missing session, an uninitialised econ
+/// (no forward yet), or a poisoned lock yields the default empty state, which the
+/// synth builder renders as an honest minimal summary from the request's own turns.
+fn working_snapshot(state: &AppState, token: Option<&SessionToken>) -> ccs_policy::WorkingState {
+    token
+        .and_then(|t| state.sessions.get(t))
+        .and_then(|ctx| ctx.econ.clone())
+        .and_then(|econ| econ.lock().ok().map(|guard| guard.working.clone()))
+        .unwrap_or_default()
 }
 
 /// Resolve the session's `Arc<Mutex<SessionEcon>>` and its [`SessionId`],
@@ -281,6 +330,7 @@ fn init_econ(
         },
         capture_auth(state, headers),
         ctx.config.economics.npv_floor,
+        ctx.config.policy.clone().into(),
     )));
     ctx.econ = Some(econ.clone());
     econ

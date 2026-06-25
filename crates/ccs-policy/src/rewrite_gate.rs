@@ -190,6 +190,26 @@ mod tests {
     }
 
     #[test]
+    fn tool_pair_broken_when_result_drops_tool_use_id() {
+        let body = original();
+        let segs = [RenderedSegment {
+            target: SegmentTarget {
+                message: 2,
+                block: Some(0),
+            },
+            // A tool_result placeholder that omits tool_use_id orphans the tool_use.
+            block_json: r#"{"type":"tool_result","content":"<ref>"}"#.to_owned(),
+        }];
+        let rewritten = splice(ORIGINAL.as_bytes(), &body, &segs, &Default::default())
+            .unwrap()
+            .bytes;
+        assert_eq!(
+            validate(&rewritten, &original()),
+            Err(GateError::ToolPairBroken),
+        );
+    }
+
+    #[test]
     fn role_dropped_when_a_message_vanishes() {
         let bad = r#"{"model":"claude-opus-4-8","max_tokens":1024,"system":"you are helpful","tools":[{"name":"calc"}],"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"calc","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"42"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"reason","signature":"SIG-LATEST"}]}]}"#;
         assert_eq!(

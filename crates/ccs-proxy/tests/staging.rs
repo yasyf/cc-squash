@@ -140,6 +140,34 @@ fn squashable_body() -> Vec<u8> {
     .into_bytes()
 }
 
+/// A non-compaction body whose FIRST historical segment is a client `tool_use` /
+/// `tool_result` pair (array content). The `tool_result` content is above the
+/// pre-gate so the staging summarizer scores it; later turns push the pair out of
+/// the recency window so it is a squash candidate.
+fn tool_pair_body() -> Vec<u8> {
+    let output = "the tool printed a great deal of detailed output here. ".repeat(12);
+    serde_json::json!({
+        "model": "claude-opus-4-20250514",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": "kick off the work"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "bash", "input": {"cmd": "ls"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": output}
+            ]},
+            {"role": "user", "content": "second turn"},
+            {"role": "assistant", "content": "second reply"},
+            {"role": "user", "content": "third turn"},
+            {"role": "assistant", "content": "third reply"},
+            {"role": "user", "content": "fourth turn that is current"},
+        ],
+    })
+    .to_string()
+    .into_bytes()
+}
+
 async fn post(proxy: SocketAddr, token: &str, body: Vec<u8>) -> reqwest::Response {
     reqwest::Client::new()
         .post(format!("http://{proxy}/s/{token}/v1/messages"))
@@ -212,6 +240,38 @@ async fn stage_next_produces_staged_plan() {
         entry.rec.ref_id.as_str(),
         plan.by_content.keys().next().expect("key").as_str(),
         "the plan is keyed by the entry's content-address ref_id",
+    );
+}
+
+#[tokio::test]
+async fn stage_next_stages_tool_pair_segment() {
+    let reply =
+        summarizer_reply(r#"{"choice":"summarize","summary_content":"condensed tool output"}"#);
+    let upstream = mock_upstream(reply, Duration::ZERO).await;
+    let (proxy, state) = spawn_proxy_with_state(&upstream.uri()).await;
+    register(&state, "tok-pair-stage");
+
+    let resp = post(proxy, "tok-pair-stage", tool_pair_body()).await;
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await.expect("drain body");
+
+    assert!(
+        await_staged(&state, "tok-pair-stage").await,
+        "the spawned staging task must populate `staged`",
+    );
+
+    let ctx = state
+        .sessions
+        .get(&SessionToken("tok-pair-stage".to_owned()))
+        .expect("session");
+    let econ = ctx.econ.as_ref().expect("econ");
+    let guard = econ.lock().expect("lock");
+    let plan = guard.staged.as_ref().expect("staged plan");
+    assert!(
+        plan.by_content
+            .values()
+            .any(|e| e.rec.kind == ccs_core::SegmentKind::ToolPair),
+        "the tool_use/tool_result pair must be staged as a ToolPair entry",
     );
 }
 

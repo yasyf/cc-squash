@@ -7,9 +7,11 @@
 use ccs_core::{ChoiceTag, LineRange};
 use serde::Deserialize;
 
+use crate::config::PolicyConfig;
 use crate::strategy::Strategy;
 
 /// The minimum original length (chars) below which a segment is never rewritten.
+/// Tunable via [`PolicyConfig::pre_gate_min_chars`]; this is the default.
 pub const PRE_GATE_MIN_CHARS: usize = 256;
 
 /// One segment's compaction decision, as returned by the summarizer LLM.
@@ -47,12 +49,12 @@ impl ContentDecision {
     }
 
     /// Refuse a rewrite that cannot pay off: `Some(Strategy::Keep)` when the
-    /// original is under [`PRE_GATE_MIN_CHARS`] chars, or the decision is
+    /// original is under [`PolicyConfig::pre_gate_min_chars`], or the decision is
     /// `summarize` and its summary is longer (in chars) than the input
     /// (`result_longer_than_input`); `None` when the rewrite may proceed. `original_len`
-    /// is a character count, matching [`PRE_GATE_MIN_CHARS`].
-    pub fn pre_gate(&self, original_len: usize) -> Option<Strategy> {
-        if original_len < PRE_GATE_MIN_CHARS {
+    /// is a character count, matching the floor.
+    pub fn pre_gate(&self, original_len: usize, cfg: &PolicyConfig) -> Option<Strategy> {
+        if original_len < cfg.pre_gate_min_chars {
             return Some(Strategy::Keep);
         }
         match (self.choice, self.summary_content.as_deref()) {

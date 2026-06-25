@@ -141,16 +141,58 @@ fn squashable_body() -> Vec<u8> {
     .into_bytes()
 }
 
+/// A body whose FIRST historical segment is a real client `tool_use` / `tool_result`
+/// pair (array content) — the L2 squash target is the user message's `tool_result`
+/// block, not the assistant `tool_use`. The result content is long enough to clear
+/// the span floor; several later turns push the pair out of the recency window. A
+/// large `system` keeps the post-squash cacheable prefix above the model floor.
+fn tool_pair_body() -> Vec<u8> {
+    let system = "you are a meticulous engineering assistant with deep context. ".repeat(90);
+    let output = "the tool printed a great deal of detailed output here. ".repeat(20);
+    serde_json::json!({
+        "model": MODEL,
+        "max_tokens": 4096,
+        "system": system,
+        "messages": [
+            {"role": "user", "content": "kick off the work"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "bash", "input": {"cmd": "ls"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": output}
+            ]},
+            {"role": "user", "content": "second turn"},
+            {"role": "assistant", "content": "second reply"},
+            {"role": "user", "content": "third turn"},
+            {"role": "assistant", "content": "third reply"},
+            {"role": "user", "content": "fourth turn that is current"},
+        ],
+    })
+    .to_string()
+    .into_bytes()
+}
+
 /// The content-address ref_id + a `RefRecord` for the squash candidate — the FIRST
 /// (long, historical) assistant turn within `body`, found by kind rather than a
 /// fixed index so a leading `system`/`tools` segment doesn't shift it.
 fn candidate_ref(body_bytes: &[u8], session: &str) -> (ccs_core::RefId, RefRecord) {
+    candidate_ref_of(body_bytes, session, SegmentKind::AssistantTurn)
+}
+
+/// The content-address ref_id + a `RefRecord` for the first segment of `kind` — the
+/// staged-plan key is the WHOLE-segment payload (for a `ToolPair`, the assistant
+/// `tool_use` plus the user `tool_result`).
+fn candidate_ref_of(
+    body_bytes: &[u8],
+    session: &str,
+    kind: SegmentKind,
+) -> (ccs_core::RefId, RefRecord) {
     let body = parse_body(body_bytes).expect("parse");
     let segs = segment_prompt(&body);
     let seg = segs
         .iter()
-        .find(|s| s.kind == SegmentKind::AssistantTurn)
-        .expect("an assistant-turn candidate");
+        .find(|s| s.kind == kind)
+        .expect("a candidate of the requested kind");
     let payload = segment_payload_bytes(seg, &body);
     let ref_id = content_address(&payload);
     let rec = RefRecord {
@@ -281,6 +323,67 @@ async fn live_squash_applies_staged_plan() {
     assert!(
         egress.contains("condensed early context"),
         "the placeholder carries the staged summary",
+    );
+}
+
+#[tokio::test]
+async fn live_squash_replaces_tool_result_block() {
+    let upstream = warm_upstream().await;
+    let (proxy, state) = spawn_proxy(&upstream.uri()).await;
+    register(&state, "tok-pair", RelayConfig::default());
+    warmup(proxy, "tok-pair").await;
+
+    let body = tool_pair_body();
+    let (ref_id, rec) = candidate_ref_of(&body, "tok-pair", SegmentKind::ToolPair);
+    let ref_str = ref_id.as_str().to_owned();
+    assert!(
+        seed(&state, "tok-pair", |e| {
+            e.cache = warm_cache(MODEL);
+            e.intercept_enabled = true;
+            e.remaining_turns = 50.0;
+            e.staged = Some(staged_plan(ref_id, rec, "condensed tool output"));
+        }),
+        "session seeded",
+    );
+
+    let before = upstream.received_requests().await.expect("reqs").len();
+    let resp = post(proxy, "tok-pair", body.clone()).await;
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await.expect("drain");
+
+    let reqs = upstream.received_requests().await.expect("reqs");
+    let measured = &reqs[before];
+    assert!(
+        measured.body.len() < body.len(),
+        "the egress body must be SHRUNK ({} >= {})",
+        measured.body.len(),
+        body.len(),
+    );
+    let egress: serde_json::Value =
+        serde_json::from_slice(&measured.body).expect("egress is valid JSON");
+    let result_block = &egress["messages"][2]["content"][0];
+    assert_eq!(
+        result_block["type"], "tool_result",
+        "the squashed block stays a tool_result",
+    );
+    assert_eq!(
+        result_block["tool_use_id"], "tu_1",
+        "the tool_use_id is preserved so the pair stays intact",
+    );
+    assert!(
+        result_block["content"]
+            .as_str()
+            .expect("content is a string")
+            .contains(&format!("ref={ref_str}")),
+        "the tool_result content is the placeholder carrying the ref marker",
+    );
+    assert_eq!(
+        egress["messages"][1]["content"][0]["type"], "tool_use",
+        "the assistant tool_use block is untouched",
+    );
+    assert_eq!(
+        egress["messages"][1]["content"][0]["id"], "tu_1",
+        "the tool_use id is byte-intact",
     );
 }
 
@@ -528,5 +631,72 @@ async fn deterministic_fallback_overbudget() {
     assert!(
         egress.contains("current turn with a very large payload"),
         "the pinned current turn must be untouched by the fallback",
+    );
+}
+
+#[tokio::test]
+async fn deterministic_fallback_shrinks_tool_output() {
+    let upstream = warm_upstream().await;
+    let (proxy, state) = spawn_proxy(&upstream.uri()).await;
+    register(&state, "tok-fb-tool", RelayConfig::default());
+    warmup(proxy, "tok-fb-tool").await;
+
+    // Over-budget, no staged plan: the historical block is a client tool_use /
+    // tool_result pair. The string-only fallback could never touch it; routing
+    // through squash_targets drops the tool_result content while keeping the pair.
+    let huge_current = "current turn with a very large payload that blows the budget. ".repeat(80);
+    let tool_output = "an old tool dumped a great deal of output to drop. ".repeat(30);
+    let body = serde_json::json!({
+        "model": MODEL,
+        "max_tokens": 100,
+        "messages": [
+            {"role": "user", "content": "kick off the work for the fallback test"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "bash", "input": {"cmd": "ls"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": tool_output}
+            ]},
+            {"role": "user", "content": "second turn here"},
+            {"role": "assistant", "content": "second reply with some content"},
+            {"role": "user", "content": "third turn here"},
+            {"role": "assistant", "content": "third reply with some content"},
+            {"role": "user", "content": huge_current},
+        ],
+    })
+    .to_string()
+    .into_bytes();
+
+    seed(&state, "tok-fb-tool", |e| {
+        e.cache = warm_cache(MODEL);
+        e.intercept_enabled = true;
+        e.remaining_turns = 50.0;
+        e.staged = None;
+    });
+
+    let before = upstream.received_requests().await.expect("reqs").len();
+    let resp = post(proxy, "tok-fb-tool", body.clone()).await;
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await.expect("drain");
+
+    let reqs = upstream.received_requests().await.expect("reqs");
+    assert!(
+        reqs[before].body.len() < body.len(),
+        "the deterministic fallback must shrink the tool-output-heavy body",
+    );
+    let egress: serde_json::Value =
+        serde_json::from_slice(&reqs[before].body).expect("egress is valid JSON");
+    let result_block = &egress["messages"][2]["content"][0];
+    assert_eq!(
+        result_block["type"], "tool_result",
+        "the dropped block stays a tool_result",
+    );
+    assert_eq!(
+        result_block["tool_use_id"], "tu_1",
+        "the irreversible drop keeps tool_use_id so the pair stays intact",
+    );
+    assert_eq!(
+        egress["messages"][1]["content"][0]["type"], "tool_use",
+        "the assistant tool_use block survives the drop",
     );
 }

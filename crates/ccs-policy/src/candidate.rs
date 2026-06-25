@@ -7,14 +7,15 @@
 use ccs_core::{ByteOffset, ChoiceTag, RefId, SegmentKind, TokenCount};
 use ccs_economics::{npv, BatchView, CacheState, ModelEconomics};
 
-use crate::decision::{ContentDecision, PRE_GATE_MIN_CHARS};
+use crate::config::PolicyConfig;
+use crate::decision::ContentDecision;
 use crate::salience::{is_pinned, WorkingState};
 use crate::segment::Segment;
 use crate::strategy::Strategy;
 
 /// The maximum length (chars) of a human paste still eligible for lossy rewrite.
 /// A larger paste takes the verbatim exception ({`Keep`, `ReversibleRef`} only).
-/// Tunable via `PolicyConfig`.
+/// Tunable via [`PolicyConfig::human_verbatim_max`]; this is the default.
 pub const HUMAN_VERBATIM_MAX: usize = 16_384;
 
 /// One staged rewrite of a segment, with its economics inputs. `ref_id` is supplied
@@ -85,9 +86,9 @@ impl BatchView for SquashBatch {
 /// round-trips for the threshold comparisons here.
 ///
 /// Order (the huge-paste exception precedes every other rule):
-/// 1. A true-human `UserTurn` above [`HUMAN_VERBATIM_MAX`] is exempt from the
-///    verbatim pin but lossless-only: `compress` lowers to a reversible reference,
-///    anything else stays `Keep`.
+/// 1. A true-human `UserTurn` above [`PolicyConfig::human_verbatim_max`] is exempt
+///    from the verbatim pin but lossless-only: `compress` lowers to a reversible
+///    reference, anything else stays `Keep`.
 /// 2. The pre-gate refuses tiny or net-lengthening rewrites (`Keep`).
 /// 3. The cache-cost fold keeps a segment that is pinned, whose single-candidate
 ///    NPV does not clear `npv_floor`, or that is under the pre-gate floor.
@@ -101,7 +102,7 @@ impl BatchView for SquashBatch {
 /// [`Controller`]: crate::controller::Controller
 ///
 /// Never returns `Drop` — `Drop` is the HARD-ladder fallback tier only.
-#[allow(clippy::too_many_arguments)] // the NPV gate's inputs are irreducible: segment, decision, candidate, economics, cache, turns, now, floor.
+#[allow(clippy::too_many_arguments)] // the NPV gate's inputs are irreducible: segment, decision, candidate, economics, cache, turns, now, floor, policy.
 pub fn select_strategy(
     seg: &Segment,
     decision: &ContentDecision,
@@ -111,10 +112,11 @@ pub fn select_strategy(
     remaining_turns: f64,
     now: f64,
     npv_floor: f64,
+    cfg: &PolicyConfig,
 ) -> Strategy {
     let chars = approx_chars(seg);
 
-    if seg.is_true_human && seg.kind == SegmentKind::UserTurn && chars > HUMAN_VERBATIM_MAX {
+    if seg.is_true_human && seg.kind == SegmentKind::UserTurn && chars > cfg.human_verbatim_max {
         return match decision.choice {
             ChoiceTag::Compress => Strategy::ReversibleRef {
                 ref_id: cand.ref_id.clone(),
@@ -124,14 +126,14 @@ pub fn select_strategy(
         };
     }
 
-    if let Some(gated) = decision.pre_gate(chars) {
+    if let Some(gated) = decision.pre_gate(chars, cfg) {
         return gated;
     }
 
     let batch = SquashBatch::of_single(cand);
     if seg.pinned
         || npv(&batch, cache, econ, remaining_turns, now) <= npv_floor
-        || chars < PRE_GATE_MIN_CHARS
+        || chars < cfg.pre_gate_min_chars
     {
         return Strategy::Keep;
     }
@@ -153,14 +155,17 @@ pub fn select_strategy(
 /// unless [`salience::is_pinned`](crate::salience::is_pinned) holds — except a huge
 /// human paste, which stays eligible despite the default verbatim pin so the
 /// controller can offload it losslessly via [`select_strategy`]'s step 1.
-pub fn is_squash_candidate(seg: &Segment, working: &WorkingState) -> bool {
-    !is_pinned(seg, working) || is_huge_human_paste(seg)
+pub fn is_squash_candidate(seg: &Segment, working: &WorkingState, cfg: &PolicyConfig) -> bool {
+    !is_pinned(seg, working) || is_huge_human_paste(seg, cfg)
 }
 
-/// Whether `seg` is a true-human `UserTurn` larger than [`HUMAN_VERBATIM_MAX`] — the
-/// huge-paste exception that overrides the verbatim pin (lossless offload only).
-pub fn is_huge_human_paste(seg: &Segment) -> bool {
-    seg.is_true_human && seg.kind == SegmentKind::UserTurn && approx_chars(seg) > HUMAN_VERBATIM_MAX
+/// Whether `seg` is a true-human `UserTurn` larger than
+/// [`PolicyConfig::human_verbatim_max`] — the huge-paste exception that overrides
+/// the verbatim pin (lossless offload only).
+pub fn is_huge_human_paste(seg: &Segment, cfg: &PolicyConfig) -> bool {
+    seg.is_true_human
+        && seg.kind == SegmentKind::UserTurn
+        && approx_chars(seg) > cfg.human_verbatim_max
 }
 
 fn approx_chars(seg: &Segment) -> usize {

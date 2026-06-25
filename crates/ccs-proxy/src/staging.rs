@@ -11,7 +11,7 @@ use ccs_core::{RefId, SessionId};
 use ccs_policy::wire::parse_body;
 use ccs_policy::{
     is_recency_protected, is_squash_candidate, segment_payload_bytes, segment_prompt,
-    ContentDecision, Segment, WorkingState,
+    ContentDecision, PolicyConfig, Segment, WorkingState,
 };
 use ccs_refs::{RefRecord, RefStore};
 use ccs_summarizer::{decide, fold, SessionAuthContext, SummarizerClient};
@@ -38,7 +38,7 @@ pub async fn stage_next(
     store: Arc<RefStore>,
     now: f64,
 ) {
-    let Some((working, auth)) = clone_inputs(&econ) else {
+    let Some((working, auth, policy)) = clone_inputs(&econ) else {
         clear_guard(&econ);
         return;
     };
@@ -51,7 +51,7 @@ pub async fn stage_next(
 
     if !segments
         .iter()
-        .any(|seg| is_squash_candidate(seg, &working))
+        .any(|seg| is_squash_candidate(seg, &working, &policy))
     {
         clear_guard(&econ);
         return;
@@ -61,14 +61,14 @@ pub async fn stage_next(
 
     let mut plan = StagedPlan::default();
     for seg in &segments {
-        if !is_squash_candidate(seg, &working) {
+        if !is_squash_candidate(seg, &working, &policy) {
             continue;
         }
         let payload = segment_payload_bytes(seg, &body);
         let payload_text = String::from_utf8_lossy(&payload);
         let tags = salience_tags(seg, &working);
         let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-        let decision = decide(&client, &payload_text, &tag_refs).await;
+        let decision = decide(&client, &payload_text, &tag_refs, &policy).await;
         if decision.choice == ChoiceTag::Keep {
             continue;
         }
@@ -92,10 +92,10 @@ pub async fn stage_next(
         );
     }
 
-    let new_turns = recent_turns_text(&segments, &body);
+    let new_turns = recent_turns_text(&segments, &body, &policy);
     let working = fold(&client, &working, &new_turns).await;
 
-    log_plan(&session_id, &segments, &working, &plan);
+    log_plan(&session_id, &segments, &working, &plan, &policy);
     commit(&econ, plan, working);
 }
 
@@ -114,10 +114,14 @@ fn carries_live_constraint(seg: &Segment, working: &WorkingState) -> bool {
         .any(|c| seg.source_uuids.contains(&c.source_message))
 }
 
-fn recent_turns_text(segments: &[Segment], body: &ccs_policy::WireBody) -> String {
+fn recent_turns_text(
+    segments: &[Segment],
+    body: &ccs_policy::WireBody,
+    cfg: &PolicyConfig,
+) -> String {
     segments
         .iter()
-        .filter(|seg| is_recency_protected(seg, segments))
+        .filter(|seg| is_recency_protected(seg, segments, cfg))
         .flat_map(|seg| seg.source_uuids.iter())
         .filter_map(|u| u.as_str().parse::<usize>().ok())
         .filter_map(|i| body.messages.get(i))
@@ -126,9 +130,11 @@ fn recent_turns_text(segments: &[Segment], body: &ccs_policy::WireBody) -> Strin
         .join("\n")
 }
 
-fn clone_inputs(econ: &Mutex<SessionEcon>) -> Option<(WorkingState, SessionAuthContext)> {
+fn clone_inputs(
+    econ: &Mutex<SessionEcon>,
+) -> Option<(WorkingState, SessionAuthContext, PolicyConfig)> {
     let guard = econ.lock().ok()?;
-    Some((guard.working.clone(), guard.auth.clone()))
+    Some((guard.working.clone(), guard.auth.clone(), guard.policy))
 }
 
 fn commit(econ: &Mutex<SessionEcon>, plan: StagedPlan, working: WorkingState) {
@@ -150,10 +156,11 @@ fn log_plan(
     segments: &[Segment],
     working: &WorkingState,
     plan: &StagedPlan,
+    cfg: &PolicyConfig,
 ) {
     let candidates = segments
         .iter()
-        .filter(|seg| is_squash_candidate(seg, working))
+        .filter(|seg| is_squash_candidate(seg, working, cfg))
         .count();
     let entries: Vec<(String, ChoiceTag)> = plan
         .by_content

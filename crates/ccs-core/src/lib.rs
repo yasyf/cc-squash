@@ -12,7 +12,7 @@ pub mod kind;
 pub mod range;
 pub mod units;
 
-pub use estimate::{estimate_chars_proxy, CharProxyEstimator, TokenEstimator};
+pub use estimate::{estimate_chars_proxy, CharProxyEstimator, TokenEstimator, TokenScale};
 pub use ids::{MessageId, ModelId, RefId, RefIdError, SessionId};
 pub use kind::{ChoiceTag, SegmentKind};
 pub use range::LineRange;

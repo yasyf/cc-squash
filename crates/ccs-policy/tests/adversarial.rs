@@ -16,8 +16,8 @@ use ccs_core::{
 use ccs_economics::{economics_for, CacheState, ModelEconomics};
 use ccs_policy::candidate::is_squash_candidate;
 use ccs_policy::{
-    is_pinned, select_strategy, Constraint, ContentDecision, FreeBustTrigger, Pressure, Segment,
-    SquashCandidate, Strategy, WorkingState,
+    is_pinned, select_strategy, Constraint, ContentDecision, FreeBustTrigger, PolicyConfig,
+    Pressure, Segment, SquashCandidate, Strategy, WorkingState,
 };
 
 const HEX64: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
@@ -116,7 +116,7 @@ fn salience_needle_survives_pressure_matrix() {
                         "constraint pin lost at idle={idle} turns={remaining_turns} free_bust={free_bust:?} pressure={pressure:?}",
                     );
                     assert!(
-                        !is_squash_candidate(&pinned_seg, &working),
+                        !is_squash_candidate(&pinned_seg, &working, &PolicyConfig::default()),
                         "pinned seg became a candidate at idle={idle} turns={remaining_turns} free_bust={free_bust:?} pressure={pressure:?}",
                     );
                     for choice in [
@@ -130,7 +130,7 @@ fn salience_needle_survives_pressure_matrix() {
                             summary_content: Some("a terse summary".to_owned()),
                         };
                         assert_eq!(
-                            select_strategy(&pinned_seg, &decision, &cand(), &econ, &cache(), remaining_turns, now, 0.0),
+                            select_strategy(&pinned_seg, &decision, &cand(), &econ, &cache(), remaining_turns, now, 0.0, &PolicyConfig::default()),
                             Strategy::Keep,
                             "pinned seg rewritten ({choice}) at idle={idle} turns={remaining_turns} free_bust={free_bust:?} pressure={pressure:?}",
                         );
@@ -144,7 +144,11 @@ fn salience_needle_survives_pressure_matrix() {
     // cell (200 turns, idle 0 ⇒ NPV = 0.1 − 0.019 = 0.081), is eligible and IS
     // rewritten. So the pin — not the economics — is what kept the needle.
     let unpinned = seg(SegmentKind::AssistantTurn, false, false, None);
-    assert!(is_squash_candidate(&unpinned, &WorkingState::default()));
+    assert!(is_squash_candidate(
+        &unpinned,
+        &WorkingState::default(),
+        &PolicyConfig::default()
+    ));
     assert_eq!(
         select_strategy(
             &unpinned,
@@ -155,6 +159,7 @@ fn salience_needle_survives_pressure_matrix() {
             200.0,
             0.0,
             0.0,
+            &PolicyConfig::default(),
         ),
         Strategy::Summarize("terse".to_owned()),
         "the unpinned twin must actually rewrite, else the pin assertion is vacuous",
@@ -168,7 +173,11 @@ fn salience_needle_survives_pressure_matrix() {
 fn uncertain_salience_is_pinned() {
     let human = seg(SegmentKind::UserTurn, false, true, None);
     assert!(is_pinned(&human, &WorkingState::default()));
-    assert!(!is_squash_candidate(&human, &WorkingState::default()));
+    assert!(!is_squash_candidate(
+        &human,
+        &WorkingState::default(),
+        &PolicyConfig::default()
+    ));
 }
 
 /// Injection living in the (absent) segment content is inert: `select_strategy` reads
@@ -189,7 +198,17 @@ fn injection_in_content_is_inert() {
     let clean = seg(SegmentKind::AssistantTurn, false, false, None);
     let injected = seg(SegmentKind::AssistantTurn, false, false, None);
 
-    let out_clean = select_strategy(&clean, &decision, &cand(), &econ, &cache(), 200.0, 0.0, 0.0);
+    let out_clean = select_strategy(
+        &clean,
+        &decision,
+        &cand(),
+        &econ,
+        &cache(),
+        200.0,
+        0.0,
+        0.0,
+        &PolicyConfig::default(),
+    );
     let out_injected = select_strategy(
         &injected,
         &decision,
@@ -199,6 +218,7 @@ fn injection_in_content_is_inert() {
         200.0,
         0.0,
         0.0,
+        &PolicyConfig::default(),
     );
     assert_eq!(out_clean, out_injected);
     assert_eq!(out_clean, Strategy::Truncate(ranges));
@@ -220,6 +240,7 @@ fn injection_in_summary_cannot_unpin() {
         200.0,
         0.0,
         0.0,
+        &PolicyConfig::default(),
     );
     assert_eq!(baseline, Strategy::Keep);
 
@@ -234,6 +255,7 @@ fn injection_in_summary_cannot_unpin() {
                 200.0,
                 0.0,
                 0.0,
+                &PolicyConfig::default(),
             ),
             baseline,
             "injection {inj:?} moved a pinned decision",
@@ -257,5 +279,5 @@ fn superseded_constraint_does_not_pin() {
     let s = seg(SegmentKind::AssistantTurn, false, false, Some("msg-7"));
 
     assert!(!is_pinned(&s, &working));
-    assert!(is_squash_candidate(&s, &working));
+    assert!(is_squash_candidate(&s, &working, &PolicyConfig::default()));
 }

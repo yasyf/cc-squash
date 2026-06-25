@@ -8,8 +8,8 @@
 use ccs_core::{ByteOffset, Generation, ModelId, RefId, SegmentKind, TokenCount};
 use ccs_economics::{economics_for, CacheState, ModelEconomics};
 use ccs_policy::{
-    Controller, FreeBustTrigger, HoldReason, PromptState, Segment, SquashBatch, SquashCandidate,
-    SquashDecision, Strategy,
+    Controller, FreeBustTrigger, HoldReason, PolicyConfig, PromptState, Segment, SquashBatch,
+    SquashCandidate, SquashDecision, Strategy,
 };
 
 const HEX64: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
@@ -83,6 +83,8 @@ fn controller(ttl: f64, remaining_turns: f64) -> Controller {
         cache: cache(ttl),
         remaining_turns,
         npv_floor: 0.0,
+        policy: PolicyConfig::default(),
+        token_scale: ccs_core::TokenScale::default(),
     }
 }
 
@@ -226,5 +228,39 @@ fn sub_floor_dominates() {
         SquashDecision::Hold {
             reason: HoldReason::SubFloor
         },
+    );
+}
+
+fn controller_scaled(scale: f64) -> Controller {
+    Controller {
+        token_scale: ccs_core::TokenScale::default().fold(scale, 1.0),
+        ..controller(3600.0, 40.0)
+    }
+}
+
+/// The min-floor guard reasons in observed-token space. Raw prefix 2·450 = 900 with a
+/// small removal of 100: at identity scale the post-squash prefix (900 − 100 = 800)
+/// is below the 1024 floor (sub_floor), while NPV is positive. A calibrated 1.5x
+/// under-count scales both the prefix (→ 1350) and `net_removed` (→ 150) — mirroring
+/// the production `scale·(prefix − removed)` identity that `live_candidate` enforces —
+/// so the post-squash 1200 clears the floor and the same prompt flushes instead of
+/// holding; the estimate alone would silently mis-fire the guard.
+#[test]
+fn token_scale_lifts_prefix_clear_of_floor() {
+    let p = prompt(segs(2, 450), None);
+
+    assert_eq!(
+        controller(3600.0, 40.0).decide(&p, &batch(cand(100, 100)), 0.0),
+        SquashDecision::Hold {
+            reason: HoldReason::SubFloor
+        },
+        "at identity scale the raw 800-token post-squash prefix trips the sub-floor guard",
+    );
+    assert!(
+        matches!(
+            controller_scaled(1.5).decide(&p, &batch(cand(150, 150)), 0.0),
+            SquashDecision::Flush { .. }
+        ),
+        "a 1.5x calibration scales prefix and removal alike, lifting the post-squash 1200 clear of the 1024 floor",
     );
 }

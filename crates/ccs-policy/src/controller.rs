@@ -3,7 +3,7 @@
 //! arm rather than a stringly-typed branch.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use ccs_core::TokenCount;
+use ccs_core::{TokenCount, TokenScale};
 use ccs_economics::{
     bust_cost, npv, recurring_saving, BatchView, CacheState, Cost, ModelEconomics,
 };
@@ -12,6 +12,7 @@ use strum::Display;
 
 use crate::breakpoint::{plan_breakpoints, BreakpointPlan};
 use crate::candidate::SquashBatch;
+use crate::config::PolicyConfig;
 use crate::segment::Segment;
 
 /// The current prompt the controller decides over.
@@ -84,12 +85,19 @@ pub enum SquashDecision {
 /// `npv_floor` is `EconomicsConfig.npv_floor` (the per-egress economics seam);
 /// `select_strategy` reads the SAME floor so both gate sites compare against one
 /// value. The default `0.0` keeps the original strict-positive behavior.
+///
+/// `token_scale` calibrates the char-proxy against observed usage; it scales only
+/// the *estimated* prefix the min-floor guard sums (the batch's already-scaled
+/// removal carries its own calibration). The default identity leaves the guard's
+/// raw-estimate behavior unchanged.
 #[derive(Debug, Clone)]
 pub struct Controller {
     pub econ: ModelEconomics,
     pub cache: CacheState,
     pub remaining_turns: f64,
     pub npv_floor: f64,
+    pub policy: PolicyConfig,
+    pub token_scale: TokenScale,
 }
 
 impl Controller {
@@ -104,8 +112,8 @@ impl Controller {
     ///
     /// Out-of-scope [`HoldReason`]s: `AwaitCold` and `AwaitModelSwitch` collapse into
     /// the two [`SquashDecision::RideFreeBust`] arms here (riding the free bust *is*
-    /// the hold), and `RefHot` needs a ref `access_count` anti-thrash signal that is
-    /// Layer 3/4 and not yet wired — it is deliberately never produced here.
+    /// the hold). `RefHot` is produced upstream in the proxy layer (`intercept.rs` /
+    /// `mcp.rs`), not here.
     pub fn decide(&self, prompt: &PromptState, pending: &SquashBatch, now: f64) -> SquashDecision {
         if pending.candidates.is_empty() {
             return SquashDecision::Hold {
@@ -153,7 +161,11 @@ impl Controller {
                 _,
             ) => SquashDecision::Flush {
                 batch: pending.clone(),
-                breakpoint_plan: plan_breakpoints(&prompt.segments, self.econ.min_cache_floor),
+                breakpoint_plan: plan_breakpoints(
+                    &prompt.segments,
+                    self.econ.min_cache_floor,
+                    &self.policy,
+                ),
                 predicted_bust: bust_cost(pending, &self.cache, &self.econ, now),
                 predicted_saving: recurring_saving(pending, &self.econ, self.remaining_turns),
             },
@@ -167,16 +179,20 @@ impl Controller {
     /// `min_cache_floor` — the §3f min-floor guard, below which Anthropic silently
     /// disengages caching (a ~10× recurring blowup).
     ///
-    /// Computed as `Σ segment token_estimate − pending.total_removed() < floor`. This
-    /// subtracts the batch's removal, so it models the *post*-edit prefix directly;
-    /// the `plan_breakpoints(...).positions.is_empty()` alternative inspects only the
-    /// *pre*-squash segments and would miss a squash that itself pushes the prefix
-    /// under the floor — the exact case this guard exists to catch.
+    /// Computed as `token_scale · Σ segment token_estimate − pending.total_removed()
+    /// < floor`. This subtracts the batch's removal, so it models the *post*-edit
+    /// prefix directly; the `plan_breakpoints(...).positions.is_empty()` alternative
+    /// inspects only the *pre*-squash segments and would miss a squash that itself
+    /// pushes the prefix under the floor — the exact case this guard exists to catch.
+    ///
+    /// The prefix is a raw char-proxy estimate, so `token_scale` calibrates it into
+    /// observed-token space before the comparison; `pending.total_removed()` was
+    /// already scaled at the candidate site, so it is not re-scaled here.
     fn post_squash_below_floor(&self, prompt: &PromptState, pending: &SquashBatch) -> bool {
         let prefix: i64 = prompt
             .segments
             .iter()
-            .map(|s| i64::from(s.token_estimate.get()))
+            .map(|s| i64::from(self.token_scale.apply(s.token_estimate).get()))
             .sum();
         prefix - pending.total_removed() < i64::from(self.econ.min_cache_floor.get())
     }

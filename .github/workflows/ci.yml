@@ -68,3 +68,29 @@ jobs:
 
       - name: Test
         run: cargo test --all
+
+  # Two-process cold-start gate: drives the real `ccs` control plane and
+  # `ccs-proxy` data plane as separate processes (URL mint, warm reuse,
+  # proxy-restart port stability). The test itself builds both binaries (go
+  # build + cargo build -p ccs-proxy), so this job just needs both toolchains.
+  # Build-tagged `integration`, so the default `go` job never compiles it; this
+  # job passes `-tags integration`. Separate from the unit gates so a flaky
+  # process-spawning run does not block them, but it runs on every push/PR.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: go/go.sum
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      - name: Cold-start integration test
+        run: scripts/integration-test.sh

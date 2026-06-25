@@ -5,7 +5,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use ccs_core::ChoiceTag;
-use ccs_policy::{ContentDecision, Strategy, PRE_GATE_MIN_CHARS};
+use ccs_policy::{ContentDecision, PolicyConfig, Strategy};
 
 use crate::client::SummarizerClient;
 use crate::prompts::DECISION_SYSTEM;
@@ -14,19 +14,20 @@ const DECISION_MAX_TOKENS: u32 = 10_240;
 
 /// Decide how to compact `content`, given its live `salience_tags`.
 ///
-/// Segments under [`PRE_GATE_MIN_CHARS`] chars are kept without an LLM call. Any
-/// upstream, timeout, or parse error fails safe to `Keep`.
+/// Segments under [`PolicyConfig::pre_gate_min_chars`] chars are kept without an LLM
+/// call. Any upstream, timeout, or parse error fails safe to `Keep`.
 pub async fn decide(
     client: &SummarizerClient,
     content: &str,
     salience_tags: &[&str],
+    cfg: &PolicyConfig,
 ) -> ContentDecision {
     let len = content.chars().count();
-    if len < PRE_GATE_MIN_CHARS {
+    if len < cfg.pre_gate_min_chars {
         return keep();
     }
 
-    match query(client, content, salience_tags, len).await {
+    match query(client, content, salience_tags, len, cfg).await {
         Ok(decision) => decision,
         Err(error) => {
             tracing::warn!(%error, "content decision failed; keeping segment");
@@ -40,6 +41,7 @@ async fn query(
     content: &str,
     salience_tags: &[&str],
     len: usize,
+    cfg: &PolicyConfig,
 ) -> Result<ContentDecision, DecideError> {
     let text = client
         .call(
@@ -49,7 +51,7 @@ async fn query(
         )
         .await?;
     let decision = serde_json::from_str::<ContentDecision>(extract_json(&text)?)?.normalize();
-    Ok(match decision.pre_gate(len) {
+    Ok(match decision.pre_gate(len, cfg) {
         Some(Strategy::Keep) => keep(),
         _ => decision,
     })

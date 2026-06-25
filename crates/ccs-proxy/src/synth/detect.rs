@@ -9,6 +9,7 @@
 //! returns [`None`] so the caller relays the request upstream unchanged.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+use ccs_policy::WorkingState;
 use memchr::memmem;
 use serde_json::Value;
 
@@ -20,15 +21,27 @@ pub const COMPACT_MARKER: &[u8] = b"CRITICAL: Respond with TEXT ONLY. Do NOT cal
 /// Larger budgets indicate an ordinary generation turn, not a summary.
 const MAX_TOKENS_CEILING: u64 = 20_000;
 
-/// Inputs extracted from a recognised compaction request.
+/// The most recent user turns harvested for the empty-state fallback recap.
+const RECAP_TURNS: usize = 6;
+
+/// Inputs extracted from a recognised compaction request, plus the session's live
+/// [`WorkingState`].
 ///
-/// For the Phase-0 spike this is intentionally minimal; the real working-state
-/// inputs that drive summary synthesis arrive in a later layer.
+/// [`detect`] populates `model` and `recap` from the request body alone; the relay
+/// fills `working` from the session it serves before synthesis. An empty `working`
+/// (a very early session) falls back to `recap` — the request's own user turns — so
+/// the synthesized summary is honest rather than canned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BriefInputs {
     /// The model the original request targeted, echoed into the synthesized
     /// response so downstream bookkeeping stays consistent.
     pub model: String,
+    /// The session's live working state, threaded in by the relay. Default until
+    /// then, and default when the request carries no registered session.
+    pub working: WorkingState,
+    /// The most recent user-turn texts from the request body, the honest narrative
+    /// source when `working` is empty.
+    pub recap: Vec<String>,
 }
 
 /// Detect whether `body` is a Claude Code compaction request.
@@ -58,8 +71,50 @@ pub fn detect(body: &[u8]) -> Option<BriefInputs> {
                     .and_then(Value::as_str)
                     .unwrap_or("claude")
                     .to_string(),
+                working: WorkingState::default(),
+                recap: recap_turns(obj),
             })
         }
+        _ => None,
+    }
+}
+
+/// The last [`RECAP_TURNS`] user-turn texts in body order, the honest fallback recap
+/// when the session carries no working state. The final user turn is dropped: it is
+/// the compaction instruction itself, not conversation substance.
+fn recap_turns(obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    let users: Vec<String> = obj
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .filter_map(message_text)
+        .collect();
+    users
+        .iter()
+        .rev()
+        .skip(1)
+        .take(RECAP_TURNS)
+        .rev()
+        .cloned()
+        .collect()
+}
+
+/// The user turn's plain text: the string `content`, or the concatenated `text` of
+/// its content blocks. A non-text turn yields `None`.
+fn message_text(message: &Value) -> Option<String> {
+    match message.get("content")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(blocks) => Some(
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .filter(|t| !t.is_empty()),
         _ => None,
     }
 }
@@ -113,11 +168,19 @@ mod tests {
 
     #[test]
     fn fires_on_realistic_compact_request() {
+        let inputs = detect(&compact_body(18_000)).expect("detects compaction request");
+        assert_eq!(inputs.model, "claude-opus-4-20250514");
+        assert_eq!(inputs.working, WorkingState::default());
+    }
+
+    #[test]
+    fn recap_harvests_earlier_user_turns_dropping_the_instruction() {
+        let inputs = detect(&compact_body(18_000)).expect("detects compaction request");
+        // The earlier user turn is recapped; the final compaction-instruction turn
+        // is dropped.
         assert_eq!(
-            detect(&compact_body(18_000)),
-            Some(BriefInputs {
-                model: "claude-opus-4-20250514".to_string(),
-            }),
+            inputs.recap,
+            vec![format!("Earlier instructions. {}", marker_str())],
         );
     }
 

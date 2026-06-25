@@ -8,7 +8,9 @@
 use ccs_core::{ByteOffset, ChoiceTag, Generation, ModelId, RefId, SegmentKind, TokenCount};
 use ccs_economics::{economics_for, BatchView, CacheState, ModelEconomics};
 use ccs_policy::candidate::select_strategy;
-use ccs_policy::{ContentDecision, Segment, SquashBatch, SquashCandidate, Strategy as PolStrategy};
+use ccs_policy::{
+    ContentDecision, PolicyConfig, Segment, SquashBatch, SquashCandidate, Strategy as PolStrategy,
+};
 use proptest::prelude::*;
 
 const HEX64: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
@@ -136,7 +138,7 @@ proptest! {
         now in 0.0f64..3600.0,
     ) {
         prop_assert_ne!(
-            select_strategy(&s, &dec, &c, &opus(), &warm_cache(), turns, now, 0.0),
+            select_strategy(&s, &dec, &c, &opus(), &warm_cache(), turns, now, 0.0, &PolicyConfig::default()),
             PolStrategy::Drop,
         );
     }
@@ -153,7 +155,7 @@ proptest! {
         // is_true_human=false ⇒ the huge-paste exception (step 1) never fires.
         let s = seg(te, false, true, SegmentKind::AssistantTurn);
         prop_assert_eq!(
-            select_strategy(&s, &dec, &c, &opus(), &warm_cache(), turns, now, 0.0),
+            select_strategy(&s, &dec, &c, &opus(), &warm_cache(), turns, now, 0.0, &PolicyConfig::default()),
             PolStrategy::Keep,
         );
     }
@@ -184,7 +186,7 @@ proptest! {
         };
         // removed ≤ 0 ⇒ recurring ≤ 0, Q = 0, warm bust ≥ 0 ⇒ NPV ≤ 0.
         prop_assert_eq!(
-            select_strategy(&s, &dec, &c, &opus(), &warm_cache(), turns, now, 0.0),
+            select_strategy(&s, &dec, &c, &opus(), &warm_cache(), turns, now, 0.0, &PolicyConfig::default()),
             PolStrategy::Keep,
         );
     }

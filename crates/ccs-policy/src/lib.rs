@@ -19,6 +19,7 @@ pub mod rewrite_gate;
 pub mod salience;
 pub mod segment;
 pub mod strategy;
+pub mod targets;
 pub mod wire;
 
 pub use breakpoint::{
@@ -41,4 +42,5 @@ pub use segment::{
     fresh_boundary, is_recency_protected, segment_prompt, Segment, RECENCY_WINDOW_N,
 };
 pub use strategy::{Strategy, StrategyKind, LADDER_PRIORITY};
+pub use targets::{squash_targets, BlockTarget, ReplacementKind, MIN_BLOCK_SPAN};
 pub use wire::{ContentBlock, Role, WireBody, WireMessage};

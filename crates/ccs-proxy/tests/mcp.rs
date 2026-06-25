@@ -55,7 +55,12 @@ impl Harness {
     /// resolve the scope and write `hot_refs`. Returns the `econ` handle the test
     /// reads back.
     fn register(&self, token: &str) -> Arc<Mutex<SessionEcon>> {
-        let econ = Arc::new(Mutex::new(SessionEcon::new(cache_state(), auth(), 0.0)));
+        let econ = Arc::new(Mutex::new(SessionEcon::new(
+            cache_state(),
+            auth(),
+            0.0,
+            ccs_policy::PolicyConfig::default(),
+        )));
         self.state.sessions.insert(
             SessionToken(token.to_owned()),
             SessionCtx {

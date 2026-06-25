@@ -14,7 +14,7 @@ use ccs_policy::segment::{
     fresh_boundary, is_prune_candidate, is_recency_protected, segment_prompt,
 };
 use ccs_policy::wire::parse_body;
-use ccs_policy::RECENCY_WINDOW_N;
+use ccs_policy::{PolicyConfig, RECENCY_WINDOW_N};
 
 use common::{prompt, typed_human};
 
@@ -27,14 +27,15 @@ fn recency_window_protects_recent_n_with_exact_cutoff() {
     let segs = segment_prompt(&parse_body(&body).unwrap());
     let n = segs.len();
 
+    let cfg = PolicyConfig::default();
     // The most-recent N segments are recency-protected and never candidates.
     for seg in &segs[n - RECENCY_WINDOW_N..] {
         assert!(
-            is_recency_protected(seg, &segs),
+            is_recency_protected(seg, &segs, &cfg),
             "recent-N segment is protected"
         );
         assert!(
-            !is_prune_candidate(seg, &segs),
+            !is_prune_candidate(seg, &segs, &cfg),
             "recent-N segment is not a candidate"
         );
     }
@@ -42,11 +43,11 @@ fn recency_window_protects_recent_n_with_exact_cutoff() {
     // The (N+1)-th-from-end segment is the exact cutoff: not protected, a candidate.
     let cutoff = &segs[n - RECENCY_WINDOW_N - 1];
     assert!(
-        !is_recency_protected(cutoff, &segs),
+        !is_recency_protected(cutoff, &segs, &cfg),
         "the (N+1)-th from end is not protected"
     );
     assert!(
-        is_prune_candidate(cutoff, &segs),
+        is_prune_candidate(cutoff, &segs, &cfg),
         "the (N+1)-th from end is a candidate"
     );
 }
@@ -85,7 +86,39 @@ fn recency_floor_stacks_on_fresh_boundary() {
         "and it is not structurally pinned"
     );
     assert!(
-        !is_prune_candidate(oldest_in_window, &segs),
+        !is_prune_candidate(oldest_in_window, &segs, &PolicyConfig::default()),
         "yet the recency floor still protects it",
+    );
+}
+
+#[test]
+fn smaller_recency_window_unprotects_a_default_protected_segment() {
+    let messages: Vec<_> = (0..RECENCY_WINDOW_N + 3)
+        .map(|k| typed_human(&format!("Step {k}.")))
+        .collect();
+    let body = prompt(&messages);
+    let segs = segment_prompt(&parse_body(&body).unwrap());
+    let n = segs.len();
+
+    // The oldest segment inside the DEFAULT recency window: protected by default.
+    let oldest_in_default_window = &segs[n - RECENCY_WINDOW_N];
+    assert!(
+        is_recency_protected(oldest_in_default_window, &segs, &PolicyConfig::default()),
+        "default window protects the oldest in-window segment",
+    );
+
+    // Shrinking the window to one position drops that same segment out of the floor:
+    // a non-default knob flips the engine's keep/evict decision for it.
+    let tight = PolicyConfig {
+        recency_window_n: 1,
+        ..PolicyConfig::default()
+    };
+    assert!(
+        !is_recency_protected(oldest_in_default_window, &segs, &tight),
+        "a recency_window_n of 1 no longer protects it",
+    );
+    assert!(
+        is_prune_candidate(oldest_in_default_window, &segs, &tight),
+        "and it becomes a prune candidate under the tighter window",
     );
 }
