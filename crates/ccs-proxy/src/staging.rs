@@ -1,11 +1,4 @@
-//! L1 OFF-PATH staging (sub-phase 4c). After the response is forwarded, a spawned
-//! task recomputes — for the *next* turn — which historical segments to squash and
-//! a refreshed [`WorkingState`], then STAGES the plan on the session. It NEVER
-//! blocks the hot path and NEVER calls the LLM on-path: every `.await` here runs
-//! after `forward` returns, and the session lock is taken only in two brief
-//! synchronous windows (clone inputs out, write results back) — never held across
-//! an `.await`. There is still NO on-path rewrite; that is 4d. 4c is shadow-mode:
-//! it computes, stages, and logs the plan as observability.
+//! L1 off-path staging: recompute and stage the next-turn squash plan.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::HashMap;
@@ -25,35 +18,19 @@ use ccs_summarizer::{decide, fold, SessionAuthContext, SummarizerClient};
 
 use crate::session::SessionEcon;
 
-/// One staged rewrite: the frozen [`RefRecord`] of the segment's stored original
-/// (its `ref_id` is the content-address key, its `kind`/`byte_len`/`token_estimate`
-/// the placeholder renderer reads) and the summarizer's [`ContentDecision`]. Keyed
-/// in the [`StagedPlan`] by `rec.ref_id` — the same content-address the on-path 4d
-/// rewrite recomputes via [`segment_payload_bytes`] to match this plan.
 #[derive(Debug, Clone)]
 pub struct StagedEntry {
     pub rec: RefRecord,
     pub decision: ContentDecision,
 }
 
-/// The plan the L1 task stages for the next turn: every squashable segment's
-/// [`StagedEntry`], indexed by its content-address. 4d's on-path rewrite looks a
-/// live segment up here by re-hashing its canonical payload bytes.
 #[derive(Debug, Clone, Default)]
 pub struct StagedPlan {
     pub by_content: HashMap<RefId, StagedEntry>,
 }
 
-/// The salience tag attached to a segment that carries a live constraint — the one
-/// signal the per-segment decision agent reads to bias toward preservation.
 const CONSTRAINT_TAG: &str = "CONSTRAINT";
 
-/// Compute and STAGE the next-turn plan off the hot path.
-///
-/// Clones `working` + `auth` out of the session under a brief synchronous lock,
-/// runs the summarizer (decide per candidate, then fold) entirely lock-free, then
-/// re-locks once to write the staged plan and the folded working state and to
-/// clear the overlap guard. A parse failure fails open: no staging, guard cleared.
 pub async fn stage_next(
     econ: Arc<Mutex<SessionEcon>>,
     bytes: Bytes,
@@ -72,12 +49,6 @@ pub async fn stage_next(
     };
     let segments = segment_prompt(&body);
 
-    // Nothing squashable ⇒ no plan to stage and no working-state fold worth an
-    // off-path LLM round-trip. Skip the summarizer entirely: this spares a
-    // per-turn Sonnet call on trivial turns and keeps a no-candidate forward to
-    // exactly one upstream request. True-human constraints stay protected by the
-    // verbatim pin regardless of the working state, so the fold can wait until
-    // there is genuinely squashable content.
     if !segments
         .iter()
         .any(|seg| is_squash_candidate(seg, &working))
@@ -128,9 +99,6 @@ pub async fn stage_next(
     commit(&econ, plan, working);
 }
 
-/// The salience tags for `seg`: `["CONSTRAINT"]` when the segment carries a live
-/// constraint (its `source_uuids` name a non-superseded constraint's source), else
-/// `[]`. The decision agent reads these to bias preservation.
 fn salience_tags(seg: &Segment, working: &WorkingState) -> Vec<String> {
     match carries_live_constraint(seg, working) {
         true => vec![CONSTRAINT_TAG.to_owned()],
@@ -146,8 +114,6 @@ fn carries_live_constraint(seg: &Segment, working: &WorkingState) -> bool {
         .any(|c| seg.source_uuids.contains(&c.source_message))
 }
 
-/// The rendered text of the recency-window segments — the small, deterministic
-/// slice of recent turns the Rsum folder reconciles into the working state.
 fn recent_turns_text(segments: &[Segment], body: &ccs_policy::WireBody) -> String {
     segments
         .iter()
@@ -160,15 +126,11 @@ fn recent_turns_text(segments: &[Segment], body: &ccs_policy::WireBody) -> Strin
         .join("\n")
 }
 
-/// Clone the staging inputs out of the session under a brief synchronous lock.
-/// `None` when the lock is poisoned (fail-open: skip staging).
 fn clone_inputs(econ: &Mutex<SessionEcon>) -> Option<(WorkingState, SessionAuthContext)> {
     let guard = econ.lock().ok()?;
     Some((guard.working.clone(), guard.auth.clone()))
 }
 
-/// Write the staged plan and folded working state back under a brief synchronous
-/// lock, then clear the overlap guard so the next turn may stage again.
 fn commit(econ: &Mutex<SessionEcon>, plan: StagedPlan, working: WorkingState) {
     if let Ok(mut guard) = econ.lock() {
         guard.staged = Some(plan);
@@ -183,8 +145,6 @@ fn clear_guard(econ: &Mutex<SessionEcon>) {
     }
 }
 
-/// Shadow-mode observability AND the live read of `staged`: a one-line summary of
-/// the staged plan the control plane can watch before 4d trusts it on-path.
 fn log_plan(
     session_id: &SessionId,
     segments: &[Segment],

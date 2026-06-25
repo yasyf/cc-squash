@@ -1,15 +1,4 @@
-//! The L0 cache-usage tap: a read-only stream adapter that wraps reqwest's
-//! `bytes_stream()`. Every chunk is yielded downstream UNCHANGED before any
-//! inspection, so the verbatim passthrough is preserved byte-for-byte and the
-//! adapter adds zero await points to the relayed path.
-//!
-//! As chunks flow, a copy feeds a bounded (<= [`SCAN_CAP`]) rolling scanner that
-//! looks for the SSE `data: {…}` line of the `message_start` event — the only
-//! event that carries `message.usage` (cache token counts) and `message.model`.
-//! On the first successful parse, the [`CacheUsage`] and [`ModelId`] are
-//! `try_send` on the sink and scanning STOPS (the buffer is dropped); the stream
-//! never waits for stream end, so there is no stall risk. Past the cap with no
-//! hit, scanning gives up (fail-open) and the stream still passes through.
+//! The L0 cache-usage tap: a read-only stream adapter over reqwest's `bytes_stream()`.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use bytes::Bytes;
@@ -19,27 +8,18 @@ use futures_util::Stream;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-/// Hard ceiling on the rolling scan buffer. `message_start` is the first SSE
-/// event and well under this, so a hit lands early; the cap bounds memory and
-/// guarantees the scanner gives up on a hostile no-newline flood.
 const SCAN_CAP: usize = 64 * 1024;
 
-/// The SSE event name whose `data:` payload carries the cache-token usage.
 const TARGET_EVENT: &str = "message_start";
 
-/// One observation lifted off the wire: the cache-token usage and the model the
-/// `message_start` event reported.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observed {
     pub usage: CacheUsage,
     pub model: ModelId,
 }
 
-/// The sender half the tap pushes a single [`Observed`] onto. Bounded; a full or
-/// closed channel drops the observation (fail-open) rather than blocking.
 pub type UsageSink = mpsc::Sender<Observed>;
 
-/// The `message_start` SSE data payload: `{"type":"message_start","message":{…}}`.
 #[derive(Deserialize)]
 struct MessageStart {
     message: StartMessage,
@@ -51,8 +31,6 @@ struct StartMessage {
     usage: CacheUsage,
 }
 
-/// The rolling scanner: accumulates SSE bytes up to [`SCAN_CAP`], extracts the
-/// `data:` line of the first `message_start` event, and parses it once.
 struct Scanner {
     buf: Vec<u8>,
     sink: UsageSink,
@@ -68,8 +46,6 @@ impl Scanner {
         }
     }
 
-    /// Feed one chunk. Never blocks, never awaits, never panics. Once an
-    /// observation is sent or the cap is hit, the scanner is inert.
     fn feed(&mut self, chunk: &[u8]) {
         if self.done {
             return;
@@ -83,15 +59,11 @@ impl Scanner {
         }
     }
 
-    /// Release the buffer and stop all further work.
     fn finish(&mut self) {
         self.done = true;
         self.buf = Vec::new();
     }
 
-    /// Walk complete `\n`-terminated lines; on the `data:` payload of the target
-    /// event, parse `message.usage`/`message.model`. Incomplete trailing bytes
-    /// stay buffered for the next chunk.
     fn scan(&self) -> Option<Observed> {
         let mut event: Option<&[u8]> = None;
         for line in self.buf.split(|&b| b == b'\n') {
@@ -113,8 +85,6 @@ impl Scanner {
     }
 }
 
-/// The named field's value with one optional leading space trimmed, or `None`
-/// when `line` is not that field.
 fn parse_field<'a>(line: &'a [u8], field: &[u8]) -> Option<&'a [u8]> {
     let rest = line.strip_prefix(field)?;
     Some(rest.strip_prefix(b" ").unwrap_or(rest))
@@ -128,10 +98,6 @@ fn parse_message_start(data: &[u8]) -> Option<Observed> {
     })
 }
 
-/// Wrap `upstream` so each chunk is yielded downstream UNCHANGED while a copy
-/// feeds the scanner. The returned stream is byte-identical to `upstream`; the
-/// only side effect is a single `try_send` on `sink` for the first observed
-/// `message_start`.
 pub fn tap<S>(upstream: S, sink: UsageSink) -> impl Stream<Item = reqwest::Result<Bytes>>
 where
     S: Stream<Item = reqwest::Result<Bytes>>,

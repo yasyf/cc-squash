@@ -1,11 +1,4 @@
-//! The PURE owned-bytes splice. [`splice`] edits the *original* request bytes in
-//! place: it parses only the top-level envelope and the `messages` array, replaces
-//! the targeted content blocks with caller-rendered placeholders, applies the
-//! [`BreakpointPlan`]'s `cache_control` hints (capped so the total never exceeds
-//! [`CACHE_HINT_CAP`] across system + tools + messages), and copies EVERY untouched
-//! span — sibling envelope keys, thinking blocks, tool blocks — byte-for-byte. It
-//! never rebuilds from [`WireBody`] (which models only five keys); doing so would
-//! drop `metadata`, `temperature`, `tool_choice`, and the rest.
+//! The pure owned-bytes splice: edit the original request bytes in place.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::BTreeMap;
@@ -16,58 +9,31 @@ use serde_json::{Map, Value};
 use crate::breakpoint::CACHE_HINT_CAP;
 use crate::wire::WireBody;
 
-/// Identifies the content to replace within one message of the `messages` array.
-///
-/// `block` selects a single block in an array-form `content`; `None` targets a
-/// string-form `content` (the whole `content` value is replaced).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentTarget {
-    /// Index into the top-level `messages` array.
     pub message: usize,
-    /// Index into that message's `content` block array, or `None` for string content.
     pub block: Option<usize>,
 }
 
-/// One pre-rendered replacement: a [`SegmentTarget`] and the FULL JSON value the
-/// caller (the proxy, via `ccs_refs`) rendered for it — e.g.
-/// `{"type":"text","text":"<placeholder>"}`. This module never renders content; it
-/// only splices `block_json` into place.
 #[derive(Debug, Clone)]
 pub struct RenderedSegment {
     pub target: SegmentTarget,
     pub block_json: String,
 }
 
-/// Why the splice could not produce a structurally valid rewrite. Any variant means
-/// the caller must forward the original bytes unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RewriteError {
-    /// The top-level object or its `messages` array did not parse.
     ParseEnvelope,
-    /// A [`SegmentTarget`] named a message or block index that does not exist.
     TargetOutOfRange,
-    /// A caller-supplied `block_json` was not valid JSON.
     Serialize,
 }
 
-/// The outcome of a [`splice`]: the rewritten bytes and how many of the plan's
-/// message breakpoints were suppressed because the effective cap was already hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spliced {
     pub bytes: Vec<u8>,
-    /// Plan positions dropped to keep the total `cache_control` count `<= 4`. A
-    /// non-zero value is worth logging: our hints lost to pre-existing system/tools
-    /// breakpoints.
     pub suppressed_breakpoints: usize,
 }
 
-/// Splice the `segments`' rendered placeholders and the `plan`'s `cache_control`
-/// hints into `original`, preserving every untouched byte.
-///
-/// `original` is the verbatim request body; `body` is its parse (used only to count
-/// pre-existing `cache_control` hints on `system`/`tools`). `segments` carry the
-/// caller-rendered replacement blocks. `plan.positions` are message indices that
-/// each take a `cache_control` hint on their last content block.
 pub fn splice(
     original: &[u8],
     body: &WireBody,
@@ -111,10 +77,8 @@ pub fn splice(
     })
 }
 
-/// Edit one message: replace targeted blocks, add/remove the `cache_control` hint,
-/// and re-serialize ONLY if something changed — otherwise return the verbatim span
-/// (the load-bearing byte-for-byte path: untouched thinking/tool blocks must not be
-/// canonicalized by serde's key-sorting re-serialization).
+// Re-serialize only on a real change: an untouched message must return its verbatim
+// span, since serde's key-sorting would canonicalize thinking/tool blocks otherwise.
 fn edit_message(
     index: usize,
     raw: Box<RawValue>,
@@ -149,9 +113,6 @@ fn edit_message(
     to_raw(&Value::Object(msg)).map_err(|_| RewriteError::Serialize)
 }
 
-/// Add the `cache_control` hint to the message's last block (or to a string-content
-/// message, which we promote to a single text block), or strip every hint when
-/// `wants_hint` is false. Stripping keeps the message verbatim-shaped otherwise.
 fn set_hint(content: &mut Value, wants_hint: bool) -> Result<(), RewriteError> {
     match content {
         Value::Array(blocks) => {
@@ -196,12 +157,8 @@ fn has_hint_raw(raw: &RawValue) -> bool {
     raw.get().contains("\"cache_control\"")
 }
 
-// Substring count, not a structural walk: a literal `"cache_control"` inside a
-// system-prompt or tool-schema *text value* (plausible for a coding agent) inflates
-// the prefix count, shrinking `effective_cap`. The direction is fail-safe — we only
-// ever emit fewer hints, never more than 4, so this never causes a 400 — but it can
-// cost a marginal breakpoint. The post-rewrite gate counts the same way, so an
-// overcount there at worst rejects a valid rewrite (→ fail-open to the original).
+// Substring count, not a structural walk: a literal `"cache_control"` in a text value
+// can overcount, but the direction is fail-safe (we only ever emit fewer hints).
 fn count_hints_raw(raw: Option<&RawValue>) -> usize {
     raw.map(|r| r.get().matches("\"cache_control\"").count())
         .unwrap_or(0)
@@ -211,8 +168,6 @@ fn to_raw(value: &Value) -> Result<Box<RawValue>, serde_json::Error> {
     RawValue::from_string(serde_json::to_string(value)?)
 }
 
-/// [`cap_cache_hints`] caps at the fixed [`CACHE_HINT_CAP`]; here the cap is the
-/// per-request effective budget (`4 − prefix hints`). Drops the earliest first.
 fn cap_cache_hints_to(mut positions: Vec<usize>, cap: usize) -> Vec<usize> {
     match positions.len() <= cap {
         true => positions,
@@ -238,8 +193,6 @@ mod tests {
         BreakpointPlan { positions }
     }
 
-    /// A body carrying many unmodeled top-level keys plus a latest-assistant thinking
-    /// block whose signature must survive byte-for-byte.
     fn rich_body() -> String {
         serde_json::json!({
             "model": "claude-opus-4-8",
@@ -310,12 +263,9 @@ mod tests {
     fn preserves_latest_assistant_thinking_byte_for_byte() {
         let original = rich_body();
         let body = parse_body(original.as_bytes()).unwrap();
-        // The exact verbatim span of the latest assistant's thinking block, lifted
-        // straight from the ORIGINAL bytes (whatever key order it carries).
         let latest_thinking = body.messages[3].content.blocks()[0].raw().get();
         assert!(latest_thinking.contains("LATEST-SIG-XYZ"));
 
-        // Replace a block in message 1, NOT the latest assistant (message 3).
         let segs = [rendered(
             1,
             Some(1),
@@ -323,7 +273,6 @@ mod tests {
         )];
         let out = splice(original.as_bytes(), &body, &segs, &plan(vec![])).unwrap();
         let text = String::from_utf8(out.bytes).unwrap();
-        // The whole latest thinking block survives byte-for-byte, signature included.
         assert!(
             text.contains(latest_thinking),
             "the latest assistant thinking block must survive byte-for-byte: {latest_thinking}",
@@ -343,14 +292,11 @@ mod tests {
         let msgs = key(&out.bytes, "messages");
         let block = &msgs[1]["content"][1];
         assert_eq!(block["text"], Value::String("<placeholder>".to_owned()));
-        // The sibling thinking block in the same message is untouched.
         assert_eq!(msgs[1]["content"][0]["type"], "thinking");
     }
 
     #[test]
     fn caps_total_cache_control_at_four_when_prefix_has_some() {
-        // system + tools each carry a cache_control ⇒ prefix hints = 2 ⇒ effective
-        // cap = 2. Ask for 4 message breakpoints; only the latest 2 survive.
         let original = serde_json::json!({
             "model": "claude-opus-4-8",
             "max_tokens": 1024,
@@ -372,7 +318,6 @@ mod tests {
             .count();
         assert_eq!(total, 4, "never more than four cache_control total");
         assert_eq!(out.suppressed_breakpoints, 2, "two earliest hints dropped");
-        // The two surviving message hints land on the latest messages (2 and 3).
         let msgs = key(&out.bytes, "messages");
         for i in [2usize, 3] {
             assert!(

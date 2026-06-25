@@ -1,24 +1,10 @@
-//! The SHARED segment canonicalizer: the SOLE definition mapping a [`Segment`] to
-//! the exact, deterministic bytes that get content-addressed and stored. Layer 4's
-//! L1 staging hashes these bytes to key its plan; the on-path L2 rewrite re-hashes
-//! the same live segment with this SAME function to match the staged plan. It must
-//! therefore be stable and order-deterministic — a historical segment in a grown
-//! body (later messages appended) must canonicalize byte-identically, since its
-//! `source_uuids` name the same prefix indices in both bodies and the bytes come
-//! from each message's verbatim `&RawValue` content spans (never a lossy decode).
+//! The sole segment canonicalizer. Must stay stable and order-deterministic: a
+//! historical segment in a grown body must canonicalize byte-identically.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use crate::segment::Segment;
 use crate::wire::WireBody;
 
-/// The canonical content-payload bytes of `seg` within `body` — the exact,
-/// deterministic input to content-addressing and `RefStore::put`.
-///
-/// Maps `seg.source_uuids` (message indices, in segment order) to `body.messages`
-/// and concatenates each message's verbatim content `&RawValue` spans in order.
-/// Using the raw spans (not a decoded string) keeps the bytes identical across
-/// turns: appended later messages take higher indices and never perturb a
-/// historical segment's prefix indices or its spans.
 pub fn segment_payload_bytes(seg: &Segment, body: &WireBody) -> Vec<u8> {
     seg.source_uuids
         .iter()
@@ -75,7 +61,6 @@ mod tests {
         let base_segs = segment_prompt(&base_body);
         let grown_segs = segment_prompt(&grown_body);
 
-        // The first segment (the first user turn) is historical in both bodies.
         let base_bytes = segment_payload_bytes(&base_segs[0], &base_body);
         let grown_bytes = segment_payload_bytes(&grown_segs[0], &grown_body);
 
