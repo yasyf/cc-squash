@@ -168,6 +168,40 @@ fn tool_pair_body() -> Vec<u8> {
     .into_bytes()
 }
 
+/// Like [`squashable_body`], but with a `role: "system"` string-content message
+/// (the SessionStart-hook / deferred-tools reminder Claude Code injects into
+/// `messages[]`) interleaved among the turns. Before the `Role::System` fix this
+/// made `parse_body` fail, silently disabling the whole staging engine. The long
+/// first assistant turn is still an old, unpinned squash candidate.
+fn system_role_body() -> Vec<u8> {
+    let long = "the assistant explained a lot of detailed context in this reply. ".repeat(12);
+    let reminder = "<system-reminder> SessionStart hook context and deferred-tools notice. "
+        .repeat(8);
+    serde_json::json!({
+        "model": "claude-opus-4-20250514",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": "kick off the work"},
+            {"role": "assistant", "content": long},
+            {"role": "system", "content": reminder},
+            {"role": "user", "content": "second turn"},
+            {"role": "assistant", "content": "second reply"},
+            {"role": "user", "content": "third turn"},
+            {"role": "assistant", "content": "third reply"},
+            {"role": "user", "content": "fourth turn that is current"},
+        ],
+    })
+    .to_string()
+    .into_bytes()
+}
+
+fn now_s() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs_f64()
+}
+
 async fn post(proxy: SocketAddr, token: &str, body: Vec<u8>) -> reqwest::Response {
     reqwest::Client::new()
         .post(format!("http://{proxy}/s/{token}/v1/messages"))
@@ -272,6 +306,65 @@ async fn stage_next_stages_tool_pair_segment() {
             .values()
             .any(|e| e.rec.kind == ccs_core::SegmentKind::ToolPair),
         "the tool_use/tool_result pair must be staged as a ToolPair entry",
+    );
+}
+
+#[tokio::test]
+async fn stage_next_stages_body_containing_system_role_message() {
+    // A body carrying a `role: "system"` reminder must flow end-to-end through
+    // parse → segment → decide → store.put → commit. Before the `Role::System`
+    // fix, `parse_body` errored on the `system` variant and NOTHING staged.
+    let reply =
+        summarizer_reply(r#"{"choice":"summarize","summary_content":"condensed early context"}"#);
+    let upstream = mock_upstream(reply, Duration::ZERO).await;
+    let (proxy, state) = spawn_proxy_with_state(&upstream.uri()).await;
+    register(&state, "tok-system");
+
+    let resp = post(proxy, "tok-system", system_role_body()).await;
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await.expect("drain body");
+
+    assert!(
+        await_staged(&state, "tok-system").await,
+        "a body with a system-role message must still stage a plan",
+    );
+
+    let ctx = state
+        .sessions
+        .get(&SessionToken("tok-system".to_owned()))
+        .expect("session");
+    let econ = ctx.econ.as_ref().expect("econ");
+    let ref_id = {
+        let guard = econ.lock().expect("lock");
+        let plan = guard.staged.as_ref().expect("staged plan");
+        assert!(
+            !plan.by_content.is_empty(),
+            "the squashable segment must produce a staged entry",
+        );
+        plan.by_content
+            .values()
+            .next()
+            .expect("entry")
+            .rec
+            .ref_id
+            .clone()
+    };
+
+    // The original was `put` into the REAL RefStore under this session: the staged
+    // ref resolves, proving store.put ran on the system-role-carrying body.
+    let resolved = state
+        .store
+        .retrieve(
+            &ref_id,
+            &ccs_core::SessionId::new("tok-system"),
+            None,
+            now_s(),
+        )
+        .await
+        .expect("retrieve");
+    assert!(
+        matches!(resolved, ccs_refs::RetrieveResult::Hit { .. }),
+        "stage_next must have stored the original under the staged ref",
     );
 }
 

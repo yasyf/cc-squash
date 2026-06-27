@@ -38,14 +38,24 @@ pub async fn stage_next(
     store: Arc<RefStore>,
     now: f64,
 ) {
+    let _guard = StagingGuard { econ: econ.clone() };
+
     let Some((working, auth, policy)) = clone_inputs(&econ) else {
-        clear_guard(&econ);
+        tracing::debug!(session = session_id.as_str(), "L1 skip: econ lock poisoned");
         return;
     };
 
-    let Ok(body) = parse_body(&bytes) else {
-        clear_guard(&econ);
-        return;
+    let body = match parse_body(&bytes) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(
+                session = session_id.as_str(),
+                error = %e,
+                len = bytes.len(),
+                "L1 skip: request body did not parse; squash disabled this turn",
+            );
+            return;
+        }
     };
     let segments = segment_prompt(&body);
 
@@ -53,7 +63,11 @@ pub async fn stage_next(
         .iter()
         .any(|seg| is_squash_candidate(seg, &working, &policy))
     {
-        clear_guard(&econ);
+        tracing::debug!(
+            session = session_id.as_str(),
+            segments = segments.len(),
+            "L1 skip: no squash candidates",
+        );
         return;
     }
 
@@ -77,11 +91,19 @@ pub async fn stage_next(
             .first()
             .cloned()
             .unwrap_or_else(|| ccs_core::MessageId::new(seg.index.to_string()));
-        let Ok(record) = store
+        let record = match store
             .put(&payload, &source_uuid, &session_id, seg.kind, now)
             .await
-        else {
-            continue;
+        {
+            Ok(record) => record,
+            Err(e) => {
+                tracing::debug!(
+                    session = session_id.as_str(),
+                    error = %e,
+                    "L1 ref-store put failed; skipping segment",
+                );
+                continue;
+            }
         };
         plan.by_content.insert(
             record.ref_id.clone(),
@@ -141,13 +163,22 @@ fn commit(econ: &Mutex<SessionEcon>, plan: StagedPlan, working: WorkingState) {
     if let Ok(mut guard) = econ.lock() {
         guard.staged = Some(plan);
         guard.working = working;
-        guard.staging.store(false, Ordering::Release);
     }
 }
 
-fn clear_guard(econ: &Mutex<SessionEcon>) {
-    if let Ok(guard) = econ.lock() {
-        guard.staging.store(false, Ordering::Release);
+/// Releases the per-session staging guard the moment the off-path task ends — on
+/// any exit, including an early return or a panic in the detached task — so one
+/// failed turn can never wedge staging shut. The guard is claimed synchronously in
+/// `forward_setup` (latest-wins) and released here; this is its sole release site.
+struct StagingGuard {
+    econ: Arc<Mutex<SessionEcon>>,
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if let Ok(guard) = self.econ.lock() {
+            guard.staging.store(false, Ordering::Release);
+        }
     }
 }
 

@@ -133,6 +133,26 @@ pub fn segment_prompt(body: &WireBody) -> Vec<Segment> {
                 );
                 i += 1;
             }
+            // An injected system-reminder turn (SessionStart context, the
+            // deferred-tools notice). Never a true-human turn and never a new
+            // conversation round, so it carries the current generation and is a
+            // squash candidate like any other message-indexed segment.
+            Role::System => {
+                push(
+                    &mut segments,
+                    &mut offset,
+                    Build {
+                        kind: SegmentKind::System,
+                        generation,
+                        pinned: false,
+                        is_true_human: false,
+                        source_uuids: vec![message_id(i)],
+                        raws: m.content.raws(),
+                        rendered: m.content.rendered(),
+                    },
+                );
+                i += 1;
+            }
         }
     }
 

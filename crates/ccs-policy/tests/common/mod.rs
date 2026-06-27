@@ -51,6 +51,14 @@ pub fn assistant_text(text: &str) -> Value {
     json!({"role": "assistant", "content": [{"type": "text", "text": text}]})
 }
 
+/// A `role: "system"` message INSIDE `messages[]` with STRING content — the
+/// SessionStart-hook / deferred-tools reminder Claude Code injects. Distinct from
+/// the top-level `system` prompt field; rejecting this variant fails the whole
+/// body parse, so it is the regression fixture for the `system`-role parse bug.
+pub fn system_reminder(text: &str) -> Value {
+    json!({"role": "system", "content": text})
+}
+
 /// An assistant message issuing a single client `tool_use`.
 pub fn assistant_tool_use(id: &str) -> Value {
     json!({"role": "assistant", "content": [

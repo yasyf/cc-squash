@@ -9,7 +9,9 @@ use ccs_policy::segment::{is_prune_candidate, segment_prompt};
 use ccs_policy::wire::parse_body;
 use ccs_policy::{PolicyConfig, Segment};
 
-use common::{client_tool_pair, in_flight_tool_use, prompt, server_tool_turn};
+use common::{
+    client_tool_pair, in_flight_tool_use, prompt, server_tool_turn, system_reminder, typed_human,
+};
 
 fn segments(body: &[u8]) -> Vec<Segment> {
     segment_prompt(&parse_body(body).unwrap())
@@ -97,6 +99,44 @@ fn in_flight_tool_use_is_pinned_current_and_never_a_candidate() {
     assert!(
         !is_prune_candidate(last, &segs, &PolicyConfig::default()),
         "the in-flight head is never a prune candidate",
+    );
+}
+
+#[test]
+fn system_role_message_in_messages_array_parses_and_segments() {
+    // Claude Code injects a `role: "system"` reminder INSIDE `messages[]`. Before
+    // the fix, the `Role` enum had no `System` variant, so `parse_body` failed with
+    // `unknown variant `system`` — silently disabling the whole squash engine.
+    let reminder = "<system-reminder> ".repeat(20); // ≥300 chars
+    assert!(reminder.len() >= 300);
+    let body = prompt(&[
+        typed_human("Please refactor the auth module."),
+        system_reminder(&reminder),
+        typed_human("Now run the tests."), // trailing turn so the System seg is NOT last
+    ]);
+
+    // THE core regression guard: a `system`-role message must parse, not `Err`.
+    let parsed = parse_body(&body).expect("a system-role message must parse");
+    let segs = segment_prompt(&parsed);
+
+    // The injected `role: "system"` message is message index 1; segment by its
+    // source_uuid, not by kind alone — the top-level `system` prompt is also a
+    // System segment but carries no source_uuid.
+    let sys = segs
+        .iter()
+        .find(|s| s.kind == SegmentKind::System && s.source_uuids == vec![MessageId::new("1")])
+        .expect("the injected system-role message segments as a System segment");
+    assert!(
+        !sys.is_true_human,
+        "an injected system reminder is never true-human",
+    );
+    assert!(
+        !sys.pinned,
+        "a non-last system reminder is not pinned",
+    );
+    assert!(
+        !sys.is_current,
+        "the system reminder is not the current segment",
     );
 }
 

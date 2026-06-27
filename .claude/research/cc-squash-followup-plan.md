@@ -7,83 +7,82 @@ bug; F2 is the `ccs-eval` substrate deferred from the main plan's Phase 5.
 
 ---
 
-## F1 (P0) — The live `ccs run` squash engine is a no-op
+## F1 (P0) — The live `ccs run` squash engine is a no-op — RESOLVED
 
-### Context
+**Status: FIXED.** Root cause was a wire-parse rejection, not the summarizer hang
+hypothesized below. Found by instrumented live capture; fix + regression tests landed.
 
-The deterministic proof for the tool-output squash is strong (closed-loop integration
-test produces the plan via real `stage_next` and applies it via real `intercept::run`;
-292+ tests; CI-green incl. the two-process cold-start). But a **live** `ccs run -- claude -p`
-tool-heavy session (reading 7 files incl. the ~50k-token build plan) revealed the engine
-**never squashes anything end-to-end**:
+### Symptom (as observed live)
 
-- The relay works perfectly: 10× `POST /v1/messages`, all `decision=forward status=200`,
-  intact SSE, no 401, context growing 99KB→346KB. Layer 1 / Exp C re-proven live, fail-open
-  intact.
-- **But: zero `L1 staged plan (shadow)` log lines** (logged at `info!`; the proxy filter is
-  `info`, so this is not a logging artifact) and **`refs.db` has 0 rows** — L1 never reached
-  `store.put`, and L2 never intercepted.
+A live `ccs run` tool-heavy session forwarded perfectly (every `POST /v1/messages`
+`decision=forward status=200`, context 99KB→346KB) yet produced **zero `L1 staged plan`
+logs and an empty `refs.db`** — L1 never staged, L2 never intercepted.
 
-The session *was* recognized (`decision=forward` requires `inspect_for`'s
-`state.sessions.contains_key` to be true — demux.rs:82), `econ` is built (`claude-sonnet-4-6`
-is in `MODEL_ECONOMICS`), and `SessionEcon::new` inits `staging=false` / `intercept_enabled=true`
-— so `forward_setup` *should* spawn `stage_next`. The unit and closed-loop tests can't catch
-this because they call `stage_next`/`intercept::run` **directly**, mocking the Anthropic
-boundary — they never exercise the relay's `forward_setup` wiring or the **real** summarizer
-transport/auth.
+### Actual root cause (observed, not inferred)
 
-### Most likely root cause
+A throwaway probe at `relay.rs serve` dumped each inbound `/v1/messages` body and its
+`parse_body` verdict. Every real body failed serde with:
 
-The off-path L1 task (`staging.rs::stage_next`) does not complete in the live flow. The
-loop's `store.put` and the final `log_plan` both sit **after** the `decide()`/`fold()`
-summarizer `await`s, so a hang or silent failure there produces exactly this signature (no
-log, no refs). The summarizer POSTs to `state.upstream` with the captured session OAuth
-(`capture_auth`, relay.rs:343) and the pinned `claude-sonnet-4-6`; the call has no observed
-timeout, and it runs in a detached `tokio::spawn` whose panic would go to stderr (verify
-whether that reaches `daemon.log`).
+> `unknown variant `system`, expected `user` or `assistant` at line 1 column N`
 
-### Approach
+Claude Code injects a message with **`role: "system"`** *inside* the `messages[]` array
+(the SessionStart-hook / deferred-tools reminder; `content` is a plain string), distinct
+from the top-level `system` prompt field. The wire `Role` enum had only `User`/`Assistant`,
+so `serde_json::from_slice` rejected the whole body. That **one** failure cascaded
+uniformly: `stage_next`'s `parse_body` failed (silent early-return → no L1), and
+`body_model`'s `parse_body` failed → model resolved to `"unknown"` → `economics_for`→None →
+L2 disabled. One bug, the entire signature.
 
-1. **Instrumented reproduction** (don't guess): run the proxy with `RUST_LOG=ccs_proxy=debug`
-   + `RUST_BACKTRACE=1`, capture proxy stdout **and** stderr, drive a minimal 1-file
-   `ccs run -- claude -p` session, and determine whether `stage_next` spawns, hangs, or
-   panics — and whether a detached-task panic surfaces in `daemon.log` at all. Add temporary
-   `tracing::debug!` at `forward_setup` entry/exit, `stage_next` entry, and around each
-   `decide`/`fold` await if needed.
-2. **Fix per the evidence.** Likely: (a) add a wall-clock **timeout** to the off-path
-   summarizer calls (a stalled call must never wedge L1 — it should fail-safe to Keep/prev and
-   still `log_plan`); (b) confirm the standalone summarizer request carries the headers the
-   first-party path needs (beta headers / `anthropic-version`) so the OAuth call actually
-   succeeds; (c) ensure detached-task failures are logged (wrap `stage_next` so a panic/err is
-   visible, not swallowed).
-3. **Close the test gap.** Add a relay-level test that drives `serve()` through
-   `forward_setup` → `stage_next` (summarizer mocked at the transport, but the **real**
-   `forward_setup` wiring + a real `RefStore`), asserting `refs.db` gains a row and a staged
-   plan is committed after turn 1 — the gap the direct-call tests structurally miss.
-4. **Re-verify live**: a `ccs run` session shows `L1 staged plan` logs, `refs.db` rows, and on
-   a later turn an L2 squash (or a logged economic `Hold`), with realized `cache_creation`
-   tracking the predicted bust.
+The original "off-path summarizer `decide()`/`fold()` hang/fail" hypothesis was **wrong as
+the cause** — it was unreachable, because parsing failed first. (It is a real *fail-open*
+path; see the secondary finding below.) The deepest enabling defect was **silence**: all
+three `stage_next` early-returns and the `init_econ` `"unknown"` fallback discarded their
+reason, which is why a live session + multiple agents were needed to corner it.
 
-### Potential pitfalls
+### As-built fix (landed)
 
-- Detached `tokio::spawn` swallows panics — instrument before assuming "didn't spawn."
-- The summarizer auth may work for the main session but not for a raw standalone POST; this is
-  an auth/headers issue, not necessarily a hang.
-- Keep the cardinal invariant: a broken summarizer must degrade L1 to no-squash (fail-safe),
-  never wedge the hot path or the relay.
+1. **Parse fix** — `crates/ccs-policy/src/wire.rs`: added `System` to `enum Role`
+   (snake_case). `crates/ccs-policy/src/segment.rs`: a `Role::System` arm pushes a
+   `SegmentKind::System` segment with `source_uuids = [message_id(i)]`,
+   `is_true_human = false`, `pinned = false`, current `generation` (no increment) — so the
+   injected reminder is a normal message-indexed squash candidate. No `Any`-widening; the
+   closed-variant discipline is intact. Verified the full real captured body now parses
+   (`system` was the *only* non-conforming field) and flows byte-safe through
+   segment → candidate → content-address match → `squash_targets` (catch-all StringContent
+   target) → splice (role preserved; only `content` replaced) → `check_roles` gate.
+2. **Observability** — `warn!` at `stage_next`'s parse-fail and at `init_econ`'s
+   `model="unknown"` fallback (a silent economics-disable now screams); `debug!` at the
+   no-candidate / poisoned-lock / ref-store-put-failed returns. The engine can never again
+   silently no-op undiagnosed.
+3. **RAII staging guard** — `StagingGuard` (Drop) released on *every* `stage_next` exit
+   (return/error/panic in the detached task), replacing the manual `staging.store(false)`
+   sites. Removes the single-shot-wedge fragility; latest-wins claim semantics unchanged.
+4. **Regression tests** — `ccs-policy/tests/d1_segmentation.rs`
+   (`system_role_message_in_messages_array_parses_and_segments`: a `role:"system"` body must
+   parse + segment as a non-true-human `System` segment) and `ccs-proxy/tests/staging.rs`
+   (`stage_next_stages_body_containing_system_role_message`: full `forward_setup`→`stage_next`
+   with a real `RefStore` + mocked summarizer stages a plan and lands a ref). Both were
+   confirmed to FAIL on pre-fix source (the exact `unknown variant system`) and pass after.
 
-### Workflow Plan
+### Verification (done)
 
-| Phase | Shape | Agents | Verification |
-|---|---|---|---|
-| Repro | pipeline | 1 subagent runs the instrumented live repro, reports the exact failure point | the failing await/spawn is identified with evidence from logs |
-| Fix | pipeline → verify | 1 impl (timeout + auth + visibility) → 1 adversarial verify | `refs.db` gains rows in a live run; fail-safe holds under a stalled summarizer |
-| Test gap | pipeline | 1 subagent adds the relay-level `serve`→`forward_setup`→`stage_next` test | the new test fails on the pre-fix code and passes after |
+- Live (rebuilt, committed binary): `L1 staged plan` logs now fire every turn, candidates
+  grow 4→12, **no** parse-fail / `model=unknown` / skip warnings, model resolves, fail-open
+  intact. The engine engages end-to-end.
+- `cargo test --all` + `cargo clippy --all -- -D warnings` green.
 
-### Verification
+### Secondary finding (now visible post-fix; NOT a no-op regression)
 
-Live `ccs run` session shows staging logs + refs.db rows + an L2 squash/Hold; the new
-relay-level test exercises the real `forward_setup` wiring; `cargo test --all` + clippy green.
+With parsing fixed, `staged=0` persisted in back-to-back live runs because the off-path
+summarizer returned **`429 Too Many Requests`** (`ccs_summarizer::decision`/`folder` warn:
+"content decision failed/working-state fold failed; keeping…") — a rate limit from running
+several live sessions in quick succession, each firing one `decide()` per candidate plus a
+`fold()`. The code handles this correctly: a 429 fail-opens to `Keep`/prior (the cardinal
+invariant holds). That `staging` *does* produce a ref when the summarizer responds is proven
+deterministically by `stage_next_stages_body_containing_system_role_message` (mocked
+summarizer). A live `staged≥1` observation just needs a run outside the rate-limit window.
+Future hardening worth considering (out of scope here): throttle/serialize off-path
+summarizer calls and/or back off on 429 so L1 does not burst the account.
 
 ---
 

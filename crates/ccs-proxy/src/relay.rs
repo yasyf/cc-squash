@@ -325,7 +325,13 @@ fn init_econ(
             cached_prefix_tokens: ccs_core::TokenCount(0),
             last_request_ts: now_s(),
             assumed_ttl_s: ctx.config.economics.ttl_auto_s,
-            model: body_model(body).unwrap_or_else(|| ModelId::new("unknown")),
+            model: body_model(body).unwrap_or_else(|| {
+                tracing::warn!(
+                    len = body.len(),
+                    "economics disabled: request body model unresolved (model=unknown)"
+                );
+                ModelId::new("unknown")
+            }),
             breakpoints: Vec::new(),
         },
         capture_auth(state, headers),
