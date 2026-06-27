@@ -130,10 +130,7 @@ fn system_role_message_in_messages_array_parses_and_segments() {
         !sys.is_true_human,
         "an injected system reminder is never true-human",
     );
-    assert!(
-        !sys.pinned,
-        "a non-last system reminder is not pinned",
-    );
+    assert!(!sys.pinned, "a non-last system reminder is not pinned",);
     assert!(
         !sys.is_current,
         "the system reminder is not the current segment",

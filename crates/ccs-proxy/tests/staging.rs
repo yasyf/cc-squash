@@ -175,8 +175,8 @@ fn tool_pair_body() -> Vec<u8> {
 /// first assistant turn is still an old, unpinned squash candidate.
 fn system_role_body() -> Vec<u8> {
     let long = "the assistant explained a lot of detailed context in this reply. ".repeat(12);
-    let reminder = "<system-reminder> SessionStart hook context and deferred-tools notice. "
-        .repeat(8);
+    let reminder =
+        "<system-reminder> SessionStart hook context and deferred-tools notice. ".repeat(8);
     serde_json::json!({
         "model": "claude-opus-4-20250514",
         "max_tokens": 1024,
