@@ -28,6 +28,10 @@ bytes = "1"
 futures-util = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
+# TOON encoder for the deterministic JSON→TOON pass (pure: depends only on
+# serde/serde_json). `default-features = false` drops the `cli` feature's heavy
+# tree (clap, ratatui, tiktoken-rs, …) so it stays a pure engine dep.
+toon-format = { version = "0.5", default-features = false }
 memchr = "2"
 # strum::Display + serde rename give the pure engine's tag enums exact wire spellings.
 strum = { version = "0.26", features = ["derive"] }

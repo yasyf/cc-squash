@@ -7,8 +7,9 @@ use ccs_core::{
     ByteOffset, ChoiceTag, Generation, LineRange, ModelId, RefId, SegmentKind, TokenCount,
 };
 use ccs_economics::{economics_for, CacheState, ModelEconomics};
-use ccs_policy::candidate::select_strategy;
+mod common;
 use ccs_policy::{ContentDecision, PolicyConfig, Segment, SquashCandidate, Strategy};
+use common::select_strategy_oracle;
 
 const HEX64: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
@@ -77,7 +78,7 @@ fn pregate_min_chars_keeps_below_floor() {
     let d = decide(ChoiceTag::Summarize, vec![], Some("anything"));
     let (c, econ, cache, turns) = positive_npv_inputs();
     assert_eq!(
-        select_strategy(
+        select_strategy_oracle(
             &s,
             &d,
             &c,
@@ -99,7 +100,7 @@ fn dispatch_truncate_maps_to_truncate() {
     let d = decide(ChoiceTag::Truncate, ranges.clone(), None);
     let (c, econ, cache, turns) = positive_npv_inputs();
     assert_eq!(
-        select_strategy(
+        select_strategy_oracle(
             &s,
             &d,
             &c,
@@ -120,7 +121,7 @@ fn dispatch_summarize_maps_to_summarize() {
     let d = decide(ChoiceTag::Summarize, vec![], Some("short summary"));
     let (c, econ, cache, turns) = positive_npv_inputs();
     assert_eq!(
-        select_strategy(
+        select_strategy_oracle(
             &s,
             &d,
             &c,
@@ -141,7 +142,7 @@ fn compress_maps_to_reversible_ref() {
     let d = decide(ChoiceTag::Compress, vec![], Some("ref summary"));
     let (c, econ, cache, turns) = positive_npv_inputs();
     assert_eq!(
-        select_strategy(
+        select_strategy_oracle(
             &s,
             &d,
             &c,
@@ -167,7 +168,7 @@ fn npv_nonpositive_keeps_even_when_summarize() {
     let d = decide(ChoiceTag::Summarize, vec![], Some("x"));
     let c = cand(10_000, 10);
     assert_eq!(
-        select_strategy(
+        select_strategy_oracle(
             &s,
             &d,
             &c,
@@ -188,7 +189,7 @@ fn pinned_keeps_even_when_summarize() {
     let d = decide(ChoiceTag::Summarize, vec![], Some("short summary"));
     let (c, econ, cache, turns) = positive_npv_inputs();
     assert_eq!(
-        select_strategy(
+        select_strategy_oracle(
             &s,
             &d,
             &c,
@@ -210,7 +211,7 @@ fn huge_paste_compress_is_reversible_ref_only() {
     let d = decide(ChoiceTag::Compress, vec![], Some("offloaded"));
     let (c, econ, cache, turns) = positive_npv_inputs();
     assert_eq!(
-        select_strategy(
+        select_strategy_oracle(
             &s,
             &d,
             &c,
@@ -236,7 +237,7 @@ fn huge_paste_summarize_keeps_never_lossy() {
     for choice in [ChoiceTag::Summarize, ChoiceTag::Truncate, ChoiceTag::Keep] {
         let d = decide(choice, vec![LineRange { start: 1, end: 2 }], Some("lossy"));
         assert_eq!(
-            select_strategy(
+            select_strategy_oracle(
                 &s,
                 &d,
                 &c,
@@ -270,7 +271,7 @@ fn never_returns_drop() {
                 let s = seg(est, human, false, kind);
                 let d = decide(choice, vec![LineRange { start: 1, end: 2 }], Some("s"));
                 assert_ne!(
-                    select_strategy(
+                    select_strategy_oracle(
                         &s,
                         &d,
                         &c,

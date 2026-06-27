@@ -420,6 +420,7 @@ mod tests {
                         ranges_to_keep: Vec::new(),
                         summary_content: None,
                     },
+                    recode: None,
                 },
             )]),
         });

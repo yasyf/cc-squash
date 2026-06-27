@@ -16,9 +16,12 @@ use ccs_core::{
 use ccs_economics::{economics_for, CacheState, ModelEconomics};
 use ccs_policy::candidate::is_squash_candidate;
 use ccs_policy::{
-    is_pinned, select_strategy, Constraint, ContentDecision, FreeBustTrigger, PolicyConfig,
-    Pressure, Segment, SquashCandidate, Strategy, WorkingState,
+    is_pinned, Constraint, ContentDecision, FreeBustTrigger, PolicyConfig, Pressure, Segment,
+    SquashCandidate, Strategy, WorkingState,
 };
+
+mod common;
+use common::select_strategy_oracle;
 
 const HEX64: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
@@ -130,7 +133,7 @@ fn salience_needle_survives_pressure_matrix() {
                             summary_content: Some("a terse summary".to_owned()),
                         };
                         assert_eq!(
-                            select_strategy(&pinned_seg, &decision, &cand(), &econ, &cache(), remaining_turns, now, 0.0, &PolicyConfig::default()),
+                            select_strategy_oracle(&pinned_seg, &decision, &cand(), &econ, &cache(), remaining_turns, now, 0.0, &PolicyConfig::default()),
                             Strategy::Keep,
                             "pinned seg rewritten ({choice}) at idle={idle} turns={remaining_turns} free_bust={free_bust:?} pressure={pressure:?}",
                         );
@@ -150,7 +153,7 @@ fn salience_needle_survives_pressure_matrix() {
         &PolicyConfig::default()
     ));
     assert_eq!(
-        select_strategy(
+        select_strategy_oracle(
             &unpinned,
             &summarize("terse"),
             &cand(),
@@ -198,7 +201,7 @@ fn injection_in_content_is_inert() {
     let clean = seg(SegmentKind::AssistantTurn, false, false, None);
     let injected = seg(SegmentKind::AssistantTurn, false, false, None);
 
-    let out_clean = select_strategy(
+    let out_clean = select_strategy_oracle(
         &clean,
         &decision,
         &cand(),
@@ -209,7 +212,7 @@ fn injection_in_content_is_inert() {
         0.0,
         &PolicyConfig::default(),
     );
-    let out_injected = select_strategy(
+    let out_injected = select_strategy_oracle(
         &injected,
         &decision,
         &cand(),
@@ -231,7 +234,7 @@ fn injection_in_content_is_inert() {
 fn injection_in_summary_cannot_unpin() {
     let econ = opus();
     let pinned_seg = seg(SegmentKind::AssistantTurn, true, false, None);
-    let baseline = select_strategy(
+    let baseline = select_strategy_oracle(
         &pinned_seg,
         &summarize("a clean summary"),
         &cand(),
@@ -246,7 +249,7 @@ fn injection_in_summary_cannot_unpin() {
 
     for inj in INJECTIONS {
         assert_eq!(
-            select_strategy(
+            select_strategy_oracle(
                 &pinned_seg,
                 &summarize(inj),
                 &cand(),

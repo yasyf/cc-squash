@@ -6,16 +6,20 @@
 use crate::breakpoint::{CACHE_HINT_CAP, LOOKBACK_POSITIONS};
 use crate::candidate::HUMAN_VERBATIM_MAX;
 use crate::decision::PRE_GATE_MIN_CHARS;
+use crate::pipeline::scorer::ScoreWeights;
 use crate::segment::RECENCY_WINDOW_N;
 
-/// Tunable policy knobs the control plane will later override via the seam.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Tunable policy knobs the control plane will later override via the seam. `weights`
+/// carries the explicit scorer's per-signal weights, scales, and the two decision knobs
+/// (`q_weight`, `score_floor`); see [`ScoreWeights`].
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PolicyConfig {
     pub recency_window_n: usize,
     pub human_verbatim_max: usize,
     pub pre_gate_min_chars: usize,
     pub cache_hint_cap: usize,
     pub lookback_positions: usize,
+    pub weights: ScoreWeights,
 }
 
 impl Default for PolicyConfig {
@@ -26,6 +30,7 @@ impl Default for PolicyConfig {
             pre_gate_min_chars: PRE_GATE_MIN_CHARS,
             cache_hint_cap: CACHE_HINT_CAP,
             lookback_positions: LOOKBACK_POSITIONS,
+            weights: ScoreWeights::default(),
         }
     }
 }

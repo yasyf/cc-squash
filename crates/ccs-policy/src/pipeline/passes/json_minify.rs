@@ -1,0 +1,112 @@
+//! Phase 3 pass A — minify a recodeable leaf whose content is pretty-printed JSON.
+//! Inline-lossless: re-serialize the parsed value with no insignificant whitespace; the
+//! model reads identical JSON, no ref is minted (`ref_id = None`). Idempotent — minified
+//! JSON re-minifies to itself.
+//!
+//! Fires only when the whole leaf parses as a JSON value (object, array, or scalar): the
+//! transform then drops the pretty-print indentation/spacing. A leaf that is not JSON, or
+//! is already minimal, yields no proposal (the strict-shrink check in
+//! [`inline_recode`](super::recode::inline_recode) rejects a non-shrinking result).
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
+use serde_json::value::RawValue;
+
+use crate::pipeline::pass::{Pass, PassControl, PassCtx, PassId, Phase, PlanLedger};
+use crate::pipeline::passes::recode::{inline_recode, recode_leaf};
+
+/// Minifies a recodeable leaf that is embedded JSON, proposing an inline `Recode` where
+/// the minified form is strictly shorter.
+pub struct JsonMinifyPass;
+
+impl Pass for JsonMinifyPass {
+    fn id(&self) -> PassId {
+        PassId("json_minify")
+    }
+
+    fn phase(&self) -> Phase {
+        Phase::OffPath
+    }
+
+    fn apply(&self, ctx: &PassCtx, ledger: &mut PlanLedger) -> PassControl {
+        for seg in ctx.segments {
+            let Some(leaf) = recode_leaf(ctx.body, seg, ledger) else {
+                continue;
+            };
+            let Some(minified) = minify_json(&leaf.content) else {
+                continue;
+            };
+            if let Some(p) = inline_recode(seg, &leaf, minified, self.id()) {
+                ledger.upsert_proposal(p);
+            }
+        }
+        PassControl::Continue
+    }
+}
+
+/// Re-serialize `input` as minified JSON when the whole string parses as a JSON value.
+/// `None` when `input` is not valid JSON. Lossless and idempotent: minified JSON
+/// re-minifies to itself.
+pub fn minify_json(input: &str) -> Option<String> {
+    let value: Box<RawValue> = serde_json::from_str(input).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(value.get()).ok()?;
+    serde_json::to_string(&parsed).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PRETTY: &str = r#"{
+  "rows": [
+    { "id": 1, "name": "alpha" },
+    { "id": 2, "name": "beta" }
+  ],
+  "ok": true
+}"#;
+
+    #[test]
+    fn minifies_pretty_json() {
+        let out = minify_json(PRETTY).expect("valid json");
+        assert_eq!(
+            out,
+            r#"{"rows":[{"id":1,"name":"alpha"},{"id":2,"name":"beta"}],"ok":true}"#
+        );
+    }
+
+    #[test]
+    fn shrinks_pretty_json() {
+        let out = minify_json(PRETTY).expect("valid json");
+        assert!(
+            out.len() < PRETTY.len(),
+            "minified ({}) shrinks vs pretty ({})",
+            out.len(),
+            PRETTY.len(),
+        );
+    }
+
+    #[test]
+    fn lossless_roundtrip() {
+        let out = minify_json(PRETTY).expect("valid json");
+        let a: serde_json::Value = serde_json::from_str(PRETTY).expect("pretty parses");
+        let b: serde_json::Value = serde_json::from_str(&out).expect("minified parses");
+        assert_eq!(a, b, "minify preserves the JSON value");
+    }
+
+    #[test]
+    fn idempotent() {
+        let once = minify_json(PRETTY).expect("valid json");
+        assert_eq!(minify_json(&once).as_deref(), Some(once.as_str()));
+    }
+
+    #[test]
+    fn no_op_on_non_json() {
+        assert_eq!(minify_json("not json at all, just a log line"), None);
+    }
+
+    #[test]
+    fn no_shrink_on_already_minified() {
+        let minified = r#"{"a":1,"b":[2,3]}"#;
+        // It re-minifies to itself; the pass's strict-shrink check then drops it.
+        assert_eq!(minify_json(minified).as_deref(), Some(minified));
+    }
+}

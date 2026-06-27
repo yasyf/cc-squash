@@ -118,12 +118,15 @@ impl Default for PolicyKnobs {
 
 impl From<PolicyKnobs> for PolicyConfig {
     fn from(k: PolicyKnobs) -> Self {
+        // The scorer `weights` have no serde face on `PolicyKnobs`, so they ride the
+        // engine default (`..PolicyConfig::default()`) until calibration exposes them.
         Self {
             recency_window_n: k.recency_window_n,
             human_verbatim_max: k.human_verbatim_max,
             pre_gate_min_chars: k.pre_gate_min_chars,
             cache_hint_cap: k.cache_hint_cap,
             lookback_positions: k.lookback_positions,
+            ..PolicyConfig::default()
         }
     }
 }

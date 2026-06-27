@@ -1,6 +1,9 @@
-//! The two-layer budget: soft per-turn pressure and the hard compaction target,
-//! plus the fallback ladder [`default_compact`] (which returns a [`CompactionPlan`],
-//! never bytes).
+//! The two-layer budget: soft per-turn pressure and the hard compaction target, plus
+//! the [`hard_target`] floor and the [`strip_reasoning`]/[`shed_tokens`] helpers the
+//! off-path budget-fallback passes share. The fallback ladder itself is the
+//! [`StripReasoningPass`](crate::pipeline::passes::StripReasoningPass) →
+//! [`DropToolPairsPass`](crate::pipeline::passes::DropToolPairsPass) →
+//! [`DropOldestPass`](crate::pipeline::passes::DropOldestPass) chain.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use ccs_core::{estimate_chars_proxy, SegmentKind, TokenCount};
@@ -13,22 +16,6 @@ use crate::wire::{ContentBlock, WireBody};
 pub enum Pressure {
     Nominal,
     OverBudget,
-}
-
-/// The HARD-ladder plan: which segments shed their reasoning, and which are dropped
-/// from the live window.
-///
-/// `strip` and `dropped` carry segment indices, not bytes — Layer 4 applies them.
-/// `dropped` is in ladder order (oldest tool pairs first, then the oldest
-/// non-instruction segments); each dropped segment is offloaded through a reversible
-/// reference where it can be, with an irreversible `Drop` only as the final rung.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CompactionPlan {
-    /// Indices of historical assistant turns whose `thinking` / `redacted_thinking`
-    /// blocks are shed (rung 1).
-    pub strip: Vec<usize>,
-    /// Indices dropped from the live window, oldest-first (rungs 2 and 3).
-    pub dropped: Vec<usize>,
 }
 
 /// Soft per-turn pressure: `OverBudget` when `just_added` exceeds half the soft cap
@@ -71,70 +58,6 @@ pub fn strip_reasoning(body: &WireBody, segments: &[Segment]) -> Vec<usize> {
         .collect()
 }
 
-/// The fallback ladder: a deterministic per-segment plan to reach `target` (strip
-/// reasoning → drop tool pairs oldest-first → drop oldest, keep last). The running
-/// token estimate is re-checked against `target` after each rung, so the ladder
-/// climbs no higher than it must.
-pub fn default_compact(
-    body: &WireBody,
-    segments: &[Segment],
-    target: TokenCount,
-) -> CompactionPlan {
-    let target = u64::from(target.get());
-    let mut running = total_tokens(segments);
-    let mut plan = CompactionPlan::default();
-
-    if running <= target {
-        return plan;
-    }
-
-    plan.strip = strip_reasoning(body, segments);
-    running = running.saturating_sub(
-        plan.strip
-            .iter()
-            .map(|&i| u64::from(shed_tokens(body, &segments[i])))
-            .sum(),
-    );
-    if running <= target {
-        return plan;
-    }
-
-    for seg in segments
-        .iter()
-        .filter(|s| s.kind == SegmentKind::ToolPair && !s.pinned)
-    {
-        if running <= target {
-            return plan;
-        }
-        running = running.saturating_sub(u64::from(seg.token_estimate.get()));
-        plan.dropped.push(seg.index);
-    }
-
-    let last = segments.len() - 1;
-    for seg in segments.iter() {
-        if running <= target {
-            break;
-        }
-        if seg.index == last
-            || matches!(seg.kind, SegmentKind::System | SegmentKind::Tools)
-            || plan.dropped.contains(&seg.index)
-        {
-            continue;
-        }
-        running = running.saturating_sub(u64::from(seg.token_estimate.get()));
-        plan.dropped.push(seg.index);
-    }
-
-    plan
-}
-
-fn total_tokens(segments: &[Segment]) -> u64 {
-    segments
-        .iter()
-        .map(|s| u64::from(s.token_estimate.get()))
-        .sum()
-}
-
 fn is_reasoning_block(block: &ContentBlock) -> bool {
     matches!(
         block,
@@ -151,7 +74,10 @@ fn segment_has_reasoning(body: &WireBody, seg: &Segment) -> bool {
         .any(is_reasoning_block)
 }
 
-fn shed_tokens(body: &WireBody, seg: &Segment) -> u32 {
+/// The tokens a strip-reasoning rung sheds from `seg`: its estimate minus the
+/// non-reasoning blocks that survive. Used by the strip rung to track the running
+/// total against the hard target.
+pub fn shed_tokens(body: &WireBody, seg: &Segment) -> u32 {
     let kept: String = seg
         .source_uuids
         .iter()

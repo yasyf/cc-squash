@@ -82,9 +82,10 @@ pub enum SquashDecision {
 /// The continuous squash controller: the economics view, the live cache state, the
 /// EWMA estimate of remaining turns, and the NPV bar a flush must clear.
 ///
-/// `npv_floor` is `EconomicsConfig.npv_floor` (the per-egress economics seam);
-/// `select_strategy` reads the SAME floor so both gate sites compare against one
-/// value. The default `0.0` keeps the original strict-positive behavior.
+/// `npv_floor` is `EconomicsConfig.npv_floor` (the per-egress economics seam); the
+/// [`EconomicsGatePass`](crate::pipeline::passes::EconomicsGatePass) reads the SAME
+/// floor so both gate sites compare against one value. The default `0.0` keeps the
+/// original strict-positive behavior.
 ///
 /// `token_scale` calibrates the char-proxy against observed usage; it scales only
 /// the *estimated* prefix the min-floor guard sums (the batch's already-scaled

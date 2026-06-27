@@ -223,6 +223,7 @@ fn staged_plan(ref_id: ccs_core::RefId, rec: RefRecord, summary: &str) -> Staged
                 ranges_to_keep: Vec::new(),
                 summary_content: Some(summary.to_owned()),
             },
+            recode: None,
         },
     );
     StagedPlan { by_content }

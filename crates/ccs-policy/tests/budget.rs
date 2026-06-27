@@ -1,16 +1,19 @@
 //! The two-layer budget: the soft-pressure boundary, the hard target with its floor,
-//! and the `default_compact` fallback ladder (strip → drop tool pairs → drop oldest,
-//! re-checking the budget after each rung, always keeping the last segment).
+//! and the fallback ladder (strip → drop tool pairs → drop oldest, re-checking the
+//! budget after each rung, always keeping the last segment) — exercised through the
+//! [`default_compact_oracle`](common) reference copy of the pre-Phase-5 ladder.
 
 mod common;
 
 use ccs_core::TokenCount;
-use ccs_policy::budget::{default_compact, CompactionPlan};
 use ccs_policy::segment::segment_prompt;
 use ccs_policy::wire::parse_body;
 use ccs_policy::{hard_target, soft_pressure, Pressure};
 
-use common::{assistant_text, client_tool_pair, prompt, thinking_turn, typed_human};
+use common::{
+    assistant_text, client_tool_pair, default_compact_oracle, prompt, thinking_turn, typed_human,
+    CompactionPlanOracle,
+};
 use serde_json::json;
 
 #[test]
@@ -52,8 +55,8 @@ fn default_compact_is_a_noop_below_target() {
     let parsed = parse_body(&body).unwrap();
     let segs = segment_prompt(&parsed);
     assert_eq!(
-        default_compact(&parsed, &segs, TokenCount(1_000_000)),
-        CompactionPlan::default(),
+        default_compact_oracle(&parsed, &segs, TokenCount(1_000_000)),
+        CompactionPlanOracle::default(),
     );
 }
 
@@ -72,7 +75,7 @@ fn default_compact_runs_the_full_ladder_in_order() {
     let segs = segment_prompt(&parsed);
 
     // target 1 forces every rung to completion.
-    let plan = default_compact(&parsed, &segs, TokenCount(1));
+    let plan = default_compact_oracle(&parsed, &segs, TokenCount(1));
 
     // Rung 1: only the historical thinking turn is stripped (latest assistant exempt).
     assert_eq!(plan.strip, vec![2]);
@@ -104,7 +107,7 @@ fn default_compact_stops_after_strip_when_it_suffices() {
     let segs = segment_prompt(&parsed);
 
     // total ≈ 2356 tokens, post-strip ≈ 56; target 1000 sits comfortably between.
-    let plan = default_compact(&parsed, &segs, TokenCount(1_000));
+    let plan = default_compact_oracle(&parsed, &segs, TokenCount(1_000));
     assert_eq!(
         plan.strip,
         vec![2],

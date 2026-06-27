@@ -1,14 +1,14 @@
 //! Squash candidates and batches. [`SquashBatch`] implements
 //! [`ccs_economics::BatchView`] so the cost model can price it without depending on
-//! `ccs-policy`. [`select_strategy`] folds the NPV gate, the pin, and the pre-gate
-//! into the final ladder choice; a huge human paste takes the verbatim exception.
+//! `ccs-policy`. The ladder choice itself lives in
+//! [`LadderSelectPass`](crate::pipeline::passes::LadderSelectPass) +
+//! [`EconomicsGatePass`](crate::pipeline::passes::EconomicsGatePass).
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use ccs_core::{ByteOffset, ChoiceTag, RefId, SegmentKind, TokenCount};
-use ccs_economics::{npv, BatchView, CacheState, ModelEconomics};
+use ccs_core::{ByteOffset, RefId, SegmentKind, TokenCount};
+use ccs_economics::BatchView;
 
 use crate::config::PolicyConfig;
-use crate::decision::ContentDecision;
 use crate::salience::{is_pinned, WorkingState};
 use crate::segment::Segment;
 use crate::strategy::Strategy;
@@ -78,83 +78,10 @@ impl BatchView for SquashBatch {
     }
 }
 
-/// Choose the final ladder [`Strategy`] for a segment.
-///
-/// The size gates work in token space: the wire [`Segment`] carries
-/// `token_estimate` (a `chars / 3.5` proxy), so a char-length is recovered as
-/// `token_estimate · 3.5`. The calibrated tokenizer is Layer 4; the proxy
-/// round-trips for the threshold comparisons here.
-///
-/// Order (the huge-paste exception precedes every other rule):
-/// 1. A true-human `UserTurn` above [`PolicyConfig::human_verbatim_max`] is exempt
-///    from the verbatim pin but lossless-only: `compress` lowers to a reversible
-///    reference, anything else stays `Keep`.
-/// 2. The pre-gate refuses tiny or net-lengthening rewrites (`Keep`).
-/// 3. The cache-cost fold keeps a segment that is pinned, whose single-candidate
-///    NPV does not clear `npv_floor`, or that is under the pre-gate floor.
-/// 4. Otherwise dispatch on the LLM's `choice`; `compress` lowers to a reversible
-///    reference.
-///
-/// `npv_floor` is `EconomicsConfig.npv_floor` — the SAME bar the [`Controller`]'s
-/// warm-flush gate uses, so a segment and its batch agree on the threshold. The
-/// default `0.0` keeps the original "strictly positive NPV" behavior.
-///
-/// [`Controller`]: crate::controller::Controller
-///
-/// Never returns `Drop` — `Drop` is the HARD-ladder fallback tier only.
-#[allow(clippy::too_many_arguments)] // the NPV gate's inputs are irreducible: segment, decision, candidate, economics, cache, turns, now, floor, policy.
-pub fn select_strategy(
-    seg: &Segment,
-    decision: &ContentDecision,
-    cand: &SquashCandidate,
-    econ: &ModelEconomics,
-    cache: &CacheState,
-    remaining_turns: f64,
-    now: f64,
-    npv_floor: f64,
-    cfg: &PolicyConfig,
-) -> Strategy {
-    let chars = approx_chars(seg);
-
-    if seg.is_true_human && seg.kind == SegmentKind::UserTurn && chars > cfg.human_verbatim_max {
-        return match decision.choice {
-            ChoiceTag::Compress => Strategy::ReversibleRef {
-                ref_id: cand.ref_id.clone(),
-                summary: decision.summary_content.clone().unwrap_or_default(),
-            },
-            _ => Strategy::Keep,
-        };
-    }
-
-    if let Some(gated) = decision.pre_gate(chars, cfg) {
-        return gated;
-    }
-
-    let batch = SquashBatch::of_single(cand);
-    if seg.pinned
-        || npv(&batch, cache, econ, remaining_turns, now) <= npv_floor
-        || chars < cfg.pre_gate_min_chars
-    {
-        return Strategy::Keep;
-    }
-
-    match decision.choice {
-        ChoiceTag::Truncate => Strategy::Truncate(decision.ranges_to_keep.clone()),
-        ChoiceTag::Summarize => {
-            Strategy::Summarize(decision.summary_content.clone().unwrap_or_default())
-        }
-        ChoiceTag::Compress => Strategy::ReversibleRef {
-            ref_id: cand.ref_id.clone(),
-            summary: decision.summary_content.clone().unwrap_or_default(),
-        },
-        ChoiceTag::Keep => Strategy::Keep,
-    }
-}
-
 /// Whether `seg` may be offered to the squash loop at all. A segment is eligible
 /// unless [`salience::is_pinned`](crate::salience::is_pinned) holds — except a huge
 /// human paste, which stays eligible despite the default verbatim pin so the
-/// controller can offload it losslessly via [`select_strategy`]'s step 1.
+/// controller can offload it losslessly via the ladder's huge-paste exception.
 pub fn is_squash_candidate(seg: &Segment, working: &WorkingState, cfg: &PolicyConfig) -> bool {
     !is_pinned(seg, working) || is_huge_human_paste(seg, cfg)
 }

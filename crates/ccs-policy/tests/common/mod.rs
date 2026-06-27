@@ -110,3 +110,147 @@ pub fn thinking_turn(signed: bool, redacted: bool) -> Value {
     content.push(json!({"type": "text", "text": "Here is the answer."}));
     json!({"role": "assistant", "content": content})
 }
+
+// ---- Reference oracles (production fns deleted in Phase 5) -------------------
+//
+// `select_strategy_oracle` / `default_compact_oracle` are verbatim copies of the
+// pre-Phase-5 `ccs_policy::candidate::select_strategy` and
+// `ccs_policy::budget::default_compact` bodies. The equivalence proptests pin the
+// LadderSelect>>EconomicsGate split (and the budget-fallback passes) to these oracles,
+// so the "passes == original logic" guarantee survives the production fns' deletion.
+
+use ccs_core::{ChoiceTag, SegmentKind, TokenCount};
+use ccs_economics::{npv, CacheState, ModelEconomics};
+use ccs_policy::budget::{shed_tokens, strip_reasoning};
+use ccs_policy::candidate::SquashBatch;
+use ccs_policy::config::PolicyConfig;
+use ccs_policy::decision::ContentDecision;
+use ccs_policy::segment::Segment;
+use ccs_policy::strategy::Strategy;
+use ccs_policy::wire::WireBody;
+use ccs_policy::SquashCandidate;
+
+fn oracle_approx_chars(seg: &Segment) -> usize {
+    (f64::from(seg.token_estimate.get()) * 3.5).round() as usize
+}
+
+/// Verbatim copy of the pre-Phase-5 `select_strategy`. The composed
+/// `LadderSelectPass >> EconomicsGatePass` must equal this across all inputs.
+#[allow(clippy::too_many_arguments)]
+pub fn select_strategy_oracle(
+    seg: &Segment,
+    decision: &ContentDecision,
+    cand: &SquashCandidate,
+    econ: &ModelEconomics,
+    cache: &CacheState,
+    remaining_turns: f64,
+    now: f64,
+    npv_floor: f64,
+    cfg: &PolicyConfig,
+) -> Strategy {
+    let chars = oracle_approx_chars(seg);
+
+    if seg.is_true_human && seg.kind == SegmentKind::UserTurn && chars > cfg.human_verbatim_max {
+        return match decision.choice {
+            ChoiceTag::Compress => Strategy::ReversibleRef {
+                ref_id: cand.ref_id.clone(),
+                summary: decision.summary_content.clone().unwrap_or_default(),
+            },
+            _ => Strategy::Keep,
+        };
+    }
+
+    if let Some(gated) = decision.pre_gate(chars, cfg) {
+        return gated;
+    }
+
+    let batch = SquashBatch::of_single(cand);
+    if seg.pinned
+        || npv(&batch, cache, econ, remaining_turns, now) <= npv_floor
+        || chars < cfg.pre_gate_min_chars
+    {
+        return Strategy::Keep;
+    }
+
+    match decision.choice {
+        ChoiceTag::Truncate => Strategy::Truncate(decision.ranges_to_keep.clone()),
+        ChoiceTag::Summarize => {
+            Strategy::Summarize(decision.summary_content.clone().unwrap_or_default())
+        }
+        ChoiceTag::Compress => Strategy::ReversibleRef {
+            ref_id: cand.ref_id.clone(),
+            summary: decision.summary_content.clone().unwrap_or_default(),
+        },
+        ChoiceTag::Keep => Strategy::Keep,
+    }
+}
+
+/// The HARD-ladder plan oracle mirror of the deleted `CompactionPlan`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactionPlanOracle {
+    pub strip: Vec<usize>,
+    pub dropped: Vec<usize>,
+}
+
+fn oracle_total_tokens(segments: &[Segment]) -> u64 {
+    segments
+        .iter()
+        .map(|s| u64::from(s.token_estimate.get()))
+        .sum()
+}
+
+/// Verbatim copy of the pre-Phase-5 `default_compact`. The composed
+/// `StripReasoning >> DropToolPairs >> DropOldest` passes must drop exactly the union of
+/// this plan's `strip` and `dropped` indices.
+pub fn default_compact_oracle(
+    body: &WireBody,
+    segments: &[Segment],
+    target: TokenCount,
+) -> CompactionPlanOracle {
+    let target = u64::from(target.get());
+    let mut running = oracle_total_tokens(segments);
+    let mut plan = CompactionPlanOracle::default();
+
+    if running <= target {
+        return plan;
+    }
+
+    plan.strip = strip_reasoning(body, segments);
+    running = running.saturating_sub(
+        plan.strip
+            .iter()
+            .map(|&i| u64::from(shed_tokens(body, &segments[i])))
+            .sum(),
+    );
+    if running <= target {
+        return plan;
+    }
+
+    for seg in segments
+        .iter()
+        .filter(|s| s.kind == SegmentKind::ToolPair && !s.pinned)
+    {
+        if running <= target {
+            return plan;
+        }
+        running = running.saturating_sub(u64::from(seg.token_estimate.get()));
+        plan.dropped.push(seg.index);
+    }
+
+    let last = segments.len() - 1;
+    for seg in segments.iter() {
+        if running <= target {
+            break;
+        }
+        if seg.index == last
+            || matches!(seg.kind, SegmentKind::System | SegmentKind::Tools)
+            || plan.dropped.contains(&seg.index)
+        {
+            continue;
+        }
+        running = running.saturating_sub(u64::from(seg.token_estimate.get()));
+        plan.dropped.push(seg.index);
+    }
+
+    plan
+}
