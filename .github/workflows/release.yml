@@ -8,32 +8,17 @@ permissions:
   contents: write
 
 jobs:
-  verify-on-main:
-    # Only commits that live on main may be released. A vX.Y.Z tag is built and
-    # published from its own commit, so if that commit isn't reachable from main
-    # (e.g. a `git push` of main lost a race and the tag went out anyway, or the
-    # tag was cut from a side branch) the release would not reflect main's
-    # history. Fail fast — before any macOS runner spins up — and make the rest
-    # of the pipeline depend on this.
+  verify-tag-on-main:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0 # full history so merge-base can reach the common ancestor
-      - name: Require the tagged commit to be on main
-        run: |
-          git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
-            echo "::error::tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main — only commits on main can be released. Push the commit to main first, then re-tag."
-            exit 1
-          fi
-          echo "ok: ${GITHUB_SHA} is contained in main"
+          fetch-depth: 0
+      - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@v1
 
-  build:
+  release:
+    needs: verify-tag-on-main
     runs-on: macos-15
-    needs: verify-on-main
-    outputs:
-      tarball_sha256: ${{ steps.shas.outputs.tarball }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -41,7 +26,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
+          go-version-file: go/go.mod
           cache: true
           cache-dependency-path: go/go.sum
 
@@ -54,33 +39,21 @@ jobs:
           workspaces: crates
 
       - name: Import Developer ID certificate
-        env:
-          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
-          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-        run: |
-          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
-          KP="$(openssl rand -base64 24)"
-          security create-keychain -p "$KP" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KP" "$KEYCHAIN"
-          echo -n "$MACOS_SIGN_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_SIGN_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KP" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/[\" ]//g')
-          rm -f "$RUNNER_TEMP/cert.p12"
-          echo "MACOS_SIGN_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/{print $2; exit}')" >> "$GITHUB_ENV"
-          echo -n "$MACOS_NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
-          echo "MACOS_NOTARY_KEY_FILE=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
-          echo "MACOS_NOTARY_KEY_ID=$MACOS_NOTARY_KEY_ID" >> "$GITHUB_ENV"
-          echo "MACOS_NOTARY_ISSUER=$MACOS_NOTARY_ISSUER_ID" >> "$GITHUB_ENV"
+        uses: yasyf/homebrew-tap/.github/actions/import-developer-id@v1
+        with:
+          p12: ${{ secrets.MACOS_SIGN_P12 }}
+          p12-password: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          notary-key: ${{ secrets.MACOS_NOTARY_KEY }}
+          notary-key-id: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          notary-issuer-id: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
 
       - name: Build universal binaries (Go ccs + Rust ccs-proxy, arm64 + amd64 via lipo)
         run: |
           VERSION="${GITHUB_REF_NAME}"
           COMMIT="$(git rev-parse --short HEAD)"
+          # The -X targets live in the EXTERNAL github.com/yasyf/fusekit module —
+          # ccs vendors fusekit's version package; pointing them at cc-squash's own
+          # module path breaks `ccs --version`.
           LDFLAGS="-s -w -X github.com/yasyf/fusekit/version.Version=${VERSION} -X github.com/yasyf/fusekit/version.Commit=${COMMIT}"
           mkdir -p dist/bin
 
@@ -97,23 +70,19 @@ jobs:
             crates/target/aarch64-apple-darwin/release/ccs-proxy \
             crates/target/x86_64-apple-darwin/release/ccs-proxy
 
-          # Developer ID sign (hardened runtime) post-lipo, then smoke-test the
-          # native slices. macOS 15/26 SIGKILL ad-hoc/Team-less signatures, so
-          # `codesign -s -` won't do. Neither binary loads an external (other-team)
-          # dylib — ccs is pure Go, ccs-proxy statically links rustls/ring — so
-          # neither needs disable-library-validation; a plain hardened-runtime
-          # signature is enough.
-          codesign --force --options runtime --timestamp -s "$MACOS_SIGN_IDENTITY" dist/bin/ccs
-          codesign --force --options runtime --timestamp -s "$MACOS_SIGN_IDENTITY" dist/bin/ccs-proxy
-          codesign --verify --strict dist/bin/ccs dist/bin/ccs-proxy
+          # Developer ID sign + notarize post-lipo via the shared script from
+          # import-developer-id (hardened runtime, notarytool submit retried 3x,
+          # hard-fail unless Accepted). The darwin_ prefix on the target arg is
+          # load-bearing: on anything else the script silently no-ops and the
+          # release ships unsigned. Neither binary needs disable-library-validation
+          # — ccs is pure Go, ccs-proxy statically links rustls/ring.
+          bash "$MACOS_CODESIGN_SCRIPT" dist/bin/ccs darwin_universal
+          bash "$MACOS_CODESIGN_SCRIPT" dist/bin/ccs-proxy darwin_universal
+
+          # Smoke-test the native slices. No version grep for ccs-proxy: clap
+          # prints the Cargo workspace version (0.1.0), decoupled from the git tag.
           dist/bin/ccs --version | grep -q "${VERSION}"
           dist/bin/ccs-proxy --version
-          # Notarize both universal binaries (bare Mach-O — recorded against the
-          # cdhash, not stapled; a bare binary can't carry a stapled ticket).
-          for b in dist/bin/ccs dist/bin/ccs-proxy; do
-            z="$(mktemp -d)/$(basename "$b").zip"; ditto -c -k "$b" "$z"
-            xcrun notarytool submit "$z" --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" --wait --timeout 20m
-          done
 
           # One tarball, both binaries at the tar root (the formula installs both).
           tar -czf "dist/cc-squash-${VERSION}-darwin-universal.tar.gz" -C dist/bin ccs ccs-proxy
@@ -124,7 +93,7 @@ jobs:
           shasum -a 256 -- *.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Export checksum for the formula bump
+      - name: Export the tarball checksum for the formula render
         id: shas
         run: |
           cd dist
@@ -146,105 +115,24 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
 
-  bump-formula:
-    runs-on: ubuntu-latest
-    needs: build
-    # Prerelease tags (v1.2.3-rc.1) publish assets but never touch the tap.
-    if: ${{ !contains(github.ref_name, '-') }}
-    steps:
-      # The formula lives in the shared external tap yasyf/homebrew-tap, not in
-      # this repo — so `brew install yasyf/tap/cc-squash` works without a bespoke
-      # tap URL. Release assets still come from THIS repo's GitHub Releases (the
-      # url line below points at github.com/yasyf/cc-squash/...). We render the
-      # file into a local staging dir and hand it to the shared publish composite
-      # action, which checks out the tap, copies the staging contents in, and
-      # commits/pushes. HOMEBREW_TAP_TOKEN must be a PAT (or fine-grained token)
-      # with push access to yasyf/homebrew-tap; the default GITHUB_TOKEN cannot
-      # push cross-repo.
-      - name: Write the bumped Formula into the staging dir
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          TARBALL_SHA="${{ needs.build.outputs.tarball_sha256 }}"
-          test -n "$TARBALL_SHA"
+      # The formula lives in the shared external tap yasyf/homebrew-tap (it stays
+      # a Formula, not a cask, for its `service` block — see the template), so
+      # `brew install yasyf/tap/cc-squash` works without a bespoke tap URL.
+      # Prerelease tags (v1.2.3-rc.1) publish assets but never touch the tap.
+      - name: Render the formula
+        if: ${{ !contains(github.ref_name, '-') }}
+        uses: yasyf/homebrew-tap/.github/actions/render-formula@v1
+        with:
+          template: .github/formula/cc-squash.rb.tmpl
+          output: Formula/cc-squash.rb
+          substitutions: |
+            __SHA_TARBALL__=${{ steps.shas.outputs.tarball }}
 
-          mkdir -p tap-staging/Formula
-
-          # Formula: prebuilt universal tarball (both binaries) from THIS repo's
-          # GitHub Releases, with a `service` block for `brew services` (the
-          # reason cc-squash stays a formula rather than a cask). The download url
-          # carries the /vX.Y.Z/ path segment brew reads as the version; the
-          # heredoc interpolates ${VERSION} / ${TARBALL_SHA} from the release just
-          # built above.
-          cat > tap-staging/Formula/cc-squash.rb <<RUBY
-          # Homebrew formula for cc-squash. Installs the prebuilt universal binaries
-          # (ccs control plane + ccs-proxy data plane) from GitHub Releases — no Go
-          # or Rust toolchain needed.
-          #
-          #   brew install yasyf/tap/cc-squash
-          #
-          # This file is GENERATED by cc-squash's release.yml bump-formula job and
-          # pushed here on every tagged release — do not hand-edit; change the
-          # template in cc-squash's .github/workflows/release.yml instead.
-          class CcSquash < Formula
-            desc "Augmented auto-compaction for long-running Claude Code sessions"
-            homepage "https://github.com/yasyf/cc-squash"
-            url "https://github.com/yasyf/cc-squash/releases/download/v${VERSION}/cc-squash-v${VERSION}-darwin-universal.tar.gz"
-            sha256 "${TARBALL_SHA}"
-            license "PolyForm-Noncommercial-1.0.0"
-
-            livecheck do
-              url :stable
-              strategy :github_latest
-            end
-
-            depends_on :macos
-
-            def install
-              bin.install "ccs", "ccs-proxy"
-            end
-
-            # Run the daemon as a USER LaunchAgent (no sudo): it supervises the
-            # ccs-proxy data plane on a per-user localhost socket. \`brew services
-            # start cc-squash\` installs ~/Library/LaunchAgents/homebrew.mxcl.cc-squash.plist.
-            service do
-              run [opt_bin/"ccs", "daemon"]
-              keep_alive true
-              run_at_load true
-              environment_variables PATH: std_service_path_env
-              log_path "#{Dir.home}/.cc-squash/daemon.log"
-              error_log_path "#{Dir.home}/.cc-squash/daemon.log"
-            end
-
-            def caveats
-              <<~EOS
-                Start the background daemon:
-                  brew services start cc-squash
-
-                Then point Claude Code at the proxy for continuous compaction:
-                  ANTHROPIC_BASE_URL=\$(ccs url) ENABLE_TOOL_SEARCH=true claude
-
-                Bare \`claude\` keeps working untouched.
-              EOS
-            end
-
-            test do
-              assert_match version.to_s, shell_output("#{bin}/ccs --version")
-            end
-          end
-          RUBY
-
-          # Fail loud if the interpolation produced something unexpected (a literal
-          # \${...} left in the file); allow idempotent re-runs (re-tagging the
-          # same version is a no-op push).
-          grep -q "releases/download/v${VERSION}/" tap-staging/Formula/cc-squash.rb
-          grep -q "sha256 \"${TARBALL_SHA}\"" tap-staging/Formula/cc-squash.rb
-          ! grep -qE '\$\{|#\{version\}' tap-staging/Formula/cc-squash.rb || { echo "::error::unrendered placeholder left in formula"; grep -nE '\$\{' tap-staging/Formula/cc-squash.rb; exit 1; }
-
-      # The shared composite action checks out yasyf/homebrew-tap, merges the
-      # staging dir's contents into the tap root, and commits/pushes (it no-ops
-      # when nothing changed — re-tagging the same version is idempotent).
-      - name: Publish the bumped formula to the tap
-        uses: yasyf/homebrew-tap/.github/actions/publish@main
+      # HOMEBREW_TAP_TOKEN must be a PAT with push access to yasyf/homebrew-tap;
+      # the default GITHUB_TOKEN cannot push cross-repo.
+      - name: Publish the formula to the tap
+        if: ${{ !contains(github.ref_name, '-') }}
+        uses: yasyf/homebrew-tap/.github/actions/publish@v1
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: tap-staging
