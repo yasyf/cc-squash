@@ -65,22 +65,12 @@
     "captain-hook@captain-hook": true
   },
   "hooks": {
-    "UserPromptSubmit": [
+    "PermissionRequest": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "uvx capt-hook run UserPromptSubmit"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uvx capt-hook run PreToolUse"
+            "command": "uvx capt-hook run PermissionRequest"
           }
         ]
       }
@@ -105,12 +95,12 @@
         ]
       }
     ],
-    "Stop": [
+    "PreToolUse": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "uvx capt-hook run Stop"
+            "command": "uvx capt-hook run PreToolUse"
           }
         ]
       }
@@ -122,6 +112,37 @@
             "type": "command",
             "command": "uvx capt-hook review run",
             "async": true
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uvx capt-hook run SessionStart --async",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uvx capt-hook run Stop"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uvx capt-hook run UserPromptSubmit"
           }
         ]
       }
