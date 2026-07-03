@@ -85,7 +85,7 @@ Reach for **`Grep`** only for material neither tool indexes: literal *content* o
 
 Target Python 3.13+. Run `uv sync --extra dev`, `uv run pytest`, and `uv build`.
 
-**Docstrings on the public API only.** User-facing surfaces carry Google-style docstrings; they render into the docs site via Great Docs. Internal helpers get none. No comments except TODOs, non-obvious workarounds, or disabled code.
+**Comments are terse and used sparingly — the code documents itself** through names, types, and organization. The one exception is documentation-generation comments: `///` rustdoc on public items (and `//!` module docs), each a real description rather than a restatement of the signature. Beyond rustdoc, comment only for TODOs, non-obvious workarounds, or disabled code.
 
 **Async-native from day 1.** Anything that touches I/O is `async def`, backed by a library with a native async API (e.g. `aiosqlite`) rather than a blocking call wrapped in `asyncio.to_thread`. Concurrency and tests run through `anyio`. See STYLEGUIDE.md § Async.
 
