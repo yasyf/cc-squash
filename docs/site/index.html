@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cc-squash — Compact ruthlessly. Regret nothing.</title>
+<meta name="description" content="Compact ruthlessly. Regret nothing. cc-squash proxies Claude Code's Anthropic traffic, prices every segment's keep-vs-evict call, and content-addresses each squash so anything evicted comes back.">
+<link rel="icon" type="image/png" href="assets/logo.png">
+<style>
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --border: #30363d;
+    --card: #161b22;
+    --accent: #d4a72c;
+    --code-bg: #161b22;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #ffffff;
+      --fg: #1f2328;
+      --muted: #59636e;
+      --border: #d1d9e0;
+      --card: #f6f8fa;
+      --accent: #9a6700;
+      --code-bg: #f6f8fa;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px 64px; }
+  header.site {
+    display: flex; align-items: center; justify-content: space-between;
+    max-width: 880px; margin: 0 auto; padding: 20px 24px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+  .brand img { width: 28px; height: 28px; border-radius: 6px; }
+  header.site a { color: var(--muted); text-decoration: none; font-size: 14px; }
+  header.site a:hover { color: var(--fg); }
+  .hero { padding: 48px 0 8px; }
+  .hero h1 {
+    font-size: clamp(32px, 6vw, 52px);
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    margin-bottom: 16px;
+  }
+  .hero p.sub { color: var(--muted); font-size: 18px; max-width: 640px; }
+  pre.install {
+    margin: 32px 0 20px;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 22px;
+    overflow-x: auto;
+    font: 15px/1.7 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  .demo img {
+    display: block;
+    width: 100%;
+    max-width: 760px;
+    height: auto;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+  }
+  h2 { font-size: 22px; margin: 56px 0 20px; letter-spacing: -0.01em; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+  .card {
+    display: block;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    text-decoration: none;
+    color: var(--fg);
+  }
+  .card:hover { border-color: var(--accent); }
+  .card h3 { font-size: 16px; line-height: 1.4; margin-bottom: 10px; }
+  .card p { color: var(--muted); font-size: 14px; }
+  .card span.more { display: inline-block; margin-top: 12px; color: var(--accent); font-size: 14px; }
+  footer {
+    max-width: 880px; margin: 0 auto; padding: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 14px;
+  }
+  footer a { color: var(--muted); }
+  code { font: 0.9em ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+</style>
+</head>
+<body>
+<header class="site">
+  <div class="brand"><img src="assets/logo.png" alt=""> cc-squash</div>
+  <a href="https://github.com/yasyf/cc-squash">GitHub →</a>
+</header>
+<main>
+  <section class="hero">
+    <h1>Compact ruthlessly. Regret&nbsp;nothing.</h1>
+    <p class="sub">cc-squash proxies Claude Code's Anthropic traffic, prices every segment's keep-vs-evict call, and content-addresses each squash so anything evicted comes back.</p>
+    <pre class="install"><code>brew install yasyf/tap/cc-squash
+ccs run</code></pre>
+    <div class="demo">
+      <img src="assets/demo.png" alt="Terminal running 'ccs --help' — the ccs command surface: run, env, url, status, shadow, kill, doctor">
+    </div>
+  </section>
+
+  <h2>Use cases</h2>
+  <div class="cards">
+    <a class="card" href="https://github.com/yasyf/cc-squash#keep-a-day-long-session-on-thread-past-the-auto-compact-cliff">
+      <h3>Keep a day-long session on thread past the auto-compact cliff</h3>
+      <p>Continuous, segment-priced compaction instead of one lossy summary at the threshold.</p>
+      <span class="more">How it plays out →</span>
+    </a>
+    <a class="card" href="https://github.com/yasyf/cc-squash#pull-any-squashed-file-or-tool-result-back-mid-session">
+      <h3>Pull any squashed file or tool result back mid-session</h3>
+      <p>Every squash lands content-addressed; the model retrieves the original bytes itself.</p>
+      <span class="more">How it plays out →</span>
+    </a>
+    <a class="card" href="https://github.com/yasyf/cc-squash#audit-what-compaction-would-drop-before-trusting-it-live">
+      <h3>Audit what compaction would drop before trusting it live</h3>
+      <p>Shadow mode logs the full squash plan while your traffic passes through untouched.</p>
+      <span class="more">How it plays out →</span>
+    </a>
+  </div>
+</main>
+<footer>
+  The <a href="https://github.com/yasyf/cc-squash#commands">README</a> carries the command reference and internals.
+  Status: early — v0.1.x, macOS via Homebrew.
+  Licensed under <a href="https://github.com/yasyf/cc-squash/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>.
+</footer>
+</body>
+</html>

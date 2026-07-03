@@ -13,9 +13,9 @@ brew install yasyf/tap/cc-squash
 ccs run
 ```
 
-`ccs run` starts the daemon on demand, mints a proxied session, and execs `claude` through it. cc-squash drops out of the process tree, and Claude runs exactly as before, minus the compaction cliff.
-
 <img src="docs/assets/demo.png" alt="Terminal running 'ccs --help' — the ccs command surface: run, env, url, status, shadow, kill, doctor" width="700">
+
+`ccs run` starts the daemon on demand, mints a proxied session, and execs `claude` through it. cc-squash drops out of the process tree, and Claude runs exactly as before, minus the compaction cliff.
 
 Driving with an agent? Paste this:
 
