@@ -1,29 +1,89 @@
-# cc-squash
+# ![cc-squash](docs/assets/readme-banner.webp)
 
-![cc-squash banner](https://github.com/yasyf/cc-squash/raw/main/docs/assets/readme-banner.webp)
+**Compact ruthlessly. Regret nothing.** cc-squash proxies Claude Code's Anthropic traffic, prices every segment's keep-vs-evict call, and content-addresses each squash so anything evicted comes back.
 
-[![PyPI](https://img.shields.io/pypi/v/cc-squash.svg)](https://pypi.org/project/cc-squash/)
-[![Python](https://img.shields.io/pypi/pyversions/cc-squash.svg)](https://pypi.org/project/cc-squash/)
-[![Docs](https://img.shields.io/github/actions/workflow/status/yasyf/cc-squash/docs.yml?branch=main&label=docs)](https://yasyf.github.io/cc-squash/)
-[![License: PolyForm-Noncommercial-1.0.0](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://github.com/yasyf/cc-squash/blob/main/LICENSE)
+[![CI](https://github.com/yasyf/cc-squash/actions/workflows/ci.yml/badge.svg)](https://github.com/yasyf/cc-squash/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/yasyf/cc-squash)](https://github.com/yasyf/cc-squash/releases)
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm--Noncommercial--1.0.0-blue)](LICENSE)
 
-Augmented auto-compaction for long-running Claude Code sessions.
-
-cc-squash steps into the moment Claude Code compacts its context and decides what survives the cut. It ranks the constraints you set, the decisions you made, and the files still in flight ahead of stale directory listings, so a long session keeps its thread instead of restarting from a lossy summary that forgot why. The kept, summarized, and dropped split stays inspectable, so you can tune what each session holds onto.
-
-## Install
-
-Run it with [uvx](https://docs.astral.sh/uv/): `uvx cc-squash --help`.
-
-## Quickstart
+## Get started
 
 ```bash
-$ uvx cc-squash hello
-Hello from cc-squash!
+brew install yasyf/tap/cc-squash
+ccs run
 ```
 
-`hello` is the starter command; run `uvx cc-squash --help` for the current surface.
+`ccs run` starts the daemon on demand, mints a proxied session, and execs `claude` through it. cc-squash drops out of the process tree, and Claude runs exactly as before, minus the compaction cliff.
 
-## Docs
+<img src="docs/assets/demo.png" alt="Terminal running 'ccs --help' — the ccs command surface: run, env, url, status, shadow, kill, doctor" width="700">
 
-[Read the docs](https://yasyf.github.io/cc-squash/) for the full guide and API reference.
+Driving with an agent? Paste this:
+
+```text
+Install cc-squash: `brew install yasyf/tap/cc-squash`, then `brew services start cc-squash`.
+Run `ccs doctor` to verify the daemon, then `ccs shadow on` so the proxy logs what compaction would keep, summarize, and drop without touching live traffic.
+Tell me to relaunch Claude Code as `ccs run` once the shadow ledger looks right. Docs: https://yasyf.github.io/cc-squash/
+```
+
+---
+
+## Use cases
+
+### Keep a day-long session on thread past the auto-compact cliff
+
+Claude Code compacts in one shot: the session hits a threshold and everything — the constraints you set, the decisions you argued out, the files in flight — flattens into a single lossy summary. cc-squash compacts continuously instead:
+
+```bash
+ccs run
+```
+
+Every request gets repriced segment by segment on its way to Anthropic. Stale tool output squashes down to a placeholder; your constraints and decisions ride along verbatim, hours in.
+
+### Pull any squashed file or tool result back mid-session
+
+Compaction is normally a one-way door — whatever the summary dropped is gone. cc-squash content-addresses every squash into a local store first, and the placeholder it leaves behind tells the model how to reverse it:
+
+```text
+[cc-squash: squashed segment · ref=sha256:9f2b… · ~2050 tokens · 8210 bytes]
+<one-line summary of the original>
+Pull the full original if you need it:
+  • retrieve("sha256:9f2b…")
+```
+
+`ccs run` registers the `cc_squash_retrieve` MCP tool automatically, so when the model needs the original bytes, it pulls them back itself, byte-for-byte, mid-session.
+
+### Audit what compaction would drop before trusting it live
+
+Handing your context window to a proxy on faith is a bad trade. Shadow mode computes the full squash plan for every live request and only logs it:
+
+```bash
+ccs shadow on
+ccs logs
+```
+
+The daemon log shows what each request would have kept, summarized, and dropped, while the traffic itself passes through untouched. `ccs shadow off` goes live, and `ccs kill on` is the hard passthrough switch when you want cc-squash out of the loop entirely.
+
+## Commands
+
+Per-command flags live in `ccs <command> --help`.
+
+| Command | What it does |
+|---|---|
+| `ccs run [claude args…]` | Mint a session and exec `claude` through the proxy; args pass through verbatim |
+| `ccs env` | Print eval-able exports for shells that launch `claude` themselves |
+| `ccs url` | Mint a session URL and print it (`ANTHROPIC_BASE_URL=$(ccs url)`) |
+| `ccs status` | Daemon and proxy status; bare `ccs` prints the same table, `--json` the raw snapshot |
+| `ccs shadow on\|off` | Log-only mode: compute squash decisions without altering traffic |
+| `ccs kill on\|off\|status` | Kill switch: raw passthrough, compaction off |
+| `ccs doctor` | Daemon-health self-test |
+| `ccs logs` | Print the daemon log, or its path with `--path` |
+| `ccs stop` | Stop the daemon and release its socket |
+| `ccs service install\|uninstall` | Manage the launchd agent; `brew services start cc-squash` works too |
+
+## How it works
+
+A Go control plane (`ccs`) supervises a Rust data plane (`ccs-proxy`) that sits at `ANTHROPIC_BASE_URL` and owns every `/v1/messages` body. Deterministic passes compress what survives losslessly; an economics model prices each remaining segment — what it costs to keep carrying versus what it costs to re-fetch — and evicted segments land content-addressed in a local SQLite ref store, replaced on the wire by the placeholder above. Squashes land at prompt-cache breakpoints, so compaction doesn't torch your cache hits.
+
+Status: early — v0.1.x, macOS via Homebrew. The engine runs live; shadow mode exists so you don't have to take that claim on faith.
+
+Licensed under [PolyForm Noncommercial 1.0.0](LICENSE).
