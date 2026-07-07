@@ -15,10 +15,10 @@ go -C "$repo/go" build -o "$tmp/ccs" ./cmd/ccs
 {
   printf '$ ccs --help\n'
   "$tmp/ccs" --help
-} > "$tmp/demo.txt"
+} | bat --plain --color=always --language help > "$tmp/demo.ansi"
 
-freeze "$tmp/demo.txt" \
-  --language text \
+freeze "$tmp/demo.ansi" \
+  --language ansi \
   --theme github-dark \
   --background "#0d1117" \
   --window \

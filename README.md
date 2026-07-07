@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/yasyf/cc-squash/actions/workflows/ci.yml/badge.svg)](https://github.com/yasyf/cc-squash/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/yasyf/cc-squash)](https://github.com/yasyf/cc-squash/releases)
-[![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm--Noncommercial--1.0.0-blue)](LICENSE)
+[![PolyForm Noncommercial license](https://img.shields.io/badge/license-PolyForm--Noncommercial--1.0.0-blue)](LICENSE)
 
 ## Get started
 
@@ -22,7 +22,8 @@ Driving with an agent? Paste this:
 ```text
 Install cc-squash: `brew install yasyf/tap/cc-squash`, then `brew services start cc-squash`.
 Run `ccs doctor` to verify the daemon, then `ccs shadow on` so the proxy logs what compaction would keep, summarize, and drop without touching live traffic.
-Tell me to relaunch Claude Code as `ccs run` once the shadow ledger looks right. Docs: https://yasyf.github.io/cc-squash/
+Tell me to relaunch Claude Code as `ccs run` once the shadow ledger looks right.
+Docs: https://github.com/yasyf/cc-squash#readme, plus `ccs <command> --help`.
 ```
 
 ---
@@ -31,7 +32,7 @@ Tell me to relaunch Claude Code as `ccs run` once the shadow ledger looks right.
 
 ### Keep a day-long session on thread past the auto-compact cliff
 
-Claude Code compacts in one shot: the session hits a threshold and everything — the constraints you set, the decisions you argued out, the files in flight — flattens into a single lossy summary. cc-squash compacts continuously instead:
+Claude Code compacts in one shot. The session hits a threshold, and the constraints you set, the decisions you argued out, and the files in flight all flatten into a single lossy summary. cc-squash compacts continuously instead:
 
 ```bash
 ccs run
@@ -41,7 +42,7 @@ Every request gets repriced segment by segment on its way to Anthropic. Stale to
 
 ### Pull any squashed file or tool result back mid-session
 
-Compaction is normally a one-way door — whatever the summary dropped is gone. cc-squash content-addresses every squash into a local store first, and the placeholder it leaves behind tells the model how to reverse it:
+Compaction is normally a one-way door; whatever the summary dropped is gone. cc-squash content-addresses every squash into a local store first, and the placeholder it leaves behind tells the model how to reverse it:
 
 ```text
 [cc-squash: squashed segment · ref=sha256:9f2b… · ~2050 tokens · 8210 bytes]
@@ -71,10 +72,10 @@ Per-command flags live in `ccs <command> --help`.
 |---|---|
 | `ccs run [claude args…]` | Mint a session and exec `claude` through the proxy; args pass through verbatim |
 | `ccs env` | Print eval-able exports for shells that launch `claude` themselves |
-| `ccs url` | Mint a session URL and print it (`ANTHROPIC_BASE_URL=$(ccs url)`) |
+| `ccs url` | Mint a session URL for `ANTHROPIC_BASE_URL=$(ccs url)` and print it |
 | `ccs status` | Daemon and proxy status; bare `ccs` prints the same table, `--json` the raw snapshot |
-| `ccs shadow on\|off` | Log-only mode: compute squash decisions without altering traffic |
-| `ccs kill on\|off\|status` | Kill switch: raw passthrough, compaction off |
+| `ccs shadow on\|off` | Log-only mode that computes squash decisions without altering traffic |
+| `ccs kill on\|off\|status` | Kill switch, raw passthrough with compaction off |
 | `ccs doctor` | Daemon-health self-test |
 | `ccs logs` | Print the daemon log, or its path with `--path` |
 | `ccs stop` | Stop the daemon and release its socket |
@@ -82,8 +83,8 @@ Per-command flags live in `ccs <command> --help`.
 
 ## How it works
 
-A Go control plane (`ccs`) supervises a Rust data plane (`ccs-proxy`) that sits at `ANTHROPIC_BASE_URL` and owns every `/v1/messages` body. Deterministic passes compress what survives losslessly; an economics model prices each remaining segment — what it costs to keep carrying versus what it costs to re-fetch — and evicted segments land content-addressed in a local SQLite ref store, replaced on the wire by the placeholder above. Squashes land at prompt-cache breakpoints, so compaction doesn't torch your cache hits.
+A Go control plane (`ccs`) supervises a Rust data plane (`ccs-proxy`) that sits at `ANTHROPIC_BASE_URL` and owns every `/v1/messages` body. Deterministic passes compress what survives losslessly; an economics model prices each remaining segment on what it costs to keep carrying versus what it costs to re-fetch, and evicted segments land content-addressed in a local SQLite ref store, replaced on the wire by the placeholder above. Squashes land at prompt-cache breakpoints, so compaction doesn't torch your cache hits.
 
-Status: early — v0.1.x, macOS via Homebrew. The engine runs live; shadow mode exists so you don't have to take that claim on faith.
+cc-squash is early, at v0.1.x on macOS via Homebrew. The engine runs live; shadow mode exists so you don't have to take that claim on faith.
 
 Licensed under [PolyForm Noncommercial 1.0.0](LICENSE).
