@@ -27,6 +27,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go/go.mod
+          check-latest: true
           cache: true
           cache-dependency-path: go/go.sum
 

@@ -20,7 +20,8 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.26.x"
+          go-version-file: go/go.mod
+          check-latest: true
           cache-dependency-path: go/go.sum
 
       - name: Format check (gofmt)
@@ -83,7 +84,8 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.26.x"
+          go-version-file: go/go.mod
+          check-latest: true
           cache-dependency-path: go/go.sum
 
       - uses: dtolnay/rust-toolchain@stable
