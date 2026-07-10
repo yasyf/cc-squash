@@ -1,0 +1,7 @@
+fragments = [
+  "cc-squash-development-guide",
+  "cc-skills:ccx",
+  "python-style",
+  "cc-skills:version-control",
+  "part-1",
+]
