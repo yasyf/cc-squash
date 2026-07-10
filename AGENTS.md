@@ -1,4 +1,4 @@
-<!-- cc-guides 0.1.10 src=.claude/fragments/AGENTS.md fragments=cc-skills@a91b043bdbd2 | GENERATED — do not edit: edit .claude/fragments/AGENTS.md/ and run 'cc-guides render'. Everything below is in force. -->
+<!-- cc-guides 0.1.11 src=.claude/fragments/AGENTS.md fragments=cc-skills@250a52303493 | GENERATED — do not edit: edit .claude/fragments/AGENTS.md/ and run 'cc-guides render'. Everything below is in force. -->
 # cc-squash Development Guide
 
 Augmented auto-compaction for long-running Claude Code sessions. Published to PyPI as `cc-squash`; the CLI is `cc-squash`, run as `uvx cc-squash`.
@@ -134,7 +134,7 @@ Target Python 3.13+. Run `uv sync --extra dev`, `uv run pytest`, and `uv build`.
 
 **Docs.** Any public API change must keep `uv run great-docs build` green; run `uv sync --group docs` first.
 
-**Version control.** This repo is a colocated `jj` repo over git — prefer `jj` (`jj describe` / `jj commit`, `jj git push`) over raw `git` for day-to-day work. Commits stay atomic and scoped: one logical change each. For the routine commit, push, and watch-CI cycle, `ccx vcs ship -m "<msg>"` runs the whole dance in one call — a jj-aware commit, the push, and `gh run watch --exit-status` — instead of the three-to-six Bash calls it took by hand; drop to the manual `jj` steps when ship doesn't fit, like a multi-commit split or a partial-staging commit. A dirty tree is just the working-copy commit `@` — to land work on an updated remote, `jj git fetch` then `jj rebase` (your in-flight `@` rides along untouched); never `git stash` or a worktree + cherry-pick dance.
+**Version control.** This repo is a colocated `jj` repo over git — prefer `jj` (`jj describe` / `jj commit`, `jj git push`) over raw `git` for day-to-day work. Commits stay atomic and scoped: one logical change each. For the routine commit, push, and watch-CI cycle, `ccx vcs ship -m "<msg>"` runs the whole dance in one call — a jj-aware commit, the push, and `gh run watch --exit-status` — instead of the three-to-six Bash calls by hand; drop to the manual `jj` steps when ship doesn't fit, like a multi-commit split or a partial-staging commit. A dirty tree is just the working-copy commit `@` — to land work on an updated remote, `jj git fetch` then `jj rebase` (your in-flight `@` rides along untouched); never `git stash` or a worktree + cherry-pick dance.
 
 **Watch CI after every push.** A push that kicks off CI isn't done until the run is green. `ccx vcs ship` folds this in — it pushes, then runs `gh run watch --exit-status`, so a shipped commit is already watched to its conclusion. For a push ship didn't make, watch the run to completion yourself before you stop — `gh run watch "$(gh run list -L1 --json databaseId -q '.[0].databaseId')" --exit-status` — and never walk away from a red run: fix it or report it. (`--exit-status` exits non-zero when the run fails; give the run a moment to register before watching.)
 
