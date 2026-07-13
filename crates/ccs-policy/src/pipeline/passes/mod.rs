@@ -4,8 +4,8 @@
 //! [`Presets`](crate::pipeline::presets::Presets).
 //!
 //! DEFERRED passes (roadmap, not yet implemented): G sequential diff-encoding,
-//! I markdown/HTML strip, H tools-array TOON (free-bust-window-only), and the on-path
-//! inline-lossless fast-lane (render lossless recodes without a ref marker).
+//! I markdown/HTML strip, and the on-path inline-lossless fast-lane (render
+//! lossless recodes without a ref marker).
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod ansi_strip;
