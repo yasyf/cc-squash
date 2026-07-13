@@ -224,6 +224,60 @@ async fn rsum_fold_reconciles() {
 }
 
 #[tokio::test]
+async fn call_retries_429_then_succeeds() {
+    let upstream = MockServer::start().await;
+    // First response 429 (retry-after: 0 keeps the test instant), then 200.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_text("recovered")))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let client = SummarizerClient::new(auth_context(&upstream.uri()));
+
+    let text = client
+        .call("system", "user", 16)
+        .await
+        .expect("retry recovers to success");
+
+    assert_eq!(text, "recovered");
+    let received = upstream
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(received.len(), 2, "the 429 must be retried exactly once");
+}
+
+#[tokio::test]
+async fn call_does_not_retry_400() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&upstream)
+        .await;
+    let client = SummarizerClient::new(auth_context(&upstream.uri()));
+
+    assert!(
+        client.call("system", "user", 16).await.is_err(),
+        "a 400 surfaces as an error",
+    );
+    let received = upstream
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(received.len(), 1, "a non-retryable status must not retry");
+}
+
+#[tokio::test]
 async fn fold_fails_safe_to_prev() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))

@@ -16,6 +16,9 @@ pub const SUMMARIZER_MODEL: &str = "claude-sonnet-4-6";
 
 const MESSAGES_PATH: &str = "v1/messages";
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Rate-limit retry backoffs: two retries (three attempts total), used when the
+/// upstream omits a `retry-after` header. The whole loop stays under [`CALL_TIMEOUT`].
+const RETRY_BACKOFFS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(8)];
 
 /// An error from a [`SummarizerClient::call`].
 #[derive(Debug, thiserror::Error)]
@@ -81,7 +84,29 @@ impl SummarizerClient {
             "messages": [{"role": "user", "content": user}],
         }))?;
 
-        let request = self
+        match tokio::time::timeout(CALL_TIMEOUT, self.send_with_retries(body)).await {
+            Ok(result) => result,
+            Err(_) => Err(SummarizerError::Timeout),
+        }
+    }
+
+    /// POST `body`, retrying 429/529 responses with the `retry-after` delay when
+    /// present, else [`RETRY_BACKOFFS`]. Caller's [`CALL_TIMEOUT`] bounds the loop.
+    async fn send_with_retries(&self, body: Vec<u8>) -> Result<String, SummarizerError> {
+        let mut backoffs = RETRY_BACKOFFS.into_iter();
+        loop {
+            let response = self.post_once(body.clone()).await?;
+            match backoffs.next() {
+                Some(backoff) if is_rate_limited(response.status()) => {
+                    tokio::time::sleep(retry_after(&response).unwrap_or(backoff)).await;
+                }
+                _ => return finish(response).await,
+            }
+        }
+    }
+
+    async fn post_once(&self, body: Vec<u8>) -> Result<reqwest::Response, SummarizerError> {
+        Ok(self
             .ctx
             .headers
             .iter()
@@ -91,23 +116,37 @@ impl SummarizerClient {
             )
             .header(CONTENT_TYPE, "application/json")
             .body(body)
-            .send();
-
-        let response = match tokio::time::timeout(CALL_TIMEOUT, request).await {
-            Ok(result) => result?,
-            Err(_) => return Err(SummarizerError::Timeout),
-        };
-
-        match response.error_for_status_ref() {
-            Ok(_) => extract_text(&response.bytes().await?),
-            Err(_) => Err(SummarizerError::Status(response.status())),
-        }
+            .send()
+            .await?)
     }
 
     fn messages_url(&self) -> Url {
         let mut url = self.ctx.upstream.clone();
         url.set_path(MESSAGES_PATH);
         url
+    }
+}
+
+fn is_rate_limited(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 529)
+}
+
+/// The upstream's `retry-after` delay in whole seconds, when present and numeric.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let secs: u64 = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(secs))
+}
+
+async fn finish(response: reqwest::Response) -> Result<String, SummarizerError> {
+    match response.error_for_status_ref() {
+        Ok(_) => extract_text(&response.bytes().await?),
+        Err(_) => Err(SummarizerError::Status(response.status())),
     }
 }
 
