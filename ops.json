@@ -1,1 +1,1 @@
-{"v":1,"lamport":4,"ops":[{"kind":"set_criterion_status","id":"535251225ed77565ca91d958496777c2","status":"met"}]}
+{"v":1,"lamport":5,"ops":[{"kind":"add_comment","body":"Landed as f2fd108 (fix(policy): carry the earliest ref-backed original through recode chains). Includes the codex-refuter extension: ref_recode prefers carried_ref, honest doc invariant (pass.rs, staging.rs), discriminating regression chain_f_through_b_needs_ref_is_raw_original. Workspace green."}]}
