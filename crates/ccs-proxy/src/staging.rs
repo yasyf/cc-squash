@@ -34,9 +34,10 @@ pub struct StagedEntry {
 }
 
 /// A staged deterministic recode: the cleaned content the model reads on-path and whether
-/// a ref backs it. `marker` is the resolved `ref=…` placeholder/backref for the ref-backed
-/// passes (B/C/F/J) — `None` for the inline-lossless passes (A/D/E), which carry no ref and
-/// need no retrieve. The on-path render reconstructs the `Strategy::Recode` arm from these.
+/// a ref backs it. `marker` is the resolved `ref=…` placeholder/backref when the proposal's
+/// `needs_ref` is set (any ref-backed pass, or an inline pass that inherited an earlier
+/// ref-backed original), and `None` for a pure inline chain that never touched a ref. The
+/// on-path render reconstructs the `Strategy::Recode` arm from these.
 #[derive(Debug, Clone)]
 pub struct StagedRecode {
     pub content: String,
@@ -245,12 +246,9 @@ fn prefers_recode(prop: &Proposal, payload: &[u8]) -> bool {
         && (content.len() as f64) <= (1.0 - MIN_RECODE_SHRINK_FRAC) * payload.len() as f64
 }
 
-// Store the original payload and shape the `StagedEntry` for a deterministic recode. The
-// byte-exact original is `RefStore::put` regardless of pass class (reusing the ReversibleRef
-// storage path), so the seam GC reachability contract and a later byte-exact `retrieve` both
-// hold. A ref-backed recode (B/C/F/J, `needs_ref` Some) bakes the resolved `ref=…` marker and
-// carries `ref_id = Some`; an inline-lossless recode (A/D/E) carries `ref_id = None` and no
-// marker. `None` only when the store put fails.
+// Stores the byte-exact original (always, reusing the ReversibleRef path) and shapes the
+// `StagedEntry`. `ref_id`/`marker` are set iff `prop.needs_ref.is_some()`; `None` on a
+// failed store put.
 async fn stage_recode(
     prop: &Proposal,
     payload: &[u8],

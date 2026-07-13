@@ -51,10 +51,12 @@ pub enum PassControl {
 /// will mint in Phase 2), never minted here.
 ///
 /// `needs_ref` is the deterministic-recode intention: a ref-backed pass (TOON, dedup,
-/// blob-extract, head/tail truncate) emits the original block bytes here so the
-/// off-path staging can `content_address` + `RefStore::put` them and resolve the ref;
-/// inline-lossless passes leave it `None`. Passes stay pure — they never mint the ref
-/// or write the store, they only carry the bytes to store as an intention.
+/// blob-extract, head/tail truncate) needs the original bytes stored so off-path staging can
+/// `content_address` + `RefStore::put` them and resolve the ref. It carries the earliest
+/// ref-backed pass's original when the chain has one — both inline and later ref-backed passes
+/// forward it — else the proposing pass's own input; a chain with no ref-backed pass leaves it
+/// `None`. The proxy stores bytes from the raw wire body, so these are advisory. Passes stay
+/// pure — they never mint the ref or write the store.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Proposal {
     pub seg_index: usize,

@@ -27,12 +27,15 @@ use crate::wire::{ContentBlock, MessageContent, Role, WireBody};
 /// exact strict-shrink comparison once transformed.
 pub const MIN_RECODE_SPAN: usize = 256;
 
-/// The single recodeable leaf of a segment: its current content string and the original
-/// token estimate of that leaf, so a pass can price its `net_removed`.
+/// The single recodeable leaf of a segment: its current content string, the leaf's original
+/// token estimate (to price `net_removed`), and any ref-backed original carried from an
+/// earlier pass. Both an inline and a later ref-backed refinement forward it as `needs_ref`,
+/// so the earliest ref-backed pass's original survives the chain instead of being dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecodeLeaf {
     pub content: String,
     pub original_tokens: u32,
+    pub carried_ref: Option<Vec<u8>>,
 }
 
 /// The recodeable content string for `seg`, threading any prior `Recode` proposal so the
@@ -51,19 +54,23 @@ pub fn recode_leaf(body: &WireBody, seg: &Segment, ledger: &PlanLedger) -> Optio
     match ledger.proposal_for(seg.index) {
         Some(Proposal {
             strategy: Strategy::Recode { content, .. },
+            needs_ref,
             ..
         }) => Some(RecodeLeaf {
             original_tokens: estimate_chars_proxy(content).get(),
             content: content.clone(),
+            carried_ref: needs_ref.clone(),
         }),
         Some(_) => None,
         None => raw_leaf(body, seg),
     }
 }
 
-/// Build the inline-lossless `Recode` proposal for `seg` when `transformed` strictly
-/// shrinks `leaf.content`. `ref_id` is `None` — the model reads the cleaned form, no
-/// retrieve. Returns `None` (no proposal) when the transform did not shrink the leaf.
+/// Build the inline-lossless `Recode` proposal for `seg` when `transformed` strictly shrinks
+/// `leaf.content`. `ref_id` is `None` — the model reads the cleaned form. `needs_ref` forwards
+/// `leaf.carried_ref`, keeping an earlier ref-backed pass's retrieve handle across an inline
+/// refinement; `None` when no earlier pass staged one. Returns `None` when the transform did
+/// not shrink the leaf.
 pub fn inline_recode(
     seg: &Segment,
     leaf: &RecodeLeaf,
@@ -79,18 +86,18 @@ pub fn inline_recode(
             ref_id: None,
         },
         ref_id: None,
-        needs_ref: None,
+        needs_ref: leaf.carried_ref.clone(),
         quality_gain: 0.0,
         by,
     })
 }
 
 /// Build a ref-backed `Recode` proposal for `seg` when `transformed` strictly shrinks
-/// `leaf.content`. The model reads `transformed`; `original` is the byte-exact source the
-/// Wire stage will `content_address` + `RefStore::put` (carried in `needs_ref`) so the
-/// resolved `ref=…` marker can be appended for retrieve. The pass stays pure — `ref_id`
-/// is left `None` (the intention), minted off-path. Returns `None` when the transform did
-/// not shrink the leaf.
+/// `leaf.content`. The model reads `transformed`; `needs_ref` is the byte-exact retrieve
+/// source — `leaf.carried_ref` (the earliest ref-backed pass's original, threaded through
+/// the chain) when a prior pass staged one, else the caller-passed `original` (this pass's
+/// own input). The pass stays pure — `ref_id` is left `None`, minted off-path. Returns
+/// `None` when the transform did not shrink the leaf.
 pub fn ref_recode(
     seg: &Segment,
     leaf: &RecodeLeaf,
@@ -107,7 +114,7 @@ pub fn ref_recode(
             ref_id: None,
         },
         ref_id: None,
-        needs_ref: Some(original),
+        needs_ref: Some(leaf.carried_ref.clone().unwrap_or(original)),
         quality_gain: 0.0,
         by,
     })
@@ -128,6 +135,7 @@ fn raw_leaf(body: &WireBody, seg: &Segment) -> Option<RecodeLeaf> {
         [one] if one.len() > MIN_RECODE_SPAN => Some(RecodeLeaf {
             original_tokens: estimate_chars_proxy(one).get(),
             content: one.clone(),
+            carried_ref: None,
         }),
         _ => None,
     }
@@ -309,6 +317,7 @@ mod tests {
         let leaf = RecodeLeaf {
             content: "abcdef".to_owned(),
             original_tokens: 2,
+            carried_ref: None,
         };
         let seg = Segment {
             index: 0,
@@ -336,10 +345,44 @@ mod tests {
     }
 
     #[test]
+    fn inline_recode_after_ref_backed_preserves_needs_ref() {
+        // Refining a ref-backed leaf must forward its carried original, else the retrieve
+        // handle is lost while the bytes still sit in the store.
+        let leaf = RecodeLeaf {
+            content: "cleaned but still shrinkable".to_owned(),
+            original_tokens: 8,
+            carried_ref: Some(b"pre-extract original bytes".to_vec()),
+        };
+        let seg = Segment {
+            index: 1,
+            kind: SegmentKind::ToolPair,
+            byte_offset: ccs_core::ByteOffset(0),
+            token_estimate: ccs_core::TokenCount(8),
+            generation: ccs_core::Generation(1),
+            pinned: false,
+            is_current: false,
+            is_true_human: false,
+            source_uuids: Vec::new(),
+        };
+        let p = inline_recode(&seg, &leaf, "cleaned".to_owned(), PassId("d"))
+            .expect("shrinks → proposes");
+        assert_eq!(
+            p.needs_ref.as_deref(),
+            Some(b"pre-extract original bytes".as_slice()),
+            "inline recode forwards the carried ref-backed original",
+        );
+        assert!(
+            matches!(p.strategy, Strategy::Recode { ref_id: None, .. }),
+            "still an intention — the pass never mints the ref",
+        );
+    }
+
+    #[test]
     fn ref_recode_carries_original_bytes_and_leaves_ref_id_none() {
         let leaf = RecodeLeaf {
             content: "the original long content".to_owned(),
             original_tokens: 8,
+            carried_ref: None,
         };
         let seg = Segment {
             index: 3,

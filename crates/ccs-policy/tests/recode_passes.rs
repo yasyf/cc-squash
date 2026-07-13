@@ -8,12 +8,14 @@ use std::sync::Arc;
 
 use ccs_core::{ModelId, TokenCount};
 use ccs_economics::{economics_for, CacheState};
-use ccs_policy::pipeline::pass::{PassCtx, PlanLedger, StagedDecisions};
-use ccs_policy::pipeline::passes::{AnsiStripPass, JsonMinifyPass, WhitespacePass};
+use ccs_policy::pipeline::pass::{PassCtx, PlanLedger, Proposal, StagedDecisions};
+use ccs_policy::pipeline::passes::{
+    AnsiStripPass, BlobExtractPass, JsonMinifyPass, JsonToonPass, WhitespacePass,
+};
 use ccs_policy::pipeline::{Pipeline, Runner, Stage};
 use ccs_policy::strategy::Strategy;
 use ccs_policy::wire::parse_body;
-use ccs_policy::{segment_prompt, PolicyConfig, WorkingState};
+use ccs_policy::{segment_prompt, PassId, PolicyConfig, WorkingState};
 
 fn cache() -> CacheState {
     CacheState {
@@ -49,7 +51,7 @@ fn body(dirty: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-fn run(body_bytes: &[u8], pipeline: Pipeline) -> Vec<(usize, Strategy)> {
+fn run_proposals(body_bytes: &[u8], pipeline: Pipeline) -> Vec<Proposal> {
     let parsed = parse_body(body_bytes).unwrap();
     let segments = segment_prompt(&parsed);
     let working = WorkingState::default();
@@ -70,8 +72,11 @@ fn run(body_bytes: &[u8], pipeline: Pipeline) -> Vec<(usize, Strategy)> {
     };
     let mut ledger = PlanLedger::sized(segments.len());
     Runner::default().run(&pipeline, &ctx, &mut ledger);
-    ledger
-        .proposals
+    ledger.proposals
+}
+
+fn run(body_bytes: &[u8], pipeline: Pipeline) -> Vec<(usize, Strategy)> {
+    run_proposals(body_bytes, pipeline)
         .into_iter()
         .map(|p| (p.seg_index, p.strategy))
         .collect()
@@ -159,4 +164,76 @@ fn no_op_when_only_clean_above_floor() {
         props.is_empty(),
         "clean content yields no recode: {props:?}"
     );
+}
+
+#[test]
+fn chain_f_then_d_stays_ref_backed() {
+    // F extracts the blob (ref-backed, storing the pre-extract original) and D then strips
+    // the surviving ANSI inline — the final inline proposal must still carry F's original.
+    let blob: String = "QWxhZGRpbjpvcGVuIHNlc2FtrZQ"
+        .chars()
+        .cycle()
+        .take(2000)
+        .collect();
+    let dirty =
+        format!("\x1b[36mlog header\x1b[0m\ndata:image/png;base64,{blob}\n\x1b[33mlog footer\x1b[0m\n");
+    let props = run_proposals(&body(&dirty), stage(BlobExtractPass) >> stage(AnsiStripPass));
+    match props.as_slice() {
+        [p] => {
+            let Strategy::Recode { content, ref_id } = &p.strategy else {
+                panic!("expected a Recode proposal, got {:?}", p.strategy);
+            };
+            assert!(ref_id.is_none(), "the pass never mints the ref");
+            assert!(!content.contains('\x1b'), "D cleaned the blob-extracted leaf");
+            assert!(content.contains("elided]"), "F's blob marker survives the chain");
+            assert_eq!(
+                p.needs_ref.as_deref(),
+                Some(dirty.as_bytes()),
+                "final inline proposal keeps F's pre-extract original as the retrieve payload",
+            );
+        }
+        other => panic!("expected exactly one proposal, got {other:?}"),
+    }
+}
+
+#[test]
+fn chain_f_through_b_needs_ref_is_raw_original() {
+    // F (BlobExtract) stages the raw leaf; inline D/E/A refine; B (JsonToon) closes. B must
+    // retrieve F's raw leaf, not the minified intermediate (`ref_recode` prefers carried).
+    let blob: String = "QWxhZGRpbjpvcGVuIHNlc2FtrZQ"
+        .chars()
+        .cycle()
+        .take(2000)
+        .collect();
+    let value = serde_json::json!({
+        "rows": (0..20)
+            .map(|i| serde_json::json!({
+                "id": i,
+                "name": "alpha-beta-gamma",
+                "data": format!("data:image/png;base64,{blob}"),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let dirty = serde_json::to_string_pretty(&value).unwrap();
+    let pipeline = stage(BlobExtractPass)
+        >> stage(AnsiStripPass)
+        >> stage(WhitespacePass)
+        >> stage(JsonMinifyPass)
+        >> stage(JsonToonPass);
+    match run_proposals(&body(&dirty), pipeline).as_slice() {
+        [p] => {
+            assert_eq!(p.by, PassId("json_toon"), "TOON is the final proposer");
+            let Strategy::Recode { content, ref_id } = &p.strategy else {
+                panic!("expected a Recode proposal, got {:?}", p.strategy);
+            };
+            assert!(ref_id.is_none(), "the pass never mints the ref");
+            assert!(content.contains('\t'), "final leaf is tab-delimited TOON");
+            assert_eq!(
+                p.needs_ref.as_deref(),
+                Some(dirty.as_bytes()),
+                "the ref-backed chain retrieves F's raw original leaf, not the minified intermediate",
+            );
+        }
+        other => panic!("expected exactly one proposal, got {other:?}"),
+    }
 }
