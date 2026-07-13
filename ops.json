@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"ops":[{"kind":"claim","assignee":"Yasyf Mohamedali \u003cyasyfm@gmail.com\u003e"}]}
+{"v":1,"lamport":3,"ops":[{"kind":"set_criterion_status","id":"b959a62d06ca26b0437b063aed18ba10","status":"met"}]}
