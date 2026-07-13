@@ -175,17 +175,27 @@ fn chain_f_then_d_stays_ref_backed() {
         .cycle()
         .take(2000)
         .collect();
-    let dirty =
-        format!("\x1b[36mlog header\x1b[0m\ndata:image/png;base64,{blob}\n\x1b[33mlog footer\x1b[0m\n");
-    let props = run_proposals(&body(&dirty), stage(BlobExtractPass) >> stage(AnsiStripPass));
+    let dirty = format!(
+        "\x1b[36mlog header\x1b[0m\ndata:image/png;base64,{blob}\n\x1b[33mlog footer\x1b[0m\n"
+    );
+    let props = run_proposals(
+        &body(&dirty),
+        stage(BlobExtractPass) >> stage(AnsiStripPass),
+    );
     match props.as_slice() {
         [p] => {
             let Strategy::Recode { content, ref_id } = &p.strategy else {
                 panic!("expected a Recode proposal, got {:?}", p.strategy);
             };
             assert!(ref_id.is_none(), "the pass never mints the ref");
-            assert!(!content.contains('\x1b'), "D cleaned the blob-extracted leaf");
-            assert!(content.contains("elided]"), "F's blob marker survives the chain");
+            assert!(
+                !content.contains('\x1b'),
+                "D cleaned the blob-extracted leaf"
+            );
+            assert!(
+                content.contains("elided]"),
+                "F's blob marker survives the chain"
+            );
             assert_eq!(
                 p.needs_ref.as_deref(),
                 Some(dirty.as_bytes()),
