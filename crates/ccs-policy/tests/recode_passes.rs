@@ -126,6 +126,21 @@ fn json_minify_cleans_pretty_json_tool_result() {
 }
 
 #[test]
+fn json_minify_folds_multidoc_ndjson_tool_result() {
+    // Multi-doc NDJSON (two objects, blank-line noise past the recode floor): `format-core`'s
+    // decode folds the stream to one array, so pass A now rewrites a leaf it used to no-op on.
+    let ndjson = format!("{}{}{}", r#"{"a": 1}"#, "\n".repeat(300), r#"{"b": 2}"#);
+    let props = run(&body(&ndjson), stage(JsonMinifyPass));
+    let (content, ref_id) = sole_recode(&props);
+    assert!(ref_id.is_none());
+    assert_eq!(
+        content, r#"[{"a":1},{"b":2}]"#,
+        "multi-doc NDJSON folded into one compact JSON array"
+    );
+    assert!(content.len() < ndjson.len());
+}
+
+#[test]
 fn chain_d_then_e_then_a_refines_one_leaf() {
     // ANSI-wrapped pretty JSON with trailing-whitespace padding and blank-line noise: D
     // strips the escapes, E normalizes the whitespace, A minifies the now-clean JSON —
@@ -237,7 +252,10 @@ fn chain_f_through_b_needs_ref_is_raw_original() {
                 panic!("expected a Recode proposal, got {:?}", p.strategy);
             };
             assert!(ref_id.is_none(), "the pass never mints the ref");
-            assert!(content.contains('\t'), "final leaf is tab-delimited TOON");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(content).is_err(),
+                "B closes the chain with a leaner non-JSON encoding (TRON)",
+            );
             assert_eq!(
                 p.needs_ref.as_deref(),
                 Some(dirty.as_bytes()),

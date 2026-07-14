@@ -1,15 +1,18 @@
 //! Phase 3 pass A — minify a recodeable leaf whose content is pretty-printed JSON.
-//! Inline-lossless: re-serialize the parsed value with no insignificant whitespace; the
-//! model reads identical JSON, no ref is minted (`ref_id = None`). Idempotent — minified
-//! JSON re-minifies to itself.
+//! Inline-lossless: re-serialize the parsed value through `format-core`'s compact writer
+//! with no insignificant whitespace; the model reads the same JSON value, no ref is minted
+//! (`ref_id = None`). Idempotent — compact JSON re-minifies to itself. Swapping serde_json's
+//! minify for `format-core`'s writer makes the lossless claim exact and fixes two latent
+//! defects: number lexemes now round-trip verbatim (no f64 canonicalization, so 26-digit
+//! decimals and integers past 2^53 survive byte-exact), and source key order is preserved
+//! independently of serde_json's `preserve_order` feature.
 //!
-//! Fires only when the whole leaf parses as a JSON value (object, array, or scalar): the
-//! transform then drops the pretty-print indentation/spacing. A leaf that is not JSON, or
-//! is already minimal, yields no proposal (the strict-shrink check in
-//! [`inline_recode`](super::recode::inline_recode) rejects a non-shrinking result).
+//! Fires only when the whole leaf parses as a JSON value (object, array, or scalar; NDJSON
+//! folds to one array): the transform then drops the pretty-print indentation/spacing. A
+//! leaf that is not JSON, or is already minimal, yields no proposal (the strict-shrink check
+//! in [`inline_recode`](super::recode::inline_recode) rejects a non-shrinking result).
+//! Multi-document NDJSON is intentionally folded to one array — a `decode_ir` behavior we accept.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
-
-use serde_json::value::RawValue;
 
 use crate::pipeline::pass::{Pass, PassControl, PassCtx, PassId, Phase, PlanLedger};
 use crate::pipeline::passes::recode::{inline_recode, recode_leaf};
@@ -43,13 +46,14 @@ impl Pass for JsonMinifyPass {
     }
 }
 
-/// Re-serialize `input` as minified JSON when the whole string parses as a JSON value.
-/// `None` when `input` is not valid JSON. Lossless and idempotent: minified JSON
-/// re-minifies to itself.
+/// Re-serialize `input` as compact JSON via `format-core`'s order- and lexeme-preserving
+/// writer when the whole string parses as JSON. `None` when `input` is not valid JSON.
+/// Lossless and idempotent: compact JSON re-minifies to itself, and number lexemes and key
+/// order survive verbatim.
 pub fn minify_json(input: &str) -> Option<String> {
-    let value: Box<RawValue> = serde_json::from_str(input).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(value.get()).ok()?;
-    serde_json::to_string(&parsed).ok()
+    format_core::decode_ir(input)
+        .ok()
+        .map(|value| format_core::compact_json(&value))
 }
 
 #[cfg(test)]

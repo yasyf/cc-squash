@@ -3,8 +3,8 @@
 //! L2 `intercept::run` APPLIES it on the next turn through the unchanged Controller, splice,
 //! and validate seam — no hand-seeded plan. The only mock is the Anthropic boundary, and the
 //! summarizer is told to `keep`: a fired deterministic recode PREEMPTS the LLM, so the
-//! rewrite is purely deterministic. Proves a JSON tool_result shrinks to a ref-backed TOON
-//! and `retrieve` returns the byte-exact original, an ANSI-laden log shrinks to an
+//! rewrite is purely deterministic. Proves a JSON tool_result shrinks to a ref-backed leaner
+//! encoding and `retrieve` returns the byte-exact original, an ANSI-laden log shrinks to an
 //! inline-lossless cleaned form with NO ref marker, and every rewrite still passes the
 //! validity gate (shrink-only, tool-pair intact).
 
@@ -177,8 +177,8 @@ async fn stage_then_intercept(
     (out.bytes, block)
 }
 
-/// A uniform-array JSON dump — the TOON sweet spot: the ref-backed B pass strictly shrinks it
-/// to tab-delimited TOON.
+/// A uniform-array JSON dump under a `rows` wrapper — a repeated nested shape: the ref-backed
+/// B pass strictly shrinks it to TRON (a class-table encoding).
 fn uniform_json_dump() -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "rows": (0..60)
@@ -189,7 +189,7 @@ fn uniform_json_dump() -> String {
 }
 
 #[tokio::test]
-async fn json_tool_result_recodes_to_toon_ref_backed_and_round_trips() {
+async fn json_tool_result_recodes_ref_backed_and_round_trips() {
     let upstream = mock_keep().await;
     let store = test_store().await;
     let session = SessionId::new("tok-toon");
@@ -202,16 +202,16 @@ async fn json_tool_result_recodes_to_toon_ref_backed_and_round_trips() {
     // The rewrite shrank the body (the validity gate would fail open on a non-shrink).
     assert!(
         egress_bytes.len() < body.len(),
-        "the deterministic TOON recode must shrink the egress body",
+        "the deterministic recode must shrink the egress body",
     );
     // The tool_pair is intact: a tool_result block keeping its tool_use_id.
     assert_eq!(block["type"], "tool_result", "stays a tool_result");
     assert_eq!(block["tool_use_id"], "tu_read_1", "tool_use_id survives");
     let content = block["content"].as_str().expect("string content");
-    // Ref-backed: the cleaned TOON body PLUS the resolved ref marker for retrieve.
+    // Ref-backed: the cleaned TRON body PLUS the resolved ref marker for retrieve.
     assert!(
-        content.contains('\t'),
-        "the recoded body is tab-delimited TOON"
+        content.contains("class "),
+        "the recoded body is TRON (repeated-shape class table)"
     );
     assert!(
         content.contains(&format!("ref={}", pair_ref.as_str())),
@@ -245,12 +245,11 @@ async fn json_tool_result_recodes_to_toon_ref_backed_and_round_trips() {
     );
     assert!(
         text.contains("alpha-beta-gamma"),
-        "the resolved original is the full JSON dump, not the TOON",
+        "the resolved original is the full JSON dump, not the TRON",
     );
 
-    // The egress content being tab-TOON (asserted above) is itself the proof of preemption:
-    // an LLM `summarize`/`compress` would have rendered the prose summary placeholder, never
-    // tab-delimited TOON. The deterministic chain produced the plan.
+    // Egress being TRON (asserted above) proves preemption: an LLM summarize/compress would
+    // have rendered a prose summary placeholder, never a TRON class table.
 }
 
 #[tokio::test]

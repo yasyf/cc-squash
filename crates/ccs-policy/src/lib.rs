@@ -35,9 +35,9 @@ pub use controller::{
 pub use decision::{ContentDecision, PRE_GATE_MIN_CHARS};
 pub use payload::segment_payload_bytes;
 pub use pipeline::{
-    score_segment, toon_encode, toon_options, CheckpointId, Pass, PassControl, PassCtx, PassId,
-    Phase, Pipeline, PlanLedger, Presets, Proposal, Provenance, Runner, ScoreTable, ScoreWeights,
-    SegmentScore, Stage, StagedDecisions, StagedSegment,
+    score_segment, CheckpointId, Pass, PassControl, PassCtx, PassId, Phase, Pipeline, PlanLedger,
+    Presets, Proposal, Provenance, Runner, ScoreTable, ScoreWeights, SegmentScore, Stage,
+    StagedDecisions, StagedSegment,
 };
 pub use rewrite::{splice, RenderedSegment, RewriteError, SegmentTarget, Spliced};
 pub use rewrite_gate::{validate, GateError};

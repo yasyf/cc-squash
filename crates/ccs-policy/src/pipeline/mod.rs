@@ -12,7 +12,6 @@ pub mod pass;
 pub mod passes;
 pub mod presets;
 pub mod scorer;
-pub mod toon;
 
 pub use pass::{
     Pass, PassControl, PassCtx, PassId, Phase, PlanLedger, Proposal, Provenance, StagedDecisions,
@@ -20,7 +19,6 @@ pub use pass::{
 };
 pub use presets::Presets;
 pub use scorer::{score_segment, ScoreTable, ScoreWeights, SegmentScore};
-pub use toon::{toon_encode, toon_options};
 
 /// The default cap on pipeline reverts — how many times the runner may honor a
 /// [`PassControl::RevertTo`] before it stops rewinding and runs straight through.

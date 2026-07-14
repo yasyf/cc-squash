@@ -28,10 +28,13 @@ bytes = "1"
 futures-util = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
-# TOON encoder for the deterministic JSON→TOON pass (pure: depends only on
-# serde/serde_json). `default-features = false` drops the `cli` feature's heavy
-# tree (clap, ratatui, tiktoken-rs, …) so it stays a pure engine dep.
-toon-format = { version = "0.5", default-features = false }
+# format-core: cc-context's canonical shape-classifying JSON re-encoder — the
+# classify + never-worse selection ({minified JSON, JSONL, CSV, TSV, Markdown,
+# TOON, TRON}) and a precision-preserving compact writer — backs the
+# deterministic recode passes A (compact writer) and B (leanest selection). It
+# keeps serde_json out of its runtime graph and carries the TOON number-safety
+# guard. Tag-pinned to cc-context releases; bump the tag to adopt engine changes.
+format-core = { git = "https://github.com/yasyf/cc-context", tag = "v0.16.0", package = "format-core" }
 # similar drives the deterministic sequential-diff pass (G): line-level unified
 # diffs of near-duplicate tool results. `default-features = false` + `text` keeps
 # it to the line/text differ, no unicode/bytes/serde extras. NEVER use its

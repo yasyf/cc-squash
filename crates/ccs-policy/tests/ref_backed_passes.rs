@@ -111,11 +111,15 @@ fn uniform_json(rows: usize) -> String {
 }
 
 #[test]
-fn json_toon_shrinks_uniform_array_to_toon_ref_backed() {
+fn json_toon_shrinks_uniform_array_ref_backed() {
+    // Repeated nested shape (root object wrapping a uniform array) → leaner selection is TRON.
     let pretty = uniform_json(20);
     let props = run(&body(&pretty), stage(JsonToonPass));
     let recoded = sole_ref_backed(&props, &pretty);
-    assert!(recoded.contains('\t'), "uniform array recoded to tab-TOON");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&recoded).is_err(),
+        "recoded to a leaner non-JSON encoding, not a plain minify",
+    );
     assert!(
         recoded.len() < pretty.len(),
         "recode strictly shrinks the leaf"
