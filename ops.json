@@ -1,1 +1,1 @@
-{"v":1,"lamport":4,"ops":[{"kind":"remove_criterion","id":"ce4fba1b10744dbf1331642112170aee"}]}
+{"v":1,"lamport":5,"ops":[{"kind":"add_criterion","id":"7156362c37172909cc8698aa7c8e2d0d","text":"G ordered last (F→D→E→I→A→B→C→J→G); seq_diff module doc states the base invariant: every diff base renders verbatim (no marker, never a diff, never dedup-emptied)","script":""}]}
