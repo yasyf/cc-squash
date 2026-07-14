@@ -3,9 +3,8 @@
 //! ladder (strip-reasoning → drop-tool-pairs → drop-oldest). Composed into pipelines by
 //! [`Presets`](crate::pipeline::presets::Presets).
 //!
-//! DEFERRED passes (roadmap, not yet implemented): G sequential diff-encoding,
-//! I markdown/HTML strip, and the on-path inline-lossless fast-lane (render
-//! lossless recodes without a ref marker).
+//! DEFERRED passes (roadmap, not yet implemented): the on-path inline-lossless
+//! fast-lane (render lossless recodes without a ref marker).
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod ansi_strip;
@@ -17,9 +16,11 @@ pub mod head_tail;
 pub mod json_minify;
 pub mod json_toon;
 pub mod ladder_select;
+pub mod markup_strip;
 pub mod recode;
 pub mod salience_gate;
 pub mod score;
+pub mod seq_diff;
 pub mod whitespace;
 
 pub use ansi_strip::AnsiStripPass;
@@ -31,8 +32,10 @@ pub use head_tail::HeadTailPass;
 pub use json_minify::JsonMinifyPass;
 pub use json_toon::JsonToonPass;
 pub use ladder_select::{EconomicsGatePass, LadderSelectPass};
+pub use markup_strip::MarkupStripPass;
 pub use salience_gate::SalienceGatePass;
 pub use score::ScorePass;
+pub use seq_diff::SeqDiffPass;
 pub use whitespace::WhitespacePass;
 
 #[cfg(test)]

@@ -13,11 +13,17 @@ use ccs_core::{
     ByteOffset, ChoiceTag, Generation, LineRange, MessageId, ModelId, RefId, SegmentKind,
     TokenCount,
 };
+use std::sync::Arc;
+
 use ccs_economics::{economics_for, CacheState, ModelEconomics};
 use ccs_policy::candidate::is_squash_candidate;
+use ccs_policy::pipeline::pass::{PassCtx, PlanLedger, Proposal, StagedDecisions};
+use ccs_policy::pipeline::passes::SeqDiffPass;
+use ccs_policy::pipeline::{Pipeline, Runner, Stage};
+use ccs_policy::wire::parse_body;
 use ccs_policy::{
-    is_pinned, Constraint, ContentDecision, FreeBustTrigger, PolicyConfig, Pressure, Segment,
-    SquashCandidate, Strategy, WorkingState,
+    is_pinned, segment_prompt, Constraint, ContentDecision, FreeBustTrigger, PolicyConfig,
+    Pressure, Segment, SquashCandidate, Strategy, WorkingState,
 };
 
 mod common;
@@ -283,4 +289,97 @@ fn superseded_constraint_does_not_pin() {
 
     assert!(!is_pinned(&s, &working));
     assert!(is_squash_candidate(&s, &working, &PolicyConfig::default()));
+}
+
+/// Pass G under an adversarial input: an alternating-line pair maximizes the unified diff,
+/// yet both sides stay under the size caps and G DECLINES (the diff exceeds half the target)
+/// rather than emitting an oversized proposal. The cost bound is size caps, never a deadline.
+#[test]
+fn seq_diff_alternating_pathological_pair_yields_no_oversized_proposal() {
+    let base: String = (0..400)
+        .map(|i| format!("line {i} original content payload text goes here"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let target: String = (0..400)
+        .map(|i| match i % 2 {
+            0 => format!("line {i} MUTATED content payload text goes here"),
+            _ => format!("line {i} original content payload text goes here"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        base.len() < 512 * 1024 && target.len() < 512 * 1024,
+        "both sides sit under the per-side cap",
+    );
+    assert!(
+        run_seq_diff(&base, &target).is_empty(),
+        "the pathological diff is declined, not emitted oversized",
+    );
+}
+
+/// Pass G's pre-diff line cap: a near-duplicate pair just OVER `G_MAX_LINES` (only one line
+/// differs, so the tiny diff would sail through the fraction gate) is declined WITHOUT running
+/// the O(N*D) Myers walk. Both sides stay under the byte cap, so the LINE cap alone rejects —
+/// were it absent, this pair WOULD propose. Completes fast: the guard short-circuits.
+#[test]
+fn seq_diff_over_line_cap_declines_before_diffing() {
+    let base: String = (0..10_001)
+        .map(|i| format!("line {i} payload"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let target = base.replacen("line 5000 payload", "line 5000 mutated", 1);
+    assert!(
+        base.len() < 512 * 1024 && target.len() < 512 * 1024,
+        "both sides sit under the per-side BYTE cap, so the line cap is what declines",
+    );
+    assert!(
+        run_seq_diff(&base, &target).is_empty(),
+        "a pair over the line cap is declined before the diff runs",
+    );
+}
+
+fn seq_diff_body(base: &str, target: &str) -> Vec<u8> {
+    serde_json::json!({
+        "model": "claude-opus-4-8",
+        "max_tokens": 100_000,
+        "messages": [
+            {"role": "user", "content": "kick off with a long human prompt to seed. ".repeat(8)},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tu1", "name": "Bash", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu1", "content": base}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tu2", "name": "Bash", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu2", "content": target}]},
+            {"role": "user", "content": "a trailing human prompt of some length here. ".repeat(8)},
+            {"role": "assistant", "content": [{"type": "text", "text": "latest reply."}]}
+        ]
+    })
+    .to_string()
+    .into_bytes()
+}
+
+fn run_seq_diff(base: &str, target: &str) -> Vec<Proposal> {
+    let bytes = seq_diff_body(base, target);
+    let parsed = parse_body(&bytes).unwrap();
+    let segments = segment_prompt(&parsed);
+    let working = WorkingState::default();
+    let econ = economics_for(&ModelId::new("claude-opus-4-8")).unwrap();
+    let cfg = PolicyConfig::default();
+    let staged = StagedDecisions::default();
+    let ctx = PassCtx {
+        body: &parsed,
+        segments: &segments,
+        working: &working,
+        econ: &econ,
+        cache: &cache(),
+        knobs: &cfg,
+        staged: &staged,
+        remaining_turns: 10.0,
+        now: 0.0,
+    };
+    let mut ledger = PlanLedger::sized(segments.len());
+    Runner::default().run(
+        &Pipeline::of([Stage::Pass(Arc::new(SeqDiffPass))]),
+        &ctx,
+        &mut ledger,
+    );
+    ledger.proposals
 }

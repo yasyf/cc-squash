@@ -152,6 +152,16 @@ impl<'a> ContentBlock<'a> {
             _ => None,
         }
     }
+
+    /// The tool name a `tool_use`/`server_tool_use` block invokes, read from its
+    /// `name` field. `None` for any other block or when `name` is absent.
+    pub fn tool_name(&self) -> Option<&'a str> {
+        let fields: IdFields<'a> = serde_json::from_str(self.raw().get()).ok()?;
+        match self {
+            Self::ToolUse(_) | Self::ServerToolUse(_) => fields.name,
+            _ => None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -160,6 +170,8 @@ struct IdFields<'a> {
     id: Option<&'a str>,
     #[serde(borrow, default)]
     tool_use_id: Option<&'a str>,
+    #[serde(borrow, default)]
+    name: Option<&'a str>,
 }
 
 fn classify(raw: &RawValue) -> ContentBlock<'_> {

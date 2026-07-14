@@ -19,6 +19,7 @@ use serde::Deserialize;
 use crate::pipeline::pass::{PassId, PlanLedger, Proposal};
 use crate::segment::Segment;
 use crate::strategy::Strategy;
+use crate::targets::MIN_BLOCK_SPAN;
 use crate::wire::{ContentBlock, MessageContent, Role, WireBody};
 
 /// The minimum raw-span byte length a leaf must have to be worth recoding — below this
@@ -132,12 +133,42 @@ pub fn raw_recode_leaf(body: &WireBody, seg: &Segment) -> Option<RecodeLeaf> {
 
 fn raw_leaf(body: &WireBody, seg: &Segment) -> Option<RecodeLeaf> {
     match leaf_strings(body, seg).as_slice() {
-        [one] if one.len() > MIN_RECODE_SPAN => Some(RecodeLeaf {
+        [one] if one.len() > MIN_RECODE_SPAN && sole_squash_target(body, seg) => Some(RecodeLeaf {
             original_tokens: estimate_chars_proxy(one).get(),
             content: one.clone(),
             carried_ref: None,
         }),
         _ => None,
+    }
+}
+
+/// Whether the segment's lone string leaf is the ONLY block
+/// [`squash_targets`](crate::targets::squash_targets) would overwrite. The L2 splice writes
+/// the single recode text into EVERY `tool_result` over the [`MIN_BLOCK_SPAN`] floor
+/// (`targets.rs` owns that floor), so a `ToolPair` with a second large `tool_result` —
+/// structured or string — would take the leaf's recode in that sibling too and corrupt it.
+/// Block-precise `SegmentTarget::Block` targeting is the documented Layer-4 follow-up; until
+/// then this guard rejects such a pair. Non-`ToolPair` segments have a single target.
+fn sole_squash_target(body: &WireBody, seg: &Segment) -> bool {
+    match seg.kind {
+        SegmentKind::ToolPair => {
+            seg.source_uuids
+                .iter()
+                .filter_map(|u| u.as_str().parse::<usize>().ok())
+                .filter(|&m| matches!(body.messages.get(m).map(|w| w.role), Some(Role::User)))
+                .flat_map(|m| {
+                    body.messages
+                        .get(m)
+                        .into_iter()
+                        .flat_map(|w| w.content.blocks())
+                })
+                .filter(|b| {
+                    matches!(b, ContentBlock::ToolResult(_)) && b.raw().get().len() > MIN_BLOCK_SPAN
+                })
+                .count()
+                == 1
+        }
+        _ => true,
     }
 }
 
@@ -205,7 +236,7 @@ fn text_block_string(block: &ContentBlock) -> Option<String> {
     }
 }
 
-fn tool_result_text(raw: &str) -> Option<String> {
+pub(crate) fn tool_result_text(raw: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct Fields {
         #[serde(default)]
@@ -417,6 +448,65 @@ mod tests {
             )
             .is_none(),
             "equal-length result never enlarges"
+        );
+    }
+
+    // A tool pair carrying a STRING Bash result (the leaf) and a STRUCTURED Read result.
+    fn mixed_pair_body(string_result: &str, structured: serde_json::Value) -> Vec<u8> {
+        parse(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 100_000,
+            "messages": [
+                {"role": "user", "content": "open with a long human prompt to seed. ".repeat(8)},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu1", "name": "Bash", "input": {"command": "x"}},
+                    {"type": "tool_use", "id": "tu2", "name": "Read", "input": {"file_path": "/f"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu1", "content": string_result},
+                    {"type": "tool_result", "tool_use_id": "tu2", "content": structured}
+                ]},
+                {"role": "user", "content": "a trailing human prompt of some length here. ".repeat(8)},
+                {"role": "assistant", "content": [{"type": "text", "text": "latest reply."}]}
+            ]
+        }))
+    }
+
+    #[test]
+    fn mixed_pair_with_structured_result_yields_no_recode_proposal() {
+        let string_result = "tool output line. ".repeat(120); // ~2KB string leaf
+
+        // A 1KB structured result is itself a squash target: recoding the string leaf would
+        // clobber it, so the pair must NOT be recodeable.
+        let big_structured = serde_json::json!([
+            {"type": "text", "text": "structured payload block. ".repeat(40)}
+        ]);
+        let bytes = mixed_pair_body(&string_result, big_structured);
+        let parsed = parse_body(&bytes).unwrap();
+        let segs = segment_prompt(&parsed);
+        let pair = segs
+            .iter()
+            .find(|s| s.kind == SegmentKind::ToolPair)
+            .unwrap();
+        let ledger = PlanLedger::sized(segs.len());
+        assert!(
+            recode_leaf(&parsed, pair, &ledger).is_none(),
+            "a sibling structured result over the squash floor blocks recode",
+        );
+
+        // A sub-floor structured sibling is not a squash target, leaving the string leaf sole.
+        let small_structured = serde_json::json!([{"type": "text", "text": "tiny"}]);
+        let bytes = mixed_pair_body(&string_result, small_structured);
+        let parsed = parse_body(&bytes).unwrap();
+        let segs = segment_prompt(&parsed);
+        let pair = segs
+            .iter()
+            .find(|s| s.kind == SegmentKind::ToolPair)
+            .unwrap();
+        let ledger = PlanLedger::sized(segs.len());
+        assert!(
+            recode_leaf(&parsed, pair, &ledger).is_some(),
+            "a sub-floor structured sibling leaves the string leaf as the sole target",
         );
     }
 }

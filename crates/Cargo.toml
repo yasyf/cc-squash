@@ -32,6 +32,13 @@ serde_json = { version = "1" }
 # serde/serde_json). `default-features = false` drops the `cli` feature's heavy
 # tree (clap, ratatui, tiktoken-rs, …) so it stays a pure engine dep.
 toon-format = { version = "0.5", default-features = false }
+# similar drives the deterministic sequential-diff pass (G): line-level unified
+# diffs of near-duplicate tool results. `default-features = false` + `text` keeps
+# it to the line/text differ, no unicode/bytes/serde extras. NEVER use its
+# deadline/timeout APIs: a time-bounded diff is nondeterministic, and L1 re-stages
+# the chain every turn, so output that varies between runs flaps the egress bytes
+# and busts the upstream prompt cache. Cost is bounded by size caps only.
+similar = { version = "2", default-features = false, features = ["text"] }
 memchr = "2"
 # strum::Display + serde rename give the pure engine's tag enums exact wire spellings.
 strum = { version = "0.26", features = ["derive"] }
@@ -53,7 +60,8 @@ proptest = "1"
 tokio-rusqlite = { version = "0.7", features = ["bundled"] }
 # Content addressing: the spec-mandated full sha256:<64hex> ref id.
 sha2 = "0.10"
-# REF_MARKER = ref=(sha256:[0-9a-f]{64}) — re-finds live refs for sticky-on + GC.
+# REF_MARKER — re-finds live refs inside cc-squash placeholder/backref markers
+# (anchored to their exact prefixes) for sticky-on + GC reachability.
 regex = "1"
 # Typed library errors (ccs-refs, ccs-summarizer).
 thiserror = "2"

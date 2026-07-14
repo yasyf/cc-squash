@@ -12,7 +12,8 @@ use crate::config::PolicyConfig;
 use crate::pipeline::passes::{
     AnsiStripPass, AntiThrashPass, BlobExtractPass, DedupBackrefPass, DropOldestPass,
     DropToolPairsPass, EconomicsGatePass, HeadTailPass, JsonMinifyPass, JsonToonPass,
-    LadderSelectPass, SalienceGatePass, ScorePass, StripReasoningPass, WhitespacePass,
+    LadderSelectPass, MarkupStripPass, SalienceGatePass, ScorePass, SeqDiffPass,
+    StripReasoningPass, WhitespacePass,
 };
 use crate::pipeline::{Pipeline, Stage};
 
@@ -38,20 +39,23 @@ impl Presets {
     }
 
     /// The deterministic (non-LLM) recode chain, run OFF-PATH during staging: F
-    /// blob-extract → D ANSI-strip → E whitespace-normalize → A JSON-minify → B JSON→TOON
-    /// → C dedup-backref → J head/tail-truncate. Each pass refines the prior's `Recode`
-    /// content (threaded through the ledger by
-    /// [`recode_leaf`](crate::pipeline::passes::recode::recode_leaf)), so a single leaf is
-    /// progressively cleaned, then ref-encoded, in order. Every pass is `Phase::OffPath`:
-    /// the chain never runs on the 50ms L2 path in Phase 3.
+    /// blob-extract → D ANSI-strip → E whitespace-normalize → I markup-strip → A
+    /// JSON-minify → B JSON→TOON → C dedup-backref → J head/tail-truncate → G
+    /// sequential-diff. Each pass refines the prior's `Recode` content (threaded through
+    /// the ledger by [`recode_leaf`](crate::pipeline::passes::recode::recode_leaf)), so a
+    /// single leaf is progressively cleaned, then ref-encoded, in order. G runs last so
+    /// both diff sides are the final rendered forms (see `seq_diff`'s ordering contract).
+    /// Every pass is `Phase::OffPath`: the chain never runs on the 50ms L2 path.
     pub fn deterministic(_knobs: &PolicyConfig) -> Pipeline {
         stage(BlobExtractPass)
             >> stage(AnsiStripPass)
             >> stage(WhitespacePass)
+            >> stage(MarkupStripPass)
             >> stage(JsonMinifyPass)
             >> stage(JsonToonPass)
             >> stage(DedupBackrefPass)
             >> stage(HeadTailPass)
+            >> stage(SeqDiffPass)
     }
 
     /// The hard-ladder fallback pipeline, run when a turn is over budget: strip
