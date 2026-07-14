@@ -1,4 +1,7 @@
-//! The L2 on-path interceptor. Fails open to identity on any uncertainty.
+//! The L2 on-path interceptor. Fails open to identity on any uncertainty; any
+//! fail-open identity turn reverts committed fast-lane leaves to their original
+//! bytes for that turn — pre-existing exposure shared with applied staged recodes,
+//! watched by the realized-bust breaker.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::{HashMap, HashSet};
@@ -8,6 +11,7 @@ use bytes::Bytes;
 use ccs_core::{estimate_chars_proxy, RefId, SegmentKind, TokenCount, TokenScale};
 use ccs_economics::{economics_for, CacheState, Cost, ModelEconomics};
 use ccs_policy::budget::{soft_pressure, Pressure};
+use ccs_policy::pipeline::passes::{fast_lane_clean, fast_lane_leaf};
 use ccs_policy::wire::{parse_body, WireBody};
 use ccs_policy::{
     is_recency_protected, score_segment, segment_payload_bytes, segment_prompt, splice,
@@ -25,6 +29,9 @@ use crate::staging::{StagedEntry, StagedPlan, StagedRecode};
 const L2_CAP_MS: u64 = 50;
 
 const MAX_INTERCEPT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Leaves above this are skipped by the fast lane (the 50ms budget).
+const FAST_LANE_MAX_LEAF: usize = 256 * 1024;
 
 const FUSE_UP: bool = false;
 
@@ -44,6 +51,17 @@ const FALLBACK_ECON: ModelEconomics = ModelEconomics {
 pub struct Intercepted {
     pub bytes: Bytes,
     pub predicted_bust: Option<Cost>,
+    /// Fast-lane keys newly spliced this turn — commit-on-splice-only; empty on any
+    /// identity/failed outcome so a gated splice never poisons future turns.
+    pub fast_lane_committed: Vec<RefId>,
+    /// Committed keys a spliced STAGED proposal rendered over this turn (base ∩
+    /// commitment set, lane entry or not) — ownership transfers to L1's
+    /// content-addressed staging. Empty on any identity/failed outcome, and a
+    /// budget-ladder Drop never un-commits. After un-commit the key's persistence
+    /// degrades to L1's per-turn re-staging, whose relag window can emit original
+    /// bytes for one turn — identical pre-existing exposure to every applied staged
+    /// recode, watched by the realized-bust breaker.
+    pub fast_lane_uncommitted: Vec<RefId>,
 }
 
 pub struct InterceptInputs {
@@ -53,6 +71,9 @@ pub struct InterceptInputs {
     pub policy: PolicyConfig,
     pub remaining_turns: f64,
     pub hot_refs: HashSet<RefId>,
+    pub fast_lane: HashSet<RefId>,
+    pub last_message_count: usize,
+    pub window_closed: bool,
     pub staged: Option<StagedPlan>,
     pub token_scale: TokenScale,
     pub now: f64,
@@ -92,6 +113,8 @@ fn identity(bytes: Bytes) -> Intercepted {
     Intercepted {
         bytes,
         predicted_bust: None,
+        fast_lane_committed: Vec::new(),
+        fast_lane_uncommitted: Vec::new(),
     }
 }
 
@@ -103,19 +126,122 @@ fn intercept(bytes: &Bytes, inputs: &InterceptInputs) -> Intercepted {
         return identity(bytes.clone());
     };
     let segments = segment_prompt(&body);
+    let keys: Vec<RefId> = segments
+        .iter()
+        .map(|seg| content_address(&segment_payload_bytes(seg, &body)))
+        .collect();
+    let lane = fast_lane_entries(&body, &segments, &keys, inputs);
 
     match &inputs.staged {
-        Some(plan) => continuous(bytes, &body, &segments, plan, inputs),
-        None => deterministic_compact(bytes, &body, &segments, &inputs.policy),
+        Some(plan) => continuous(bytes, &body, &segments, &keys, plan, inputs, &lane),
+        None => deterministic_compact(bytes, &body, &segments, &inputs.policy, &lane),
     }
+}
+
+/// One fast-lane leaf this turn: its commitment key, whether it is newly committed
+/// (fresh — committed only on splice success), the bytes its clean removed, and its
+/// rendered replacement blocks.
+struct LaneEntry {
+    key: RefId,
+    fresh: bool,
+    saved: usize,
+    rendered: Vec<RenderedSegment>,
+}
+
+/// Fast-lane eligibility, PURE over (commitment set, message-count window, staged
+/// map) — never score/NPV/economics-dependent, so the same session state renders the
+/// same bytes every turn. A FRESH leaf enters iff no staged entry covers it (staged
+/// wins when it renders) and it is provably uncached; a COMMITTED leaf always enters
+/// (re-rendered EVERY turn, Hold included) — [`finish`]'s collision filter drops it
+/// exactly when a staged block splices at its target. The transform is the
+/// deterministic D→E→A composition.
+///
+/// Accepted v1 CUT (follow-up to file): `Controller::post_squash_below_floor` prices
+/// only the staged batch, so it is blind to fast-lane removals, and a
+/// staged-over-committed application is priced against ORIGINAL bytes, slightly
+/// overstating savings.
+fn fast_lane_entries(
+    body: &WireBody,
+    segments: &[Segment],
+    keys: &[RefId],
+    inputs: &InterceptInputs,
+) -> Vec<LaneEntry> {
+    segments
+        .iter()
+        .zip(keys)
+        .filter_map(|(seg, key)| {
+            let fresh = !inputs.fast_lane.contains(key);
+            let staged_covers = inputs
+                .staged
+                .as_ref()
+                .is_some_and(|p| p.by_content.contains_key(key));
+            if fresh
+                && (staged_covers
+                    || inputs.window_closed
+                    || !provably_uncached(seg, inputs.last_message_count))
+            {
+                return None;
+            }
+            let leaf = fast_lane_leaf(body, seg)?;
+            if leaf.content.len() > FAST_LANE_MAX_LEAF {
+                return None;
+            }
+            let cleaned = fast_lane_clean(&leaf.content)?;
+            let saved = leaf.content.len() - cleaned.len();
+            Some(LaneEntry {
+                key: key.clone(),
+                fresh,
+                saved,
+                rendered: render_fast_lane(body, seg, cleaned)?,
+            })
+        })
+        .collect()
+}
+
+/// Whether every source message of `seg` sits at or past last turn's message count —
+/// the tail the upstream prompt cache has provably never seen.
+fn provably_uncached(seg: &Segment, last_message_count: usize) -> bool {
+    !seg.source_uuids.is_empty()
+        && seg.source_uuids.iter().all(|u| {
+            u.as_str()
+                .parse::<usize>()
+                .is_ok_and(|m| m >= last_message_count)
+        })
+}
+
+// Mirrors the staged inline-recode render: the cleaned content, no ref marker. Every
+// target must strictly shrink (deterministic, so byte-stable across turns).
+fn render_fast_lane(
+    body: &WireBody,
+    seg: &Segment,
+    cleaned: String,
+) -> Option<Vec<RenderedSegment>> {
+    let strategy = Strategy::Recode {
+        content: cleaned,
+        ref_id: None,
+    };
+    squash_targets(body, seg)
+        .into_iter()
+        .map(|t| {
+            let body_text = render_proposal_text(&strategy, None)?;
+            let block_json = placeholder_block_json(&t.kind, &body_text);
+            (block_json.len() < t.original_len).then_some(RenderedSegment {
+                block_json,
+                target: t.target,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .filter(|rendered| !rendered.is_empty())
 }
 
 fn continuous(
     bytes: &Bytes,
     body: &WireBody,
     segments: &[Segment],
+    keys: &[RefId],
     plan: &StagedPlan,
     inputs: &InterceptInputs,
+    lane: &[LaneEntry],
 ) -> Intercepted {
     // Build the pure staged side-table the on-path passes read: one entry per segment
     // whose content address matches a staged plan entry, in segment order so the
@@ -130,10 +256,9 @@ fn continuous(
     // but still NPV-gated: they enter the same `batch` the Controller prices.
     let staged_segments: Vec<(StagedSegment, &StagedEntry)> = segments
         .iter()
-        .filter_map(|seg| {
-            let entry = plan
-                .by_content
-                .get(&content_address(&segment_payload_bytes(seg, body)))?;
+        .zip(keys)
+        .filter_map(|(seg, key)| {
+            let entry = plan.by_content.get(key)?;
             if entry.recode.is_some() {
                 return None;
             }
@@ -155,10 +280,9 @@ fn continuous(
     // the hot-ref snapshot exactly as the ladder's anti-thrash pass filters LLM candidates.
     let recode_live: Vec<(usize, &StagedEntry, SquashCandidate)> = segments
         .iter()
-        .filter_map(|seg| {
-            let entry = plan
-                .by_content
-                .get(&content_address(&segment_payload_bytes(seg, body)))?;
+        .zip(keys)
+        .filter_map(|(seg, key)| {
+            let entry = plan.by_content.get(key)?;
             entry.recode.as_ref()?;
             let q = segment_quality_gain(seg, segments, inputs, &entry.rec.ref_id);
             let cand = recode_candidate(seg, segments, body, entry, inputs.token_scale, q)?;
@@ -208,10 +332,17 @@ fn continuous(
         live
     };
 
+    // Base ∩ commitment set: un-commits even a pinned (lane-exempt) segment's key.
+    let uncommit: Vec<RefId> = live
+        .iter()
+        .map(|(seg_index, _, _)| &keys[*seg_index])
+        .filter(|key| inputs.fast_lane.contains(*key))
+        .cloned()
+        .collect();
+
     if live.is_empty() {
-        // Matches today: a non-empty `matched` reduced to empty solely by the hot-ref
-        // drop logs the RefHot hold; an empty `matched` (no candidate survived
-        // `select_strategy`) forwards silently.
+        // Only a hot-ref-drained `matched` logs the RefHot hold (matches today's
+        // behavior); either way the fast lane still splices.
         if ledger
             .provenance
             .iter()
@@ -219,7 +350,15 @@ fn continuous(
         {
             tracing::info!(reason = %HoldReason::RefHot, "L2 hold");
         }
-        return identity(bytes.clone());
+        return finish(
+            bytes,
+            body,
+            Vec::new(),
+            Vec::new(),
+            lane,
+            &BreakpointPlan::default(),
+            None,
+        );
     }
 
     let batch = SquashBatch {
@@ -250,44 +389,120 @@ fn continuous(
             body,
             segments,
             &live,
+            uncommit,
             &breakpoint_plan,
             predicted_bust,
+            lane,
         ),
         SquashDecision::RideFreeBust { .. } => apply(
             bytes,
             body,
             segments,
             &live,
+            uncommit,
             &BreakpointPlan::default(),
             Cost {
                 dollars: 0.0,
                 tokens: TokenCount(0),
             },
+            lane,
         ),
         SquashDecision::Hold { reason } => {
+            // A Hold parks the staged batch only; the fast lane still splices.
             tracing::info!(reason = %reason, "L2 hold");
-            identity(bytes.clone())
+            finish(
+                bytes,
+                body,
+                Vec::new(),
+                Vec::new(),
+                lane,
+                &BreakpointPlan::default(),
+                None,
+            )
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply(
     bytes: &Bytes,
     body: &WireBody,
     segments: &[Segment],
     live: &[(usize, &StagedEntry, SquashCandidate)],
+    uncommit: Vec<RefId>,
     breakpoint_plan: &BreakpointPlan,
     predicted_bust: Cost,
+    lane: &[LaneEntry],
 ) -> Intercepted {
     let Some(rendered) = render_segments(body, segments, live) else {
         return identity(bytes.clone());
     };
     let plan = safe_breakpoints(breakpoint_plan, &rendered);
-    match splice_and_gate(bytes, body, &rendered, &plan) {
-        Some(rewritten) => Intercepted {
-            bytes: rewritten,
-            predicted_bust: Some(predicted_bust),
-        },
+    finish(
+        bytes,
+        body,
+        rendered,
+        uncommit,
+        lane,
+        &plan,
+        Some(predicted_bust),
+    )
+}
+
+/// The single splice + commit codepath: union the fast-lane blocks into the base
+/// render (base wins a target collision), splice + gate, and on success commit the
+/// FRESH lane keys and emit `uncommit` — the committed keys the base's staged
+/// proposals rendered over (commit-on-splice-only, both directions). Emits the one
+/// per-turn fast-lane summary line.
+fn finish(
+    bytes: &Bytes,
+    body: &WireBody,
+    base: Vec<RenderedSegment>,
+    uncommit: Vec<RefId>,
+    lane: &[LaneEntry],
+    breakpoint_plan: &BreakpointPlan,
+    predicted_bust: Option<Cost>,
+) -> Intercepted {
+    let taken: HashSet<(usize, Option<usize>)> = base
+        .iter()
+        .map(|r| (r.target.message, r.target.block))
+        .collect();
+    let lane: Vec<&LaneEntry> = lane
+        .iter()
+        .filter(|e| {
+            e.rendered
+                .iter()
+                .all(|r| !taken.contains(&(r.target.message, r.target.block)))
+        })
+        .collect();
+    let rendered: Vec<RenderedSegment> = base
+        .into_iter()
+        .chain(lane.iter().flat_map(|e| e.rendered.iter().cloned()))
+        .collect();
+    if rendered.is_empty() {
+        return identity(bytes.clone());
+    }
+    match splice_and_gate(bytes, body, &rendered, breakpoint_plan) {
+        Some(rewritten) => {
+            if !lane.is_empty() {
+                tracing::info!(
+                    leaves = lane.len(),
+                    fresh = lane.iter().filter(|e| e.fresh).count(),
+                    bytes_saved = lane.iter().map(|e| e.saved).sum::<usize>(),
+                    "L2 fast-lane",
+                );
+            }
+            Intercepted {
+                bytes: rewritten,
+                predicted_bust,
+                fast_lane_committed: lane
+                    .iter()
+                    .filter(|e| e.fresh)
+                    .map(|e| e.key.clone())
+                    .collect(),
+                fast_lane_uncommitted: uncommit,
+            }
+        }
         None => identity(bytes.clone()),
     }
 }
@@ -428,17 +643,16 @@ fn render_reversible_segment<'a>(
         .collect()
 }
 
-// The single proposal-driven render: turn ONE `Strategy` arm + its target into the
-// block's replacement body text, then `placeholder_block_json` shapes it for the
-// `ReplacementKind`. `ref_marker` is the dedup-resolved ref placeholder-or-backref the
-// caller computed for the ref-backed arms (ReversibleRef, and Recode whose `ref_id` is
-// `Some`); it is unused by the inline-lossless arms. `None` body text → the segment is
-// skipped (`Keep`).
-//
-// `Truncate`/`Summarize` collapse to the ref placeholder here, matching the continuous
-// render which carries the summary in the ref marker regardless of the ladder arm.
-// DEFERRED: render `Truncate` as its kept line ranges directly (and the on-path
-// inline-lossless fast-lane that skips the ref marker entirely).
+/// The single proposal-driven render: turn ONE `Strategy` arm + its target into the
+/// block's replacement body text, then `placeholder_block_json` shapes it for the
+/// `ReplacementKind`. `ref_marker` is the dedup-resolved ref placeholder-or-backref the
+/// caller computed for the ref-backed arms (ReversibleRef, and Recode whose `ref_id` is
+/// `Some`); it is unused by the inline-lossless arms. `None` body text → the segment is
+/// skipped (`Keep`).
+///
+/// `Truncate`/`Summarize` collapse to the ref placeholder here, matching the continuous
+/// render which carries the summary in the ref marker regardless of the ladder arm.
+/// DEFERRED: render `Truncate` as its kept line ranges directly.
 fn render_proposal_text(strategy: &Strategy, ref_marker: Option<&str>) -> Option<String> {
     match strategy {
         Strategy::Keep => None,
@@ -636,6 +850,7 @@ fn deterministic_compact(
     body: &WireBody,
     segments: &[Segment],
     policy: &PolicyConfig,
+    lane: &[LaneEntry],
 ) -> Intercepted {
     let window = TokenCount(body.max_tokens);
     let just_added = segments
@@ -643,8 +858,18 @@ fn deterministic_compact(
         .map(|s| s.token_estimate)
         .unwrap_or(TokenCount(0));
     let pressure = soft_pressure(window, just_added);
+    // A budget-ladder Drop is an emergency turn the commitment survives — the
+    // un-commit set stays empty, so the key returns to its cleaned bytes afterward.
     if pressure != Pressure::OverBudget {
-        return identity(bytes.clone());
+        return finish(
+            bytes,
+            body,
+            Vec::new(),
+            Vec::new(),
+            lane,
+            &BreakpointPlan::default(),
+            None,
+        );
     }
 
     // The off-path budget-fallback ladder runs OUT of the on-path filter (its passes
@@ -690,17 +915,15 @@ fn deterministic_compact(
             })
         })
         .collect();
-    if rendered.is_empty() {
-        return identity(bytes.clone());
-    }
-
-    match splice_and_gate(bytes, body, &rendered, &BreakpointPlan::default()) {
-        Some(rewritten) => Intercepted {
-            bytes: rewritten,
-            predicted_bust: None,
-        },
-        None => identity(bytes.clone()),
-    }
+    finish(
+        bytes,
+        body,
+        rendered,
+        Vec::new(),
+        lane,
+        &BreakpointPlan::default(),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -1021,6 +1244,11 @@ mod tests {
             policy: ccs_policy::PolicyConfig::default(),
             remaining_turns: 50.0,
             hot_refs: Default::default(),
+            // Legacy-parity fixtures model a closed window and an empty commitment
+            // set, so the fast lane (which postdates the legacy oracles) stays dark.
+            fast_lane: Default::default(),
+            last_message_count: 0,
+            window_closed: true,
             staged,
             token_scale: TokenScale::default(),
             now: 1_000_000.0,
@@ -1471,19 +1699,23 @@ mod tests {
                 body,
                 segments,
                 &live,
+                Vec::new(),
                 &breakpoint_plan,
                 predicted_bust,
+                &[],
             ),
             SquashDecision::RideFreeBust { .. } => apply(
                 bytes,
                 body,
                 segments,
                 &live,
+                Vec::new(),
                 &BreakpointPlan::default(),
                 Cost {
                     dollars: 0.0,
                     tokens: TokenCount(0),
                 },
+                &[],
             ),
             SquashDecision::Hold { .. } => identity(bytes.clone()),
         }
@@ -1530,9 +1762,18 @@ mod tests {
             Some(rewritten) => Intercepted {
                 bytes: rewritten,
                 predicted_bust: None,
+                fast_lane_committed: Vec::new(),
+                fast_lane_uncommitted: Vec::new(),
             },
             None => identity(bytes.clone()),
         }
+    }
+
+    fn seg_keys(body: &WireBody, segments: &[Segment]) -> Vec<RefId> {
+        segments
+            .iter()
+            .map(|seg| content_address(&segment_payload_bytes(seg, body)))
+            .collect()
     }
 
     fn staged_for(body: &WireBody, segments: &[Segment]) -> (StagedPlan, RefId) {
@@ -1550,7 +1791,15 @@ mod tests {
         let (plan, _ref_id) = staged_for(&body, &segments);
         let inputs = inputs(Some(plan.clone()));
 
-        let new = continuous(&bytes, &body, &segments, &plan, &inputs);
+        let new = continuous(
+            &bytes,
+            &body,
+            &segments,
+            &seg_keys(&body, &segments),
+            &plan,
+            &inputs,
+            &[],
+        );
         let legacy = legacy_continuous(&bytes, &body, &segments, &plan, &inputs);
         assert_eq!(
             new.bytes, legacy.bytes,
@@ -1595,7 +1844,15 @@ mod tests {
         };
         let inputs = inputs(Some(plan.clone()));
 
-        let new = continuous(&bytes, &body, &segments, &plan, &inputs);
+        let new = continuous(
+            &bytes,
+            &body,
+            &segments,
+            &seg_keys(&body, &segments),
+            &plan,
+            &inputs,
+            &[],
+        );
         let legacy = legacy_continuous(&bytes, &body, &segments, &plan, &inputs);
         assert_eq!(
             new.bytes, legacy.bytes,
@@ -1617,7 +1874,15 @@ mod tests {
         let mut inputs = inputs(Some(plan.clone()));
         inputs.hot_refs = HashSet::from([ref_id]);
 
-        let new = continuous(&bytes, &body, &segments, &plan, &inputs);
+        let new = continuous(
+            &bytes,
+            &body,
+            &segments,
+            &seg_keys(&body, &segments),
+            &plan,
+            &inputs,
+            &[],
+        );
         let legacy = legacy_continuous(&bytes, &body, &segments, &plan, &inputs);
         assert_eq!(
             new.bytes, legacy.bytes,
@@ -1669,19 +1934,24 @@ mod tests {
         let segments = segment_prompt(&body);
         let plan = make_plan(&body, &segments);
 
+        let keys = seg_keys(&body, &segments);
         let baseline = continuous(
             &bytes,
             &body,
             &segments,
+            &keys,
             &plan,
             &cold_inputs_with_q_weight(Some(plan.clone()), 0.0),
+            &[],
         );
         let lit = continuous(
             &bytes,
             &body,
             &segments,
+            &keys,
             &plan,
             &cold_inputs_with_q_weight(Some(plan.clone()), ScoreWeights::default().q_weight),
+            &[],
         );
 
         assert!(
@@ -1806,8 +2076,10 @@ mod tests {
             &bytes,
             &body,
             &segments,
+            &seg_keys(&body, &segments),
             &plan,
             &cold_inputs_with_q_weight(Some(plan.clone()), ScoreWeights::default().q_weight),
+            &[],
         );
         assert!(
             lit.bytes.len() < bytes.len(),
@@ -1847,7 +2119,7 @@ mod tests {
         let segments = segment_prompt(&body);
         let policy = PolicyConfig::default();
 
-        let new = deterministic_compact(&bytes, &body, &segments, &policy);
+        let new = deterministic_compact(&bytes, &body, &segments, &policy, &[]);
         let legacy = legacy_deterministic_compact(&bytes, &body, &segments, &policy);
         assert_eq!(
             new.bytes, legacy.bytes,
@@ -1867,9 +2139,447 @@ mod tests {
         let segments = segment_prompt(&body);
         let policy = PolicyConfig::default();
 
-        let new = deterministic_compact(&bytes, &body, &segments, &policy);
+        let new = deterministic_compact(&bytes, &body, &segments, &policy, &[]);
         let legacy = legacy_deterministic_compact(&bytes, &body, &segments, &policy);
         assert_eq!(new.bytes, legacy.bytes, "in-budget: both forward identity");
         assert_eq!(new.bytes, bytes, "an in-budget body is untouched");
+    }
+
+    // ---- FAST-LANE: the on-path inline-lossless lane over the uncached tail ----
+
+    fn dirty_leaf() -> String {
+        "\x1b[2K\rbuilding \x1b[33m[####    ]\x1b[0m 50%   \n".repeat(40)
+    }
+
+    // Messages 1-2 are the fresh ToolPair; the trailing turn keeps it unpinned.
+    fn dirty_tail_body() -> Vec<u8> {
+        serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 200_000,
+            "messages": [
+                {"role": "user", "content": "kick off the work with a long human prompt here."},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_f", "name": "Bash", "input": {"command": "build"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_f", "content": dirty_leaf()}
+                ]},
+                {"role": "user", "content": "a trailing user turn that is current"},
+            ],
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    // A big historical assistant turn (message 1) plus a fresh dirty pair (3-4).
+    fn history_and_dirty_tail_body() -> Vec<u8> {
+        let big =
+            "the assistant produced a long, detailed historical explanation here. ".repeat(120);
+        serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 200_000,
+            "messages": [
+                {"role": "user", "content": "kick off the work"},
+                {"role": "assistant", "content": big},
+                {"role": "user", "content": "second turn"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_f", "name": "Bash", "input": {"command": "build"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_f", "content": dirty_leaf()}
+                ]},
+                {"role": "user", "content": "a trailing user turn that is current"},
+            ],
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn pair_key(body: &WireBody, segments: &[Segment]) -> RefId {
+        let pair = segments
+            .iter()
+            .find(|s| s.kind == SegmentKind::ToolPair)
+            .expect("a tool pair");
+        content_address(&segment_payload_bytes(pair, body))
+    }
+
+    // An OPEN steady-state window at `floor`.
+    fn lane_inputs(staged: Option<StagedPlan>, floor: usize) -> InterceptInputs {
+        InterceptInputs {
+            last_message_count: floor,
+            window_closed: false,
+            ..inputs(staged)
+        }
+    }
+
+    // A CLOSED window (`inputs`' default): no fresh lane entry can enter.
+    fn closed_lane_inputs(staged: Option<StagedPlan>) -> InterceptInputs {
+        inputs(staged)
+    }
+
+    fn tool_result_content(egress: &[u8], message: usize) -> String {
+        let v: serde_json::Value = serde_json::from_slice(egress).expect("egress parses");
+        v["messages"][message]["content"][0]["content"]
+            .as_str()
+            .expect("string tool_result content")
+            .to_owned()
+    }
+
+    #[test]
+    fn fast_lane_fresh_tail_cleans_uncached_tool_result() {
+        let bytes = Bytes::from(dirty_tail_body());
+        let body = parse_body(&bytes).unwrap();
+        let segments = segment_prompt(&body);
+        // No staged plan, in budget: the lane alone splices the fresh tail.
+        let out = intercept(&bytes, &lane_inputs(None, 1));
+        assert!(out.bytes.len() < bytes.len(), "the lane shrinks the body");
+        assert_eq!(
+            tool_result_content(&out.bytes, 2),
+            fast_lane_clean(&dirty_leaf()).unwrap(),
+            "the tool_result carries the D→E→A cleaned bytes",
+        );
+        assert_eq!(
+            out.fast_lane_committed,
+            vec![pair_key(&body, &segments)],
+            "a successful splice commits the fresh leaf",
+        );
+    }
+
+    #[test]
+    fn fast_lane_applies_even_on_hold() {
+        let bytes = Bytes::from(history_and_dirty_tail_body());
+        let body = parse_body(&bytes).unwrap();
+        let segments = segment_prompt(&body);
+        let (_, entry) = historical_entry(&body, &segments);
+        let plan = StagedPlan {
+            by_content: HashMap::from([(entry.rec.ref_id.clone(), entry)]),
+        };
+        // Warm cache + an unreachable NPV floor: the staged batch Holds.
+        let mut inputs = lane_inputs(Some(plan), 3);
+        inputs.npv_floor = 1e9;
+        let out = intercept(&bytes, &inputs);
+        assert_eq!(
+            tool_result_content(&out.bytes, 4),
+            fast_lane_clean(&dirty_leaf()).unwrap(),
+            "the lane splices the fresh tail even on Hold",
+        );
+        assert!(
+            String::from_utf8_lossy(&out.bytes)
+                .contains("the assistant produced a long, detailed historical explanation here."),
+            "the held staged segment stays verbatim",
+        );
+        assert_eq!(out.fast_lane_committed, vec![pair_key(&body, &segments)]);
+    }
+
+    #[test]
+    fn fast_lane_recommits_committed_leaf_inside_cached_prefix() {
+        let bytes = Bytes::from(dirty_tail_body());
+        let body = parse_body(&bytes).unwrap();
+        let segments = segment_prompt(&body);
+        let key = pair_key(&body, &segments);
+        // The window is closed, but the committed leaf re-renders every turn.
+        let mut inputs = closed_lane_inputs(None);
+        inputs.fast_lane = HashSet::from([key]);
+        let out = intercept(&bytes, &inputs);
+        assert_eq!(
+            tool_result_content(&out.bytes, 2),
+            fast_lane_clean(&dirty_leaf()).unwrap(),
+            "a committed leaf keeps rendering its cleaned bytes inside the prefix",
+        );
+        assert!(
+            out.fast_lane_committed.is_empty(),
+            "a re-render is not a fresh commit",
+        );
+    }
+
+    #[test]
+    fn fast_lane_staged_entry_takes_precedence() {
+        let bytes = Bytes::from(history_and_dirty_tail_body());
+        let body = parse_body(&bytes).unwrap();
+        let segments = segment_prompt(&body);
+        let key = pair_key(&body, &segments);
+        let plan = StagedPlan {
+            by_content: HashMap::from([(
+                key.clone(),
+                recode_entry(rec(key, 80), "staged recode content wins", None, None),
+            )]),
+        };
+        // Cold cache: the staged recode rides the free bust and applies.
+        let mut inputs = lane_inputs(Some(plan), 3);
+        inputs.cache.last_request_ts = inputs.now - inputs.cache.assumed_ttl_s - 1.0;
+        let out = intercept(&bytes, &inputs);
+        assert_eq!(
+            tool_result_content(&out.bytes, 4),
+            "staged recode content wins",
+            "the staged entry renders; the lane never shadows it",
+        );
+        assert!(
+            out.fast_lane_committed.is_empty(),
+            "a staged leaf is never lane-committed",
+        );
+    }
+
+    #[test]
+    fn fast_lane_commit_requires_successful_splice() {
+        let bytes = Bytes::from(history_and_dirty_tail_body());
+        let body = parse_body(&bytes).unwrap();
+        let segments = segment_prompt(&body);
+        let (_, historical) = historical_entry(&body, &segments);
+        // A bloated staged recode on the history: the gate rejects the whole rewrite.
+        let plan = StagedPlan {
+            by_content: HashMap::from([(
+                historical.rec.ref_id.clone(),
+                recode_entry(historical.rec.clone(), &"x".repeat(20_000), None, None),
+            )]),
+        };
+        let mut inputs = lane_inputs(Some(plan), 3);
+        inputs.cache.last_request_ts = inputs.now - inputs.cache.assumed_ttl_s - 1.0;
+        let out = intercept(&bytes, &inputs);
+        assert_eq!(out.bytes, bytes, "the gated rewrite fails open to identity");
+        assert!(
+            out.fast_lane_committed.is_empty(),
+            "a failed splice must not commit — no poisoned future turns",
+        );
+    }
+
+    // The body ends at the tool_result: the pair is the last segment → pinned.
+    fn pinned_pair_body() -> Vec<u8> {
+        serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 200_000,
+            "messages": [
+                {"role": "user", "content": "kick off the work with a long human prompt here."},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_f", "name": "Bash", "input": {"command": "build"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_f", "content": dirty_leaf()}
+                ]},
+            ],
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn fast_lane_exempts_pinned_current_tool_result() {
+        let bytes = Bytes::from(pinned_pair_body());
+        let out = intercept(&bytes, &lane_inputs(None, 1));
+        assert_eq!(
+            out.bytes, bytes,
+            "the current turn's pinned tool_result forwards verbatim",
+        );
+        assert!(out.fast_lane_committed.is_empty());
+    }
+
+    fn staged_pair_plan(key: &RefId) -> StagedPlan {
+        StagedPlan {
+            by_content: HashMap::from([(
+                key.clone(),
+                recode_entry(
+                    rec(key.clone(), 80),
+                    "staged recode content wins",
+                    None,
+                    None,
+                ),
+            )]),
+        }
+    }
+
+    #[test]
+    fn fast_lane_committed_key_rerenders_on_hold_even_when_staged() {
+        let bytes = Bytes::from(dirty_tail_body());
+        let body = parse_body(&bytes).unwrap();
+        let segments = segment_prompt(&body);
+        let key = pair_key(&body, &segments);
+        // Warm cache + an unreachable NPV floor: the staged batch Holds, so the
+        // staged bytes never render — the committed key must still re-render.
+        let mut inputs = closed_lane_inputs(Some(staged_pair_plan(&key)));
+        inputs.fast_lane = HashSet::from([key]);
+        inputs.npv_floor = 1e9;
+        let out = intercept(&bytes, &inputs);
+        assert_eq!(
+            tool_result_content(&out.bytes, 2),
+            fast_lane_clean(&dirty_leaf()).unwrap(),
+            "on Hold the committed key re-renders its lane bytes, staged or not",
+        );
+        assert!(out.fast_lane_committed.is_empty());
+        assert!(
+            out.fast_lane_uncommitted.is_empty(),
+            "a Hold never un-commits"
+        );
+    }
+
+    #[test]
+    fn fast_lane_staged_application_uncommits() {
+        let bytes = Bytes::from(history_and_dirty_tail_body());
+        let body = parse_body(&bytes).unwrap();
+        let segments = segment_prompt(&body);
+        let key = pair_key(&body, &segments);
+        // Cold cache: the staged recode rides the free bust and applies over the
+        // committed key — ownership transfers to L1's content-addressed staging.
+        let mut inputs = closed_lane_inputs(Some(staged_pair_plan(&key)));
+        inputs.fast_lane = HashSet::from([key.clone()]);
+        inputs.cache.last_request_ts = inputs.now - inputs.cache.assumed_ttl_s - 1.0;
+        let out = intercept(&bytes, &inputs);
+        assert_eq!(
+            tool_result_content(&out.bytes, 4),
+            "staged recode content wins",
+            "the staged application wins the collision",
+        );
+        assert_eq!(out.fast_lane_uncommitted, vec![key.clone()]);
+        assert!(out.fast_lane_committed.is_empty());
+
+        // Next turn simulates the post-relay state (empty commitment set): L1's
+        // re-staged entry renders and the key must not re-enter via the lane.
+        let mut inputs = closed_lane_inputs(Some(staged_pair_plan(&key)));
+        inputs.cache.last_request_ts = inputs.now - inputs.cache.assumed_ttl_s - 1.0;
+        let out = intercept(&bytes, &inputs);
+        assert_eq!(
+            tool_result_content(&out.bytes, 4),
+            "staged recode content wins"
+        );
+        assert!(
+            out.fast_lane_committed.is_empty(),
+            "the key never re-enters via the lane",
+        );
+        assert!(out.fast_lane_uncommitted.is_empty());
+    }
+
+    // The history_and_dirty_tail_body shape minus the trailing turn: the pair is
+    // conversation-final → pinned, and the history clears the min-cache floor.
+    fn history_and_pinned_pair_body() -> Vec<u8> {
+        let big =
+            "the assistant produced a long, detailed historical explanation here. ".repeat(120);
+        serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 200_000,
+            "messages": [
+                {"role": "user", "content": "kick off the work"},
+                {"role": "assistant", "content": big},
+                {"role": "user", "content": "second turn"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_f", "name": "Bash", "input": {"command": "build"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_f", "content": dirty_leaf()}
+                ]},
+            ],
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn fast_lane_staged_win_over_pinned_committed_key_uncommits() {
+        // The pair turned pinned this turn (conversation-final): fast-lane exempt,
+        // so NO lane entry exists — un-commit must come from base ∩ commitment set.
+        let bytes = Bytes::from(history_and_pinned_pair_body());
+        let body = parse_body(&bytes).unwrap();
+        let segments = segment_prompt(&body);
+        let key = pair_key(&body, &segments);
+        let mut inputs = closed_lane_inputs(Some(staged_pair_plan(&key)));
+        inputs.fast_lane = HashSet::from([key.clone()]);
+        inputs.cache.last_request_ts = inputs.now - inputs.cache.assumed_ttl_s - 1.0;
+        let out = intercept(&bytes, &inputs);
+        assert_eq!(
+            tool_result_content(&out.bytes, 4),
+            "staged recode content wins",
+            "the staged recode renders over the pinned segment",
+        );
+        assert_eq!(
+            out.fast_lane_uncommitted,
+            vec![key],
+            "the stale commitment un-commits despite no lane-entry collision",
+        );
+        assert!(out.fast_lane_committed.is_empty());
+    }
+
+    // The overbudget_body shape with the committed dirty pair early in history.
+    fn overbudget_dirty_pair_body(max_tokens: u32) -> Vec<u8> {
+        let huge_current =
+            "current turn with a very large payload that blows the budget. ".repeat(80);
+        serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "user", "content": "kick off the work for the fallback test"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_f", "name": "Bash", "input": {"command": "build"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_f", "content": dirty_leaf()}
+                ]},
+                {"role": "user", "content": "second turn here"},
+                {"role": "assistant", "content": "second reply with some content"},
+                {"role": "user", "content": "third turn here"},
+                {"role": "assistant", "content": "third reply with some content"},
+                {"role": "user", "content": huge_current},
+            ],
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn fast_lane_drop_collision_keeps_commitment() {
+        let bytes = Bytes::from(overbudget_dirty_pair_body(100));
+        let body = parse_body(&bytes).unwrap();
+        let segments = segment_prompt(&body);
+        let key = pair_key(&body, &segments);
+        let mut inputs = closed_lane_inputs(None);
+        inputs.fast_lane = HashSet::from([key.clone()]);
+        let out = intercept(&bytes, &inputs);
+        assert_eq!(
+            tool_result_content(&out.bytes, 2),
+            DROP_PLACEHOLDER,
+            "the ladder's Drop wins the emergency turn",
+        );
+        assert!(
+            out.fast_lane_uncommitted.is_empty(),
+            "a Drop collision keeps the commitment",
+        );
+
+        // The next in-budget turn: the commitment survived the emergency turn.
+        let bytes = Bytes::from(overbudget_dirty_pair_body(200_000));
+        let mut inputs = closed_lane_inputs(None);
+        inputs.fast_lane = HashSet::from([key]);
+        let out = intercept(&bytes, &inputs);
+        assert_eq!(
+            tool_result_content(&out.bytes, 2),
+            fast_lane_clean(&dirty_leaf()).unwrap(),
+            "the committed key returns to its cleaned bytes",
+        );
+    }
+
+    #[test]
+    fn new_session_window_starts_closed() {
+        let fresh = crate::session::SessionEcon::new(
+            CacheState {
+                cached_prefix_tokens: TokenCount(0),
+                last_request_ts: 0.0,
+                assumed_ttl_s: 3600.0,
+                model: ModelId::new("claude-opus-4-8"),
+                breakpoints: Vec::new(),
+            },
+            ccs_summarizer::SessionAuthContext {
+                headers: Vec::new(),
+                upstream: reqwest::Url::parse("https://api.anthropic.com").unwrap(),
+            },
+            0.0,
+            ccs_policy::PolicyConfig::default(),
+        );
+        assert!(fresh.window_closed, "the window starts closed");
+        assert_eq!(fresh.last_message_count, 0, "the floor starts at zero");
+        let bytes = Bytes::from(dirty_tail_body());
+        let mut inputs = closed_lane_inputs(None);
+        inputs.last_message_count = fresh.last_message_count;
+        inputs.window_closed = fresh.window_closed;
+        inputs.fast_lane = fresh.fast_lane;
+        let out = intercept(&bytes, &inputs);
+        assert_eq!(
+            out.bytes, bytes,
+            "no fast-lane eligibility before the first egress snapshot",
+        );
     }
 }

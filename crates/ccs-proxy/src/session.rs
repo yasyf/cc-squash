@@ -40,6 +40,17 @@ pub struct SessionEcon {
     pub policy: PolicyConfig,
     pub remaining_turns: f64,
     pub hot_refs: HashSet<RefId>,
+    /// Fast-laned leaves (by segment content address); each re-renders its cleaned
+    /// bytes every turn until the session ends. Accepted v1 CUT (follow-up to file):
+    /// in-memory only — a proxy restart loses ONLY the commitment set (one re-render
+    /// bust per committed leaf); the window floor restarts closed, so no floor bust.
+    pub fast_lane: HashSet<RefId>,
+    /// Last forwarded turn's message count — the provably-uncached window floor.
+    /// Monotonic: an egress snapshot only ever raises it.
+    pub last_message_count: usize,
+    /// Whether the fast-lane window is shut. Starts closed at birth and closes on
+    /// any uninspected forward; the next egress snapshot reopens it.
+    pub window_closed: bool,
     pub last_predicted_bust: Option<Cost>,
     pub token_scale: TokenScale,
     pub last_estimated_prefix: Option<TokenCount>,
@@ -66,6 +77,9 @@ impl SessionEcon {
             policy,
             remaining_turns: INITIAL_REMAINING_TURNS,
             hot_refs: HashSet::new(),
+            fast_lane: HashSet::new(),
+            last_message_count: 0,
+            window_closed: true,
             last_predicted_bust: None,
             token_scale: TokenScale::default(),
             last_estimated_prefix: None,

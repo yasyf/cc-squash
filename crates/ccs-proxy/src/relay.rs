@@ -73,7 +73,16 @@ pub async fn serve(state: AppState, req: Request, inspect: Inspect) -> Response 
     // inspection runs. The flag is the control plane's panic button, so reading
     // it ahead of everything keeps the relay verbatim regardless of `inspect`.
     let inspect = match state.kill.load(Ordering::Relaxed) {
-        true => Inspect::No,
+        true => {
+            // The uninspected forward still reaches upstream: close the session's
+            // fast-lane window so the stale floor can't mark it provably uncached.
+            if let Inspect::Yes(Some(token)) = &inspect {
+                if let Some(econ) = state.sessions.get(token).and_then(|ctx| ctx.econ.clone()) {
+                    close_window(&econ);
+                }
+            }
+            Inspect::No
+        }
         false => inspect,
     };
 
@@ -94,6 +103,15 @@ pub async fn serve(state: AppState, req: Request, inspect: Inspect) -> Response 
             // logging the action we would have taken. Lets the control plane
             // observe what live inspection would do before trusting it.
             Decision::Synthesize(_) if state.shadow.load(Ordering::Relaxed) => {
+                // The observe-only forward reaches upstream with no egress
+                // snapshot: close the fast-lane window like the kill switch does.
+                if let Some(econ) = token
+                    .as_ref()
+                    .and_then(|t| state.sessions.get(t))
+                    .and_then(|ctx| ctx.econ.clone())
+                {
+                    close_window(&econ);
+                }
                 tracing::info!(%method, %path, would = "synth", "shadow");
                 ("shadow", forward(&state, parts, bytes, None).await)
             }
@@ -116,19 +134,24 @@ pub async fn serve(state: AppState, req: Request, inspect: Inspect) -> Response 
                 let egress = match econ.as_ref().and_then(|e| intercept_inputs(e, now_s())) {
                     Some(inputs) => {
                         let out = intercept::run(bytes.clone(), inputs).await;
-                        if let (Some(econ), Some(predicted)) = (&econ, out.predicted_bust) {
-                            stash_predicted_bust(econ, predicted);
+                        if let Some(econ) = &econ {
+                            if let Some(predicted) = out.predicted_bust {
+                                stash_predicted_bust(econ, predicted);
+                            }
+                            commit_fast_lane(
+                                econ,
+                                out.fast_lane_committed,
+                                out.fast_lane_uncommitted,
+                            );
                         }
                         out.bytes
                     }
                     None => bytes.clone(),
                 };
-                // Stash this request's estimated prefix (over the EGRESS body —
-                // exactly what Anthropic will count) so the response's usage
-                // observation calibrates the proxy against it. Must precede
-                // `forward`, since the tap can observe before `forward` returns.
+                // Stash the EGRESS snapshot (see `stash_egress_snapshot`). Must
+                // precede `forward`: the tap can observe before it returns.
                 if let Some(econ) = &econ {
-                    stash_estimated_prefix(econ, estimate_prefix(&egress));
+                    stash_egress_snapshot(econ, &egress);
                 }
                 let response = forward(&state, parts, egress, sink).await;
                 // L1 OFF-PATH staging runs AFTER the response is forwarded — never
@@ -227,6 +250,9 @@ fn intercept_inputs(econ: &Mutex<SessionEcon>, now: f64) -> Option<InterceptInpu
             policy: guard.policy,
             remaining_turns: guard.remaining_turns,
             hot_refs: guard.hot_refs.clone(),
+            fast_lane: guard.fast_lane.clone(),
+            last_message_count: guard.last_message_count,
+            window_closed: guard.window_closed,
             staged: guard.staged.take(),
             token_scale: guard.token_scale,
             now,
@@ -244,29 +270,65 @@ fn stash_predicted_bust(econ: &Mutex<SessionEcon>, predicted: ccs_economics::Cos
     }
 }
 
-/// Stash the egress request's estimated prefix, so the response's usage observation
-/// calibrates the char-proxy against the real token count Anthropic reports. Taken
-/// and dropped under a brief synchronous lock.
-fn stash_estimated_prefix(econ: &Mutex<SessionEcon>, estimated: ccs_core::TokenCount) {
+/// Fold the Interceptor's fast-lane deltas into the session's commitment set in one
+/// post-run update: union the keys it spliced this turn and remove the keys whose
+/// target a spliced staged proposal took over — commit-on-splice-only in both
+/// directions; a failed or gated splice returns neither.
+fn commit_fast_lane(
+    econ: &Mutex<SessionEcon>,
+    committed: Vec<ccs_core::RefId>,
+    uncommitted: Vec<ccs_core::RefId>,
+) {
+    if committed.is_empty() && uncommitted.is_empty() {
+        return;
+    }
     if let Ok(mut guard) = econ.lock() {
-        guard.last_estimated_prefix = Some(estimated);
+        guard.fast_lane.extend(committed);
+        for key in &uncommitted {
+            guard.fast_lane.remove(key);
+        }
     }
 }
 
-/// The estimated prefix tokens of `body`: the sum of its segment `token_estimate`s
-/// (the raw char-proxy). A malformed body yields `0` — no estimate to calibrate
-/// against, so the observation leaves the scale untouched.
-fn estimate_prefix(body: &[u8]) -> ccs_core::TokenCount {
-    ccs_core::TokenCount(
-        ccs_policy::wire::parse_body(body)
+/// Stash the egress request's estimated prefix (the raw char-proxy the response's
+/// usage observation calibrates against) and its message count (next turn's
+/// provably-uncached floor for the L2 fast-lane), reopening the window. The floor
+/// is MONOTONIC — overlapping in-flight requests can complete out of order, and a
+/// regressed floor would make already-sent messages look provably uncached. A
+/// malformed body stashes a `0` estimate (leaves the scale untouched) and keeps
+/// the floor and window untouched — nothing new provably entered the upstream
+/// cache.
+fn stash_egress_snapshot(econ: &Mutex<SessionEcon>, body: &[u8]) {
+    let parsed = ccs_policy::wire::parse_body(body).ok();
+    let estimated = ccs_core::TokenCount(
+        parsed
+            .as_ref()
             .map(|w| {
-                ccs_policy::segment_prompt(&w)
+                ccs_policy::segment_prompt(w)
                     .iter()
                     .map(|s| s.token_estimate.get())
                     .sum()
             })
             .unwrap_or(0),
-    )
+    );
+    if let Ok(mut guard) = econ.lock() {
+        guard.last_estimated_prefix = Some(estimated);
+        if let Some(w) = &parsed {
+            guard.last_message_count = guard.last_message_count.max(w.messages.len());
+            guard.window_closed = false;
+        }
+    }
+}
+
+/// Close the fast-lane eligibility window after a turn forwarded WITHOUT
+/// inspection: bytes reached upstream with no egress snapshot, so the floor alone
+/// can't vouch for freshness. The floor stays put (a racing in-flight snapshot may
+/// only raise it); the next inspected egress reopens the window. Fail = missed
+/// opportunity, never a bust.
+fn close_window(econ: &Mutex<SessionEcon>) {
+    if let Ok(mut guard) = econ.lock() {
+        guard.window_closed = true;
+    }
 }
 
 /// Test-and-set the per-session overlap guard under a brief synchronous lock:
@@ -374,5 +436,131 @@ async fn drain(econ: Arc<Mutex<SessionEcon>>, mut rx: mpsc::Receiver<Observed>) 
         if let Ok(mut guard) = econ.lock() {
             guard.observe(observed.usage, now);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ccs_core::TokenCount;
+    use ccs_policy::PolicyConfig;
+    use ccs_refs::content_address;
+
+    fn econ() -> Mutex<SessionEcon> {
+        Mutex::new(SessionEcon::new(
+            CacheState {
+                cached_prefix_tokens: TokenCount(0),
+                last_request_ts: 0.0,
+                assumed_ttl_s: 3600.0,
+                model: ModelId::new("claude-opus-4-8"),
+                breakpoints: Vec::new(),
+            },
+            SessionAuthContext {
+                headers: Vec::new(),
+                upstream: reqwest::Url::parse("https://api.anthropic.com").unwrap(),
+            },
+            0.0,
+            PolicyConfig::default(),
+        ))
+    }
+
+    fn body(messages: usize) -> Vec<u8> {
+        serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1024,
+            "messages": (0..messages)
+                .map(|i| serde_json::json!({
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("turn {i}"),
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn stash_egress_snapshot_is_monotonic() {
+        let econ = econ();
+        stash_egress_snapshot(&econ, &body(12));
+        assert_eq!(econ.lock().unwrap().last_message_count, 12);
+        stash_egress_snapshot(&econ, &body(10));
+        assert_eq!(
+            econ.lock().unwrap().last_message_count,
+            12,
+            "an out-of-order completion never regresses the floor",
+        );
+    }
+
+    #[test]
+    fn kill_switch_passthrough_closes_window() {
+        let econ = econ();
+        stash_egress_snapshot(&econ, &body(8));
+        assert_eq!(econ.lock().unwrap().last_message_count, 8);
+        assert!(!econ.lock().unwrap().window_closed);
+        close_window(&econ);
+        {
+            let guard = econ.lock().unwrap();
+            assert!(
+                guard.window_closed,
+                "an uninspected forward closes the window"
+            );
+            assert_eq!(guard.last_message_count, 8, "the floor is untouched");
+        }
+        stash_egress_snapshot(&econ, &body(10));
+        {
+            let guard = econ.lock().unwrap();
+            assert!(
+                !guard.window_closed,
+                "the next inspected egress reopens the window"
+            );
+            assert_eq!(guard.last_message_count, 10);
+        }
+    }
+
+    #[test]
+    fn close_window_racing_inflight_snapshot_keeps_floor() {
+        // Close lands first, the pre-close in-flight snapshot second.
+        {
+            let econ = econ();
+            stash_egress_snapshot(&econ, &body(12));
+            close_window(&econ);
+            stash_egress_snapshot(&econ, &body(8));
+            let guard = econ.lock().unwrap();
+            assert_eq!(
+                guard.last_message_count, 12,
+                "the racing snapshot never regresses the floor",
+            );
+            assert!(!guard.window_closed, "the late snapshot reopens the window");
+        }
+
+        // Reverse interleaving: the close lands last.
+        {
+            let econ = econ();
+            stash_egress_snapshot(&econ, &body(12));
+            stash_egress_snapshot(&econ, &body(8));
+            close_window(&econ);
+            let guard = econ.lock().unwrap();
+            assert_eq!(guard.last_message_count, 12);
+            assert!(
+                guard.window_closed,
+                "the close lands last: the window stays shut"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_fast_lane_unions_and_removes_in_one_update() {
+        let econ = econ();
+        let (a, b) = (content_address(b"a"), content_address(b"b"));
+        commit_fast_lane(&econ, vec![a.clone()], Vec::new());
+        commit_fast_lane(&econ, vec![b.clone()], vec![a.clone()]);
+        let guard = econ.lock().unwrap();
+        assert!(
+            !guard.fast_lane.contains(&a),
+            "an un-committed key is removed"
+        );
+        assert!(guard.fast_lane.contains(&b), "a committed key is unioned");
     }
 }

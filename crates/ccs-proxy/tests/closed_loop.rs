@@ -124,6 +124,9 @@ fn session_econ(upstream: &str) -> SessionEcon {
     let mut econ = SessionEcon::new(warm_cache(), auth(upstream), 0.0, PolicyConfig::default());
     econ.intercept_enabled = true;
     econ.remaining_turns = 50.0;
+    // This suite drives L1 → L2 directly, skipping relay's egress snapshot; pin the
+    // fast-lane window shut so the staged-path proofs stay exact.
+    econ.window_closed = true;
     econ
 }
 
@@ -194,6 +197,9 @@ fn intercept_inputs(econ: &Mutex<SessionEcon>, now: f64) -> InterceptInputs {
         policy: guard.policy,
         remaining_turns: guard.remaining_turns,
         hot_refs: guard.hot_refs.clone(),
+        fast_lane: guard.fast_lane.clone(),
+        last_message_count: guard.last_message_count,
+        window_closed: guard.window_closed,
         staged: guard.staged.take(),
         token_scale: guard.token_scale,
         now,

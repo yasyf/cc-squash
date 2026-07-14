@@ -1,16 +1,21 @@
 //! Integration tests for the per-session demux: `/s/{token}/…` strips its
 //! prefix before forwarding, an unknown token fails open to passthrough rather
-//! than 404, the no-token dev path still works, and the kill switch forces pure
-//! passthrough even for a body that would otherwise synthesize.
+//! than 404, the no-token dev path still works, the kill switch forces pure
+//! passthrough even for a body that would otherwise synthesize, and a shadow
+//! forward closes the fast-lane window.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
+use ccs_economics::CacheState;
+use ccs_policy::PolicyConfig;
 use ccs_proxy::config::RelayConfig;
 use ccs_proxy::demux::{SessionCtx, SessionToken};
+use ccs_proxy::session::SessionEcon;
 use ccs_proxy::{router, AppState};
 use ccs_refs::RefStore;
+use ccs_summarizer::SessionAuthContext;
 use reqwest::Url;
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
@@ -262,6 +267,74 @@ async fn kill_switch_forces_passthrough_of_synthesizable_body() {
         .await
         .expect("recorded requests");
     assert_eq!(reqs.len(), 2, "second request also forwarded under kill");
+}
+
+#[tokio::test]
+async fn shadow_forward_closes_window() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("upstream"))
+        .mount(&upstream)
+        .await;
+    let (proxy, state) = spawn_proxy_with_state(&upstream.uri()).await;
+    register(&state, "tok-shadow");
+
+    // Seed the session with an OPEN window, as a prior inspected turn would.
+    let econ = Arc::new(Mutex::new(SessionEcon::new(
+        CacheState {
+            cached_prefix_tokens: ccs_core::TokenCount(0),
+            last_request_ts: 0.0,
+            assumed_ttl_s: 3600.0,
+            model: ccs_core::ModelId::new("claude-opus-4-8"),
+            breakpoints: Vec::new(),
+        },
+        SessionAuthContext {
+            headers: Vec::new(),
+            upstream: Url::parse(&upstream.uri()).expect("upstream url"),
+        },
+        0.0,
+        PolicyConfig::default(),
+    )));
+    {
+        let mut guard = econ.lock().expect("lock");
+        guard.last_message_count = 12;
+        guard.window_closed = false;
+    }
+    state
+        .sessions
+        .get_mut(&SessionToken("tok-shadow".to_owned()))
+        .expect("registered session")
+        .econ = Some(econ.clone());
+
+    state.shadow.store(true, Ordering::Relaxed);
+    let compact = compact_body();
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy}/s/tok-shadow/v1/messages"))
+        .body(compact.clone())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.text().await.expect("body"),
+        "upstream",
+        "shadow forwards the original upstream",
+    );
+
+    let reqs = upstream
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].body, compact, "forwarded body is the original");
+
+    let guard = econ.lock().expect("lock");
+    assert!(
+        guard.window_closed,
+        "a shadow forward closes the fast-lane window until the next inspected egress",
+    );
+    assert_eq!(guard.last_message_count, 12, "the floor is untouched");
 }
 
 #[tokio::test]

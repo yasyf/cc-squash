@@ -1,10 +1,8 @@
 //! The concrete passes. The on-path squash spine (salience gate → score →
-//! ladder-select → economics gate → anti-thrash) and the off-path budget-fallback
-//! ladder (strip-reasoning → drop-tool-pairs → drop-oldest). Composed into pipelines by
+//! ladder-select → economics gate → anti-thrash), the off-path budget-fallback
+//! ladder (strip-reasoning → drop-tool-pairs → drop-oldest), and the on-path
+//! inline-lossless fast-lane helpers ([`fast_lane`]). Composed into pipelines by
 //! [`Presets`](crate::pipeline::presets::Presets).
-//!
-//! DEFERRED passes (roadmap, not yet implemented): the on-path inline-lossless
-//! fast-lane (render lossless recodes without a ref marker).
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod ansi_strip;
@@ -12,6 +10,7 @@ pub mod anti_thrash;
 pub mod blob_extract;
 pub mod budget_fallback;
 pub mod dedup_backref;
+pub mod fast_lane;
 pub mod head_tail;
 pub mod json_minify;
 pub mod json_toon;
@@ -28,6 +27,7 @@ pub use anti_thrash::AntiThrashPass;
 pub use blob_extract::BlobExtractPass;
 pub use budget_fallback::{DropOldestPass, DropToolPairsPass, StripReasoningPass};
 pub use dedup_backref::DedupBackrefPass;
+pub use fast_lane::{fast_lane_clean, fast_lane_leaf};
 pub use head_tail::HeadTailPass;
 pub use json_minify::JsonMinifyPass;
 pub use json_toon::JsonToonPass;
