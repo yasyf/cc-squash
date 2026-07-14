@@ -15,21 +15,32 @@ use crate::record::RefRecord;
 /// model must re-fetch it from its source.
 pub const RECOVERY_HINT: &str = "original no longer stored — if it was a file Read, re-read the file; if it was command output, re-run it.";
 
+/// The egress-scan regex: TWO fully-anchored alternatives, one per emitted shape — the
+/// [`render_placeholder`] block (`… ref=<digest> · ~N tokens · M bytes]`, group 1) and the
+/// [`render_backref`] marker (`… ref=<digest>]`, group 2). Each matches its shape end-to-end,
+/// so a bare `ref=…` in prose, an over-long (65+ hex) digest, or a hybrid crossing the two
+/// prefixes and terminators can never enter GC reachability.
 fn ref_marker() -> &'static Regex {
     static REF_MARKER: OnceLock<Regex> = OnceLock::new();
-    REF_MARKER.get_or_init(|| match Regex::new(r"ref=(sha256:[0-9a-f]{64})") {
-        Ok(re) => re,
-        // Unreachable: this is a compile-time-constant valid regex literal.
-        Err(_) => unreachable!("REF_MARKER pattern is a valid regex"),
+    REF_MARKER.get_or_init(|| {
+        match Regex::new(
+            r"\[cc-squash: squashed segment · ref=(sha256:[0-9a-f]{64}) · ~[0-9]+ tokens · [0-9]+ bytes\]|\[same as earlier message · ref=(sha256:[0-9a-f]{64})\]",
+        ) {
+            Ok(re) => re,
+            // Unreachable: this is a compile-time-constant valid regex literal.
+            Err(_) => unreachable!("REF_MARKER pattern is a valid regex"),
+        }
     })
 }
 
-/// Extract every live `ref=sha256:…` reference from `text`, skipping any capture
-/// that does not parse as a [`RefId`]. The GC reachability and sticky-on scan.
+/// Extract every live ref from the `cc-squash` markers in `text` — the placeholder and
+/// backref forms alone, so a bare `ref=…` in prose (a diff header, user text) is ignored.
+/// Skips any capture that does not parse as a [`RefId`]. The GC reachability and sticky-on
+/// scan.
 pub fn extract_refs(text: &str) -> Vec<RefId> {
     ref_marker()
         .captures_iter(text)
-        .filter_map(|caps| RefId::parse(caps.get(1)?.as_str()).ok())
+        .filter_map(|caps| RefId::parse(caps.get(1).or_else(|| caps.get(2))?.as_str()).ok())
         .collect()
 }
 
@@ -87,9 +98,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_refs_finds_valid_marker() {
+    fn extract_refs_finds_real_marker_in_noise() {
         let id = content_address(b"x");
-        let text = format!("noise ref={} more noise", id.as_str());
+        let text = format!("noise {} more noise", render_backref(&id));
         assert_eq!(extract_refs(&text), vec![id]);
     }
 
@@ -101,11 +112,65 @@ mod tests {
     }
 
     #[test]
+    fn extract_refs_rejects_overlong_digest() {
+        let overlong = format!("{HEX64}0"); // 65 hex chars — malformed
+        let backref = format!("[same as earlier message · ref=sha256:{overlong}]");
+        let placeholder =
+            format!("[cc-squash: squashed segment · ref=sha256:{overlong} · ~1 tokens · 1 bytes]");
+        assert!(
+            extract_refs(&backref).is_empty(),
+            "65-hex backref must not truncate to a valid ref: {:?}",
+            extract_refs(&backref),
+        );
+        assert!(
+            extract_refs(&placeholder).is_empty(),
+            "65-hex placeholder must not truncate to a valid ref: {:?}",
+            extract_refs(&placeholder),
+        );
+    }
+
+    #[test]
+    fn extract_refs_rejects_hybrid_marker_shapes() {
+        // Cross-products the old shared-suffix regex accepted: a placeholder prefix closed
+        // like a backref, and a placeholder truncated at the digest separator.
+        let prefix_backref_close = format!("[cc-squash: squashed segment · ref=sha256:{HEX64}]");
+        let truncated_placeholder = format!("[cc-squash: squashed segment · ref=sha256:{HEX64} ·");
+        assert!(
+            extract_refs(&prefix_backref_close).is_empty(),
+            "placeholder prefix with a backref close must not match: {:?}",
+            extract_refs(&prefix_backref_close),
+        );
+        assert!(
+            extract_refs(&truncated_placeholder).is_empty(),
+            "a placeholder truncated at the separator must not match: {:?}",
+            extract_refs(&truncated_placeholder),
+        );
+    }
+
+    #[test]
     fn extract_refs_finds_multiple() {
         let a = content_address(b"a");
         let b = content_address(b"b");
-        let text = format!("ref={} and ref={}", a.as_str(), b.as_str());
+        let text = format!("{} and {}", render_backref(&a), render_backref(&b));
         assert_eq!(extract_refs(&text), vec![a, b]);
+    }
+
+    #[test]
+    fn extract_refs_ignores_bare_prose_ref() {
+        // A valid-looking `ref=sha256:…` sitting in plain prose — a seq_diff diff header,
+        // user text — must NOT extend GC reachability; only a real marker does.
+        let id = content_address(b"diff base");
+        let prose = format!(
+            "near-duplicate of the earlier Bash result mentions ref={} inline",
+            id.as_str()
+        );
+        assert!(
+            extract_refs(&prose).is_empty(),
+            "bare prose ref leaked into reachability: {:?}",
+            extract_refs(&prose),
+        );
+        // The identical id inside a real backref marker is still found.
+        assert_eq!(extract_refs(&render_backref(&id)), vec![id]);
     }
 
     #[test]
