@@ -1,1 +1,1 @@
-{"v":1,"lamport":3,"ops":[{"kind":"set_criterion_status","id":"5540dd8db3d6d06fc4590402304bf87b","status":"met"}]}
+{"v":1,"lamport":4,"ops":[{"kind":"remove_criterion","id":"ce4fba1b10744dbf1331642112170aee"}]}
