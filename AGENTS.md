@@ -18,7 +18,7 @@ cc-squash/
 
 ## Engine Layering (format-core)
 
-Byte-level format selection — which encoding is leanest for a payload — is owned by cc-context's `format-core` crate, consumed as a cargo git dependency **tag-pinned** to cc-context releases (`crates/Cargo.toml`). Token accounting and cache economics stay downstream in `ccs-economics`; never re-implement selection locally. Adopting an engine change is always a deliberate tag bump, never a silent drift — format-core's golden corpus gates its behavior upstream.
+Byte-level format selection — which encoding is leanest for a payload — is owned by cc-context's `format-core` crate, consumed as a cargo git dependency **tag-pinned** to cc-context releases (`crates/Cargo.toml`). Token accounting and cache economics stay downstream in `ccs-economics`; never re-implement selection locally. Adopting an engine change is always a deliberate tag bump; format-core's golden corpus gates its behavior upstream.
 
 ## Ask Before Assuming
 
