@@ -27,3 +27,4 @@ crates/target/
 # Release tooling
 dist/
 tap-staging/
+bin/

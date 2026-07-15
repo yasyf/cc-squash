@@ -45,7 +45,10 @@ impl Presets {
     /// the ledger by [`recode_leaf`](crate::pipeline::passes::recode::recode_leaf)), so a
     /// single leaf is progressively cleaned, then ref-encoded, in order. G runs last so
     /// both diff sides are the final rendered forms (see `seq_diff`'s ordering contract).
-    /// Every pass is `Phase::OffPath`: the chain never runs on the 50ms L2 path.
+    /// Every pass is `Phase::OffPath`: this chain never runs on the 50ms L2 path. The
+    /// on-path fast-lane composes D→E→A separately
+    /// ([`fast_lane_clean`](crate::pipeline::passes::fast_lane::fast_lane_clean)),
+    /// byte-parity-pinned against this chain's inline recodes.
     pub fn deterministic(_knobs: &PolicyConfig) -> Pipeline {
         stage(BlobExtractPass)
             >> stage(AnsiStripPass)
