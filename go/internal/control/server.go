@@ -51,7 +51,7 @@ type Server struct {
 	log       *log.Logger
 
 	seam   *proxyseam.Server
-	sup    *proc.Supervisor
+	sup    *supervisor.Supervisor
 	policy *supervisor.ProxyPolicy
 
 	// spawnProxy overrides the detached ccs-proxy spawn; nil execs the real

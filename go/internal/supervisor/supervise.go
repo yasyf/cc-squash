@@ -1,10 +1,10 @@
 // Package supervisor keeps the Rust ccs-proxy data-plane child alive at the
 // control plane's own version. The generic state machine — revive a dead child
 // under spawn backoff and a crash-loop breaker, spare an alive-but-wedged one,
-// replace a version-skewed one — is proc.Supervisor; ProxyPolicy supplies every
+// replace a version-skewed one — lives here; ProxyPolicy supplies every
 // cc-squash judgement (what "reachable" means over the proxy.sock seam, how the
 // child is shut down / waited out / killed, what to re-establish after a
-// respawn). proc owns no ticker of its own, so SuperviseLoop drives the cadence.
+// respawn). SuperviseLoop drives the cadence.
 package supervisor
 
 import (
@@ -46,7 +46,7 @@ const (
 	spawnBackoffCap  = 10 * time.Minute
 
 	// goneWait bounds the wait for a retiring proxy to release its seam after it
-	// acks shutdown, before proc reaps it.
+	// acks shutdown, before the supervisor reaps it.
 	goneWait = 10 * time.Second
 
 	// reviveBreaker is the crash-loop circuit-breaker threshold: after this many
@@ -55,12 +55,12 @@ const (
 	reviveBreaker = 3
 )
 
-// BuildSupervisor wires a proc.Supervisor for the proxy child from the given
+// BuildSupervisor wires a Supervisor for the proxy child from the given
 // spawn and policy, and Validates it — panicking on a misconfigured struct
 // (a missing Required field) exactly when the daemon wires it, rather than
 // nil-panicking deep inside a later revive or replace.
-func BuildSupervisor(spawn proc.Spawn, policy proc.Policy, myVersion string) *proc.Supervisor {
-	sup := &proc.Supervisor{
+func BuildSupervisor(spawn proc.Spawn, policy Policy, myVersion string) *Supervisor {
+	sup := &Supervisor{
 		Spawn:         spawn,
 		MyVersion:     myVersion,
 		Policy:        policy,
@@ -78,7 +78,7 @@ func BuildSupervisor(spawn proc.Spawn, policy proc.Policy, myVersion string) *pr
 // owns no ticker — the consumer drives the loop — so this is the proxy's
 // supervision heartbeat. The cadence is SuperviseInterval unless
 // CCS_SUPERVISE_INTERVAL shrinks it (test-only).
-func SuperviseLoop(ctx context.Context, sup *proc.Supervisor) {
+func SuperviseLoop(ctx context.Context, sup *Supervisor) {
 	ticker := time.NewTicker(superviseInterval())
 	defer ticker.Stop()
 	for {

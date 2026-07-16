@@ -123,11 +123,11 @@ func TestProxyPolicyReplaceSafeAlwaysClears(t *testing.T) {
 
 func TestProxyPolicyReconcileRespawnRepushes(t *testing.T) {
 	policy, _, repushed := liveSeam(t)
-	policy.Reconcile(context.Background(), proc.ReconcileEvent{Kind: proc.Respawned})
+	policy.Reconcile(context.Background(), ReconcileEvent{Kind: Respawned})
 	if got := repushed.Load(); got != 1 {
 		t.Fatalf("Respawned fired %d re-pushes, want 1", got)
 	}
-	policy.Reconcile(context.Background(), proc.ReconcileEvent{Kind: proc.ReplaceSucceeded})
+	policy.Reconcile(context.Background(), ReconcileEvent{Kind: ReplaceSucceeded})
 	if got := repushed.Load(); got != 2 {
 		t.Fatalf("ReplaceSucceeded fired %d total re-pushes, want 2", got)
 	}
@@ -138,7 +138,7 @@ func TestProxyPolicyReconcileChildDiedClearsIdentity(t *testing.T) {
 	connectChild("v9.9.9")
 	waitRegistered(t, policy)
 
-	policy.Reconcile(context.Background(), proc.ReconcileEvent{Kind: proc.ChildDied})
+	policy.Reconcile(context.Background(), ReconcileEvent{Kind: ChildDied})
 	// Identity cleared: Probe reports unreachable and Kill has no pid to target.
 	if v := policy.Probe(); v.Reachable {
 		t.Fatalf("probe reachable after ChildDied: %+v", v)
@@ -221,7 +221,7 @@ func readShutdown(t *testing.T, child net.Conn, d time.Duration) bool {
 	}
 }
 
-// TestSupervisorTickConvergesOnMatchedVersion drives a REAL proc.Supervisor.Tick
+// TestSupervisorTickConvergesOnMatchedVersion drives a real Supervisor.Tick
 // against a real registering proxy — the path the unit suite previously skipped
 // (it only drove Tick against stub Probes that never matched a registered
 // version against MyVersion). It pins the exact defect that flapped the proxy:

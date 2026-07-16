@@ -8,24 +8,24 @@ import (
 	"github.com/yasyf/fusekit/proc"
 )
 
-// stubPolicy is a minimal proc.Policy whose Probe counts ticks, so a loop test
+// stubPolicy is a minimal Policy whose Probe counts ticks, so a loop test
 // can observe SuperviseLoop driving Tick.
 type stubPolicy struct{ probes chan struct{} }
 
-func (s stubPolicy) Probe() proc.Verdict {
+func (s stubPolicy) Probe() Verdict {
 	select {
 	case s.probes <- struct{}{}:
 	default:
 	}
-	return proc.Verdict{Reachable: true, Version: "v1"}
+	return Verdict{Reachable: true, Version: "v1"}
 }
-func (stubPolicy) PeerAlive() bool                                { return true }
-func (stubPolicy) ReplaceSafe(context.Context, bool) string       { return "" }
-func (stubPolicy) Retreat(context.Context, string)                {}
-func (stubPolicy) Shutdown(context.Context) error                 { return nil }
-func (stubPolicy) WaitGone(context.Context, time.Duration) bool   { return true }
-func (stubPolicy) Kill() (int, error)                             { return 0, nil }
-func (stubPolicy) Reconcile(context.Context, proc.ReconcileEvent) {}
+func (stubPolicy) PeerAlive() bool                              { return true }
+func (stubPolicy) ReplaceSafe(context.Context, bool) string     { return "" }
+func (stubPolicy) Retreat(context.Context, string)              {}
+func (stubPolicy) Shutdown(context.Context) error               { return nil }
+func (stubPolicy) WaitGone(context.Context, time.Duration) bool { return true }
+func (stubPolicy) Kill() (int, error)                           { return 0, nil }
+func (stubPolicy) Reconcile(context.Context, ReconcileEvent)    {}
 
 func okSpawn() proc.Spawn {
 	return proc.Spawn{
@@ -57,7 +57,7 @@ func TestBuildSupervisorPanicsOnMisconfig(t *testing.T) {
 func TestSuperviseLoopStopsOnCancel(t *testing.T) {
 	// A near-zero interval would still be 10s (SuperviseInterval is a const), so
 	// this test asserts the loop EXITS promptly on cancel rather than counting
-	// ticks — the cadence itself is proc's concern, the lifecycle is ours.
+	// ticks — this test only pins prompt cancellation.
 	sup := BuildSupervisor(okSpawn(), stubPolicy{probes: make(chan struct{}, 1)}, "v1")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

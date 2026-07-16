@@ -15,8 +15,8 @@ import (
 // releases it.
 const waitGonePoll = 50 * time.Millisecond
 
-// ProxyPolicy implements proc.Policy for the Rust ccs-proxy child. The generic
-// revive/replace/breaker mechanism is proc.Supervisor's; this policy supplies
+// ProxyPolicy implements Policy for the Rust ccs-proxy child. The generic
+// revive/replace/breaker mechanism is Supervisor's; this policy supplies
 // the cc-squash judgements and child-control effects, all routed through the
 // proxy.sock seam (the data plane carries no separate health socket — the seam
 // connection IS the liveness signal). The proxy is itself the data plane, so a
@@ -69,17 +69,17 @@ func (p *ProxyPolicy) Registered() bool {
 	return p.registered && p.seam.Connected()
 }
 
-// Probe distills the seam into a proc.Verdict: reachable iff a child registered
+// Probe distills the seam into a Verdict: reachable iff a child registered
 // and its seam connection is live, reporting the registered version. The data
 // plane has no secondary readiness check, so a reachable proxy is never
 // Degraded.
-func (p *ProxyPolicy) Probe() proc.Verdict {
+func (p *ProxyPolicy) Probe() Verdict {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.registered || !p.seam.Connected() {
-		return proc.Verdict{Reachable: false}
+		return Verdict{Reachable: false}
 	}
-	return proc.Verdict{Reachable: true, Version: p.version}
+	return Verdict{Reachable: true, Version: p.version}
 }
 
 // PeerAlive reports whether the proxy's seam connection is still live — proc's
@@ -149,12 +149,12 @@ func (p *ProxyPolicy) Kill() (int, error) {
 //     sessions survive a proxy restart.
 //   - ChildDied: clear the captured pid/version so a stale identity is never
 //     reused; the next register repopulates it.
-func (p *ProxyPolicy) Reconcile(_ context.Context, ev proc.ReconcileEvent) {
+func (p *ProxyPolicy) Reconcile(_ context.Context, ev ReconcileEvent) {
 	switch ev.Kind {
-	case proc.Respawned, proc.ReplaceSucceeded:
+	case Respawned, ReplaceSucceeded:
 		p.log.Printf("proxy respawned; re-pushing live sessions")
 		p.repush()
-	case proc.ChildDied:
+	case ChildDied:
 		p.mu.Lock()
 		p.registered = false
 		p.pid = 0
