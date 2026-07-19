@@ -20,15 +20,16 @@ func newStopCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			c := control.NewClient()
-			if !c.Available() {
+			defer c.Close()
+			if !c.Available(cmd.Context()) {
 				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "cc-squash daemon not running.")
 				return nil
 			}
-			if _, err := c.Shutdown(); err != nil {
+			if err := c.Shutdown(cmd.Context()); err != nil {
 				return err
 			}
-			if !c.WaitGone(stopGoneWait) {
-				return fmt.Errorf("daemon did not release %s in time", paths.SocketPath())
+			if err := c.WaitGone(cmd.Context(), stopGoneWait); err != nil {
+				return fmt.Errorf("daemon did not release %s in time: %w", paths.SocketPath(), err)
 			}
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Stopped the daemon.")
 			return nil

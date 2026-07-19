@@ -1,44 +1,37 @@
-// Package control defines cc-squash's control-plane wire surface: the
-// newline-delimited JSON request/response the CLI sends the daemon over the
-// 0600 unix socket, the session token the daemon mints for the proxy, and the
-// port-file the daemon publishes its listening port through. It is the single
-// source of truth other packages decode against, so it carries the
-// StatusSnapshot type itself rather than forward-depending on a daemon package.
+// Package control defines cc-squash's exact business messages over daemonkit's
+// persistent session transport.
 package control
 
 import "time"
 
-// ProtocolVersion is bumped on incompatible wire changes. Additive fields stay
-// at the same version: an omitempty field a peer omits decodes as the zero
-// value, so old and new builds interoperate.
-const ProtocolVersion = 1
+// BusinessBuild is the exact cc-squash control schema identity. Release
+// identity is carried independently as daemonkit's LifecycleBuild.
+const BusinessBuild = "cc-squash.control.v2"
 
 // Op is a control request operation.
 type Op string
 
 // Recognized control request operations.
 const (
-	OpHealth   Op = "health"   // liveness + version probe
-	OpStatus   Op = "status"   // full status snapshot
-	OpMint     Op = "mint"     // mint a session token for the proxy
-	OpKill     Op = "kill"     // toggle the proxy kill switch
-	OpShadow   Op = "shadow"   // toggle proxy shadow mode
-	OpGc       Op = "gc"       // sweep the proxy's ref store to its reachable set
-	OpShutdown Op = "shutdown" // step down gracefully and release the socket
+	OpStatus Op = "status" // full status snapshot
+	OpMint   Op = "mint"   // mint a session token for the proxy
+	OpKill   Op = "kill"   // toggle the proxy kill switch
+	OpShadow Op = "shadow" // toggle proxy shadow mode
+	OpGc     Op = "gc"     // sweep the proxy's ref store to its reachable set
 )
 
-// Request is one client request (one JSON object per line).
-type Request struct {
-	Proto int  `json:"proto"`
-	Op    Op   `json:"op"`
-	On    bool `json:"on,omitempty"` // carries the kill/shadow toggle
+// EmptyRequest is the exact payload for argument-free operations.
+type EmptyRequest struct{}
+
+// ToggleRequest is the exact payload for kill and shadow operations.
+type ToggleRequest struct {
+	On bool `json:"on"`
 }
 
 // StatusSnapshot is the daemon's full status view, returned by OpStatus and
 // mirrored on disk for out-of-process readers. Layer-1 minimal; defined here so
 // other packages decode it without a forward dependency on the daemon.
 type StatusSnapshot struct {
-	Proto       int       `json:"proto"`
 	Version     string    `json:"version"`
 	GeneratedAt time.Time `json:"generated_at"`
 	ProxyPort   int       `json:"proxy_port"`
@@ -49,12 +42,10 @@ type StatusSnapshot struct {
 	Shadow      bool      `json:"shadow"`
 }
 
-// Response is one server reply (one JSON object per line).
+// Response is one business-operation reply.
 type Response struct {
-	Proto   int             `json:"proto"`
 	OK      bool            `json:"ok"`
 	Error   string          `json:"error,omitempty"`
-	Version string          `json:"version,omitempty"` // health
 	Port    int             `json:"port,omitempty"`
 	MCPPort int             `json:"mcp_port,omitempty"` // mint: the rmcp retrieve server port
 	Token   string          `json:"token,omitempty"`    // mint

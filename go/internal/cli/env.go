@@ -24,7 +24,7 @@ exports CC_SQUASH_MCP_CONFIG pointing at it; pass that file to ` + "`claude --mc
 to enable retrieve, or use ` + "`ccs run`" + ` which wires it automatically.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			resp, err := resolveMint()
+			resp, err := resolveMint(cmd.Context())
 			if err != nil {
 				return err
 			}

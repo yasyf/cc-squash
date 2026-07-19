@@ -17,7 +17,7 @@ import (
 // stable launchd program path across upgrades.
 func ccsAgent() service.Agent {
 	return service.Agent{
-		Label:         "com.yasyf.cc-squash",
+		Label:         control.DaemonRoleID,
 		Formula:       "cc-squash",
 		Args:          []string{"daemon"},
 		LogPath:       paths.LogPath(),
@@ -65,8 +65,10 @@ func newServiceCmd() *cobra.Command {
 				for _, line := range ccsAgent().StatusLines(cmd.Context()) {
 					_, _ = fmt.Fprintln(out, line)
 				}
-				if resp, err := control.NewClient().Health(); err == nil && resp.OK {
-					_, _ = fmt.Fprintf(out, "Daemon: running (%s)\n", resp.Version)
+				client := control.NewClient()
+				defer client.Close()
+				if health, err := client.Health(cmd.Context()); err == nil {
+					_, _ = fmt.Fprintf(out, "Daemon: running (%s)\n", health.Build)
 				} else {
 					_, _ = fmt.Fprintln(out, "Daemon: not responding")
 				}

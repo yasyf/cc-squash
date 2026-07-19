@@ -14,7 +14,15 @@ func newDaemonCmd() *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return control.NewServer().Run(cmd.Context())
+			role, err := control.DaemonRole()
+			if err != nil {
+				return err
+			}
+			server, err := control.NewServer(role)
+			if err != nil {
+				return err
+			}
+			return server.Run(cmd.Context())
 		},
 	}
 }

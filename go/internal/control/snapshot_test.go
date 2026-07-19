@@ -11,7 +11,6 @@ import (
 func TestStatusRoundTrip(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	want := StatusSnapshot{
-		Proto:       ProtocolVersion,
 		Version:     "1.2.3",
 		GeneratedAt: time.Unix(1_700_000_000, 0).UTC(),
 		ProxyPort:   50516,
@@ -34,7 +33,7 @@ func TestStatusRoundTrip(t *testing.T) {
 
 func TestWriteStatusPerm0600(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	if err := WriteStatus(StatusSnapshot{Proto: ProtocolVersion}); err != nil {
+	if err := WriteStatus(StatusSnapshot{}); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	info, err := os.Stat(paths.StatusPath())

@@ -1,34 +1,27 @@
-// Package paths names every leaf of cc-squash's private state directory
-// (~/.cc-squash), the single source of truth the daemon, CLI, and proxy share
-// for socket, port-file, log, status, config, and lock locations.
+// Package paths names cc-squash's product-specific state beside daemonkit's
+// canonical daemon state, socket, log, and lock paths.
 package paths
 
 import (
-	"fmt"
-	"os"
 	"path/filepath"
+
+	dkpaths "github.com/yasyf/daemonkit/paths"
 )
 
-func stateDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		panic(fmt.Errorf("resolve home dir: %w", err))
-	}
-	return filepath.Join(home, ".cc-squash")
-}
+var daemon = dkpaths.Paths{App: ".cc-squash"}
 
 func path(leaf string) string {
-	return filepath.Join(stateDir(), leaf)
+	return filepath.Join(daemon.StateDir(), leaf)
 }
 
 // StateDir is the absolute path of the state directory (~/.cc-squash).
 func StateDir() string {
-	return stateDir()
+	return daemon.StateDir()
 }
 
 // SocketPath is the daemon's control-plane unix socket.
 func SocketPath() string {
-	return path("daemon.sock")
+	return daemon.SocketPath()
 }
 
 // PortFilePath is the file holding the daemon's listening port.
@@ -48,7 +41,7 @@ func RefsDbPath() string {
 
 // LogPath is the daemon's log file.
 func LogPath() string {
-	return path("daemon.log")
+	return daemon.LogPath()
 }
 
 // StatusPath is the out-of-process status mirror a status command reads.
@@ -63,8 +56,14 @@ func ConfigPath() string {
 
 // LocksDir holds the daemon's lock files.
 func LocksDir() string {
-	return path("locks")
+	return daemon.LockDir()
 }
+
+// StartLockPath serializes daemonkit cold-start and upgrade attempts.
+func StartLockPath() string { return daemon.StartLockPath() }
+
+// ProcessStorePath is daemonkit's durable process identity and receipt ledger.
+func ProcessStorePath() string { return path("processes.db") }
 
 // BinDir holds binaries the daemon manages (the ccs-proxy child).
 func BinDir() string {
@@ -73,5 +72,8 @@ func BinDir() string {
 
 // EnsureStateDir creates the state directory (0700) if it does not exist.
 func EnsureStateDir() error {
-	return os.MkdirAll(stateDir(), 0o700)
+	return daemon.EnsureStateDir()
 }
+
+// EnsureLockDir creates daemonkit's launch serialization directory.
+func EnsureLockDir() error { return daemon.EnsureLockDir() }

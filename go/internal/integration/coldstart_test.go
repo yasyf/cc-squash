@@ -141,6 +141,7 @@ func newHarness(t *testing.T) *harness {
 		ccs:  ccsBin,
 		env: append(os.Environ(),
 			"HOME="+home,
+			"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
 			"CCS_SUPERVISE_INTERVAL="+superviseInterval.String(),
 		),
 	}

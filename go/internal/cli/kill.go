@@ -32,7 +32,9 @@ straight through untouched; with it off cc-squash's compaction is active.
 			if err != nil {
 				return err
 			}
-			resp, err := control.NewClient().Kill(on)
+			client := control.NewClient()
+			defer client.Close()
+			resp, err := client.Kill(cmd.Context(), on)
 			if err != nil {
 				return err
 			}

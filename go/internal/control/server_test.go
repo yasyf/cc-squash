@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -14,12 +15,24 @@ import (
 	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
 	"github.com/yasyf/cc-squash/go/internal/version"
+	"github.com/yasyf/daemonkit/daemonrole"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/wire"
 )
 
 // quietLogger discards daemon diagnostics so a test run stays clean.
 func quietLogger(t *testing.T) *log.Logger {
 	t.Helper()
 	return log.New(io.Discard, "", 0)
+}
+
+func testDaemonRole(t *testing.T) daemonrole.Classifier {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test executable: %v", err)
+	}
+	return daemonrole.Classifier{RoleID: DaemonRoleID, RolePath: filepath.Clean(executable)}
 }
 
 // fakeProxy is a stand-in for the Rust ccs-proxy child: it dials proxy.sock once
@@ -61,13 +74,18 @@ func (f *fakeProxy) connect(t *testing.T) error {
 	if err != nil {
 		return err
 	}
-	if _, err := conn.Write(frame); err != nil {
-		return err
-	}
 	f.mu.Lock()
 	f.conn = conn
 	f.reader = bufio.NewReader(conn)
 	f.mu.Unlock()
+	if _, err := conn.Write(frame); err != nil {
+		f.mu.Lock()
+		f.conn = nil
+		f.reader = nil
+		f.mu.Unlock()
+		_ = conn.Close()
+		return err
+	}
 	return nil
 }
 
@@ -187,7 +205,10 @@ func waitSocketUp(socket string, d time.Duration) bool {
 func newServerWithProxy(t *testing.T, f *fakeProxy) *Server {
 	t.Helper()
 	shortHome(t)
-	srv := NewServer()
+	srv, err := NewServer(testDaemonRole(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
 	srv.log = quietLogger(t)
 	if f != nil {
 		// Register at the daemon's own version so the supervisor reads the proxy as
@@ -213,7 +234,8 @@ func TestServerColdStartMint(t *testing.T) {
 	startServer(t, srv)
 
 	c := NewClient()
-	resp, err := c.Mint()
+	t.Cleanup(func() { _ = c.Close() })
+	resp, err := c.Mint(t.Context())
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -245,7 +267,9 @@ func TestServerMintReturnsMCPPort(t *testing.T) {
 	srv := newServerWithProxy(t, f)
 	startServer(t, srv)
 
-	resp, err := NewClient().Mint()
+	client := NewClient()
+	t.Cleanup(func() { _ = client.Close() })
+	resp, err := client.Mint(t.Context())
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -257,7 +281,7 @@ func TestServerMintReturnsMCPPort(t *testing.T) {
 	}
 
 	// The status snapshot mirrors the recorded mcp_port too.
-	st, err := NewClient().Status()
+	st, err := client.Status(t.Context())
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
@@ -286,7 +310,9 @@ func TestServerGcForwardsFrame(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	resp, err := NewClient().Gc()
+	client := NewClient()
+	t.Cleanup(func() { _ = client.Close() })
+	resp, err := client.Gc(t.Context())
 	if err != nil {
 		t.Fatalf("gc: %v", err)
 	}
@@ -312,7 +338,9 @@ func TestServerMintCarriesConfig(t *testing.T) {
 	writeTestConfig(t, "[economics]\nnpv_floor = 0.25\n")
 	startServer(t, srv)
 
-	if _, err := NewClient().Mint(); err != nil {
+	client := NewClient()
+	t.Cleanup(func() { _ = client.Close() })
+	if _, err := client.Mint(t.Context()); err != nil {
 		t.Fatalf("mint: %v", err)
 	}
 	mint, err := f.readMintFrame()
@@ -341,26 +369,27 @@ func TestServerProtocolRoundTrips(t *testing.T) {
 	srv := newServerWithProxy(t, f)
 	startServer(t, srv)
 	c := NewClient()
+	t.Cleanup(func() { _ = c.Close() })
 
 	t.Run("health", func(t *testing.T) {
-		resp, err := c.Health()
+		health, err := c.Health(t.Context())
 		if err != nil {
 			t.Fatalf("health: %v", err)
 		}
-		if !resp.OK || resp.Version == "" {
-			t.Fatalf("health resp = %+v", resp)
+		if health.Build != version.String() {
+			t.Fatalf("health = %+v", health)
 		}
 	})
 
 	t.Run("status", func(t *testing.T) {
 		// Mint first so the snapshot reflects a session and the proxy port.
-		if _, err := c.Mint(); err != nil {
+		if _, err := c.Mint(t.Context()); err != nil {
 			t.Fatalf("mint: %v", err)
 		}
 		if _, err := f.readMint(); err != nil {
 			t.Fatalf("drain mint: %v", err)
 		}
-		resp, err := c.Status()
+		resp, err := c.Status(t.Context())
 		if err != nil {
 			t.Fatalf("status: %v", err)
 		}
@@ -376,7 +405,7 @@ func TestServerProtocolRoundTrips(t *testing.T) {
 	})
 
 	t.Run("kill", func(t *testing.T) {
-		resp, err := c.Kill(true)
+		resp, err := c.Kill(t.Context(), true)
 		if err != nil {
 			t.Fatalf("kill: %v", err)
 		}
@@ -386,7 +415,7 @@ func TestServerProtocolRoundTrips(t *testing.T) {
 	})
 
 	t.Run("shadow", func(t *testing.T) {
-		resp, err := c.Shadow(true)
+		resp, err := c.Shadow(t.Context(), true)
 		if err != nil {
 			t.Fatalf("shadow: %v", err)
 		}
@@ -396,12 +425,8 @@ func TestServerProtocolRoundTrips(t *testing.T) {
 	})
 
 	t.Run("unknown-op", func(t *testing.T) {
-		resp, err := (&Client{socket: srv.socket}).do(Request{Op: "bogus"}, 2*time.Second)
-		if err != nil {
-			t.Fatalf("do: %v", err)
-		}
-		if resp.OK {
-			t.Fatalf("unknown op replied OK: %+v", resp)
+		if _, err := c.call(t.Context(), Op("bogus"), EmptyRequest{}, 2*time.Second); err == nil {
+			t.Fatal("unknown op unexpectedly succeeded")
 		}
 	})
 }
@@ -418,7 +443,9 @@ func TestServerMintDemux(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			resp, err := NewClient().Mint()
+			client := NewClient()
+			defer client.Close()
+			resp, err := client.Mint(t.Context())
 			if err != nil {
 				t.Errorf("mint: %v", err)
 				return
@@ -448,7 +475,10 @@ func TestServerSeamFailOpen(t *testing.T) {
 	// A daemon whose proxy NEVER registers: spawnProxy returns nil without
 	// connecting, so the seam stays empty.
 	shortHome(t)
-	srv := NewServer()
+	srv, err := NewServer(testDaemonRole(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
 	srv.log = quietLogger(t)
 	srv.spawnProxy = func() error { return nil }
 	srv.mintTimeout = 200 * time.Millisecond
@@ -457,7 +487,9 @@ func TestServerSeamFailOpen(t *testing.T) {
 	// OpMint must not hang past the ready timeout, and with no proxy port known
 	// it must reply with a graceful error rather than wedging the daemon.
 	start := time.Now()
-	resp, err := NewClient().Mint()
+	client := NewClient()
+	t.Cleanup(func() { _ = client.Close() })
+	resp, err := client.Mint(t.Context())
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -472,25 +504,117 @@ func TestServerSeamFailOpen(t *testing.T) {
 	}
 
 	// The daemon is still alive: Health answers immediately.
-	if h, err := NewClient().Health(); err != nil || !h.OK {
-		t.Fatalf("daemon wedged after a fail-open mint: resp=%+v err=%v", h, err)
+	if health, err := client.Health(t.Context()); err != nil || health.Build != version.String() {
+		t.Fatalf("daemon wedged after a fail-open mint: health=%+v err=%v", health, err)
 	}
 }
 
-func TestServerSingleEntrant(t *testing.T) {
+func TestServerSameReleaseDoesNotReplaceLivePeer(t *testing.T) {
 	f := &fakeProxy{port: 50800, pid: 11}
 	first := newServerWithProxy(t, f)
 	startServer(t, first)
 
-	// A second daemon under the SAME HOME races the bound socket. Its evict
-	// closure probes the live first daemon, sees the same version, and refuses to
-	// bind.
-	second := NewServer()
+	second, err := NewServer(testDaemonRole(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
 	second.log = quietLogger(t)
 	second.spawnProxy = func() error { return nil }
-	err := second.Run(context.Background())
-	if err == nil {
-		t.Fatal("second daemon bound the socket; single-entrant guard failed")
+	if err := second.Run(context.Background()); err != nil {
+		t.Fatalf("same-release contender: %v", err)
+	}
+	client := NewClient()
+	t.Cleanup(func() { _ = client.Close() })
+	if health, err := client.Health(t.Context()); err != nil || health.PID == 0 {
+		t.Fatalf("incumbent unavailable after contender: health=%+v err=%v", health, err)
+	}
+}
+
+func TestServerRejectsWrongBusinessBuildBeforeDispatch(t *testing.T) {
+	server := newServerWithProxy(t, &fakeProxy{port: 50810, pid: 12})
+	startServer(t, server)
+	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
+		Dial: wire.UnixDialer(server.socket), Build: "cc-squash.control.wrong",
+	})
+	if err != nil {
+		t.Fatalf("wrong business build handshake: %v", err)
+	}
+	defer client.Close()
+	result, err := client.Call(t.Context(), wire.Op(OpStatus), "", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("wrong business build call: %v", err)
+	}
+	if result.Outcome != wire.Rejected || result.Response.Reason != wire.ErrBuildMismatch.Error() {
+		t.Fatalf("wrong business build result = %#v", result)
+	}
+}
+
+func TestActivationAcknowledgesRetiredProxyReceiptAfterDerivedStateCleanup(t *testing.T) {
+	shortHome(t)
+	if err := paths.EnsureStateDir(); err != nil {
+		t.Fatalf("ensure state: %v", err)
+	}
+	if err := WriteStatus(StatusSnapshot{Version: "retired"}); err != nil {
+		t.Fatalf("seed status: %v", err)
+	}
+	if err := WritePort(50999); err != nil {
+		t.Fatalf("seed port: %v", err)
+	}
+	boot, err := proc.BootID()
+	if err != nil {
+		t.Fatalf("boot identity: %v", err)
+	}
+	store := &proc.FileStore{Path: paths.ProcessStorePath()}
+	if err := store.Add(t.Context(), proc.Record{
+		RecoveryClass: proc.RecoveryTask,
+		PID:           2_000_000_000, StartTime: "retired", Boot: boot, Comm: "ccs-proxy",
+		Generation: "retired-generation",
+	}); err != nil {
+		t.Fatalf("seed retired proxy record: %v", err)
+	}
+	server, err := NewServer(testDaemonRole(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	server.log = quietLogger(t)
+	server.spawnProxy = func() error { return nil }
+	startServer(t, server)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_, statusErr := os.Stat(paths.StatusPath())
+		_, portErr := os.Stat(paths.PortFilePath())
+		if os.IsNotExist(statusErr) && os.IsNotExist(portErr) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retired derived state was not cleared: status=%v port=%v", statusErr, portErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(paths.StatusPath()); !os.IsNotExist(err) {
+		t.Fatalf("retired status still present: %v", err)
+	}
+	if _, err := os.Stat(paths.PortFilePath()); !os.IsNotExist(err) {
+		t.Fatalf("retired port still present: %v", err)
+	}
+	var page proc.ReapReceiptPage
+	for {
+		page, err = store.LoadReapReceipts(
+			t.Context(), proc.RecoveryTask, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit,
+		)
+		if err != nil {
+			t.Fatalf("read receipt ledger: %v", err)
+		}
+		if page.Floor.Sequence == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("receipt acknowledgement did not commit: %+v", page)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(page.Receipts) != 0 || page.Floor.Sequence != 1 {
+		t.Fatalf("receipt page after activation = %+v", page)
 	}
 }
 
@@ -531,6 +655,7 @@ func TestServerKillReflectedInStatusFile(t *testing.T) {
 	srv := newServerWithProxy(t, f)
 	startServer(t, srv)
 	c := NewClient()
+	t.Cleanup(func() { _ = c.Close() })
 
 	// Wait for the cold-start register so status.json exists with kill=off,
 	// then drain the register's effect by reading the first status.
@@ -548,21 +673,21 @@ func TestServerKillReflectedInStatusFile(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if _, err := c.Kill(true); err != nil {
+	if _, err := c.Kill(t.Context(), true); err != nil {
 		t.Fatalf("kill on: %v", err)
 	}
 	if snap, err := ReadStatus(); err != nil || !snap.Kill {
 		t.Fatalf("status.json kill = %v (err %v) after `kill on`, want true", snap.Kill, err)
 	}
 
-	if _, err := c.Shadow(true); err != nil {
+	if _, err := c.Shadow(t.Context(), true); err != nil {
 		t.Fatalf("shadow on: %v", err)
 	}
 	if snap, err := ReadStatus(); err != nil || !snap.Shadow {
 		t.Fatalf("status.json shadow = %v (err %v) after `shadow on`, want true", snap.Shadow, err)
 	}
 
-	if _, err := c.Kill(false); err != nil {
+	if _, err := c.Kill(t.Context(), false); err != nil {
 		t.Fatalf("kill off: %v", err)
 	}
 	snap, err := ReadStatus()
@@ -579,7 +704,7 @@ func TestServerKillReflectedInStatusFile(t *testing.T) {
 }
 
 // TestServerShutdownStepsDownProxy is the BUG B regression: an intentional
-// daemon shutdown (ctx cancellation, the OpShutdown / SIGTERM teardown path)
+// daemon shutdown (context cancellation, lifecycle shutdown, or SIGTERM)
 // must send the proxy an explicit seam Shutdown frame so `ccs stop` takes the
 // proxy down with the daemon — not leave it orphaned on a bare seam drop.
 func TestServerShutdownStepsDownProxy(t *testing.T) {

@@ -78,14 +78,18 @@ func (s *Server) Start(ctx context.Context, onRegister func(Register)) {
 			continue
 		}
 		s.setConn(conn)
-		s.serveConn(conn, onRegister)
+		s.serveConn(ctx, conn, onRegister)
 	}
 }
 
 // Close closes the listener and any live child connection.
 func (s *Server) Close() error {
 	s.clearConn()
-	return s.ln.Close()
+	err := s.ln.Close()
+	if errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 // Connected reports whether a proxy child connection is currently live — the
@@ -100,7 +104,16 @@ func (s *Server) Connected() bool {
 // serveConn reads frames from one child until it disconnects: the register
 // frame first (delivered to onRegister), then any further frames (logged and
 // ignored at Layer 1). A malformed line is logged and skipped, never fatal.
-func (s *Server) serveConn(conn net.Conn, onRegister func(Register)) {
+func (s *Server) serveConn(ctx context.Context, conn net.Conn, onRegister func(Register)) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	defer close(done)
 	defer s.clearConn()
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {

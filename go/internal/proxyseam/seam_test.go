@@ -181,6 +181,37 @@ func TestServerSurvivesChildReconnect(t *testing.T) {
 	}
 }
 
+func TestServerCancellationClosesConnectedChild(t *testing.T) {
+	srv := newTestServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		srv.Start(ctx, func(Register) {})
+		close(done)
+	}()
+
+	conn := dialChild(t)
+	if err := waitConnected(srv); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return after cancellation with a connected child")
+	}
+	if err := waitDisconnected(srv); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("connected child remained readable after cancellation")
+	}
+}
+
 // waitConnected polls until the server has a live child connection (Start runs
 // asynchronously, so a dial returns before serveConn registers the conn) or a
 // short deadline elapses.

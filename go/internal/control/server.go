@@ -2,16 +2,15 @@ package control
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"os"
-	"os/signal"
 	"strconv"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/config"
@@ -19,12 +18,13 @@ import (
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
 	"github.com/yasyf/cc-squash/go/internal/supervisor"
 	"github.com/yasyf/cc-squash/go/internal/version"
+	dkdaemon "github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/daemonrole"
+	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/proc"
+	dksupervise "github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/wire"
 )
-
-// evictTimeout bounds how long a starting daemon waits for a version-skewed peer
-// to release the socket after being told to step down.
-const evictTimeout = 5 * time.Second
 
 // mintReadyTimeout bounds how long OpMint waits for a cold-started proxy to
 // register before it falls open and replies with whatever it knows.
@@ -41,18 +41,20 @@ const proxyStartupGrace = 5 * time.Second
 // returns and the seam Close drops the connection.
 const proxyShutdownGrace = 3 * time.Second
 
-// Server is the cc-squash control-plane daemon: it binds the control socket
-// (single-entrant under a flock), binds the proxy.sock seam, spawns and
-// supervises the Rust ccs-proxy data plane, and answers the CLI's
-// newline-delimited JSON requests.
+// Server is the cc-squash product control plane. Daemonkit owns its listener,
+// lifecycle, transport, admission, process identities, and reaping.
 type Server struct {
 	socket    string
 	proxySock string
 	log       *log.Logger
+	role      daemonrole.Classifier
 
-	seam   *proxyseam.Server
-	sup    *supervisor.Supervisor
-	policy *supervisor.ProxyPolicy
+	seam    *proxyseam.Server
+	sup     *supervisor.Supervisor
+	policy  *supervisor.ProxyPolicy
+	spawner *proxySpawner
+	pool    *dksupervise.Pool
+	reaper  *proc.Reaper
 
 	// spawnProxy overrides the detached ccs-proxy launch in tests; production
 	// delegates launch, process limits, and reaping to daemonkit.
@@ -61,11 +63,6 @@ type Server struct {
 	// mintTimeout bounds OpMint's wait for a cold-started proxy to register; zero
 	// means mintReadyTimeout. Tests shrink it to pin the fail-open path fast.
 	mintTimeout time.Duration
-
-	// triggerShutdown cancels serve's context, ending the daemon. Set once in
-	// serve before the accept loop starts; the go-statement that spawns each
-	// handler establishes the happens-before, so handlers read it without a lock.
-	triggerShutdown context.CancelFunc
 
 	// relayConfig is the seam JSON parsed from config.toml once at daemon start
 	// and pushed verbatim with every mint. Set in serve before the accept loop or
@@ -92,121 +89,251 @@ type Server struct {
 	shadow    bool
 }
 
-// NewServer returns a control-plane daemon bound to the default socket paths,
-// logging to stderr.
-func NewServer() *Server {
+// NewServer returns a control-plane daemon for one exact stable executable role.
+func NewServer(role daemonrole.Classifier) (*Server, error) {
+	if err := role.Validate(); err != nil {
+		return nil, fmt.Errorf("validate cc-squash daemon role: %w", err)
+	}
 	return &Server{
 		socket:     paths.SocketPath(),
 		proxySock:  paths.ProxySocketPath(),
 		log:        log.New(os.Stderr, "[cc-squash] ", log.LstdFlags),
+		role:       role,
 		proxyReady: make(chan struct{}),
 		tokens:     map[Token]struct{}{},
-	}
+	}, nil
 }
 
-// Run is the entry point for `ccs daemon`. It blocks until the process is
-// signalled or told to step down over the socket.
+// Run is the entry point for `ccs daemon`.
 func (s *Server) Run(ctx context.Context) error {
-	return s.serve(ctx)
-}
-
-func (s *Server) serve(ctx context.Context) error {
-	if err := paths.EnsureStateDir(); err != nil {
-		return err
-	}
-	ln, lock, err := s.listen(ctx)
+	wireServer, runtime, err := s.runtime()
 	if err != nil {
 		return err
 	}
-	// The flock on lock is the cross-process guarantee that only this daemon may
-	// stale-check, remove, bind, or unlink the socket. It must outlive the
-	// listener (Close releases it), so this defer is registered first and runs
-	// last.
-	defer func() { _ = lock.Close() }()
-	// closeListener unlinks the socket exactly once. *net.UnixListener.Close
-	// unlinks by PATH and is NOT idempotent: a second Close would delete a
-	// successor daemon's freshly-bound socket. The sync.Once pins the unlink to
-	// the first close, at ctx-cancel time. No explicit os.Remove for the same
-	// reason; the lock file is never removed either.
-	var closeOnce sync.Once
-	closeListener := func() { closeOnce.Do(func() { _ = ln.Close() }) }
-	defer closeListener()
+	wireServer.RegisterLifecycle(runtime)
+	err = runtime.Run(ctx)
+	if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		return nil
+	}
+	return err
+}
 
-	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	// stop cancels ctx, so it doubles as the over-the-socket shutdown trigger
-	// (OpShutdown). Set before the accept loop spawns any handler.
-	s.triggerShutdown = stop
+func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
+	if err := paths.EnsureStateDir(); err != nil {
+		return nil, nil, err
+	}
+	if err := paths.EnsureLockDir(); err != nil {
+		return nil, nil, err
+	}
+	var generation [16]byte
+	if _, err := rand.Read(generation[:]); err != nil {
+		return nil, nil, fmt.Errorf("generate process generation: %w", err)
+	}
+	s.reaper = &proc.Reaper{
+		Store:      &proc.FileStore{Path: paths.ProcessStorePath()},
+		Generation: hex.EncodeToString(generation[:]),
+	}
+	pool, err := dksupervise.NewPool(1, s.reaper)
+	if err != nil {
+		return nil, nil, err
+	}
+	s.pool = pool
+	wireServer := &wire.Server{
+		Build: BusinessBuild, LifecycleBuild: version.String(),
+		ReservedProtectedSessions: 1, ProtectedSessionClassifier: s.role,
+	}
+	s.registerHandlers(wireServer)
+	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
+		Dial: wire.UnixDialer(s.socket), Build: BusinessBuild, LifecycleBuild: version.String(),
+	}}
+	workers := &runtimeWorkers{server: s, pool: pool}
+	runtime, err := dkdaemon.NewRuntime(dkdaemon.RuntimeConfig{
+		Socket: s.socket, Build: version.String(), Protocol: int(wire.ProtocolVersion),
+		Peer: peer, Contract: dkdaemon.RequestDaemon, WaitMode: dkdaemon.PIDExit,
+		Admission: &drain.Intake{}, Server: wireServer, Workers: workers,
+		State: runtimeState{}, Resources: runtimeResources{server: s, peer: peer},
+		Activate: func(activation dkdaemon.Activation) error {
+			return s.activate(activation, workers)
+		},
+	})
+	if err != nil {
+		pool.Close()
+		pool.Cancel()
+		_ = pool.Wait(context.Background())
+		_ = peer.Close()
+		return nil, nil, err
+	}
+	return wireServer, runtime, nil
+}
 
-	// Load the relay config once, before any goroutine that pushes a mint spawns.
-	// Fail-open: a missing or malformed config.toml degrades to {} (engine
-	// defaults) and is logged, never blocks minting.
+func (s *Server) activate(activation dkdaemon.Activation, workers *runtimeWorkers) error {
+	if err := s.pool.Recover(activation.Startup); err != nil {
+		return err
+	}
+	if _, err := s.reaper.RecoverReapReceipts(
+		activation.Startup,
+		proc.RecoveryTask,
+		func(context.Context, proc.ReapReceipt) error { return clearRetiredProxyState() },
+	); err != nil {
+		return fmt.Errorf("settle retired proxy receipts: %w", err)
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		s.log.Printf("config: load failed, pushing engine defaults: %v", err)
 		cfg = json.RawMessage("{}")
 	}
 	s.relayConfig = cfg
-
-	// Bind the proxy.sock seam BEFORE spawning the child, so the child has
-	// something to connect to the instant it binds its TCP port.
 	seam, err := proxyseam.NewServer(s.log)
 	if err != nil {
 		return err
 	}
 	s.seam = seam
-	defer func() { _ = seam.Close() }()
-	s.policy = supervisor.NewProxyPolicy(seam, s.repushTokens, s.log)
-
-	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
-
-	// Post-bind latency rule: bind and start accepting FIRST so Health/Mint
-	// answer instantly, then defer the heavy bring-up (spawn the proxy, await its
-	// register, build the supervisor, drive the supervise loop) to a goroutine
-	// launched after the listener is up.
-	s.wg.Add(1)
+	workerCtx, cancel := context.WithCancel(activation.Lifetime)
+	workers.setCancel(cancel)
+	spawner := &proxySpawner{server: s, pool: s.pool}
+	s.spawner = spawner
+	s.policy = supervisor.NewProxyPolicy(seam, s.repushTokens, spawner.Stop, s.log)
+	s.log.Printf("daemon %s activated; socket=%s", version.String(), s.socket)
+	s.wg.Add(2)
 	go func() {
 		defer s.wg.Done()
-		s.bringUp(ctx)
+		seam.Start(workerCtx, s.onRegister)
 	}()
-
-	// Break the accept loop on shutdown.
 	go func() {
-		<-ctx.Done()
-		closeListener()
+		defer s.wg.Done()
+		s.bringUp(workerCtx)
 	}()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				break
-			}
-			s.log.Printf("accept: %v", err)
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		s.wg.Add(1)
-		go func() { defer s.wg.Done(); s.handle(ctx, conn) }()
-	}
-
-	s.wg.Wait()
-	s.shutdownProxy()
-	s.log.Printf("daemon stopped")
 	return nil
+}
+
+func clearRetiredProxyState() error {
+	var errs []error
+	for _, path := range []string{paths.PortFilePath(), paths.StatusPath()} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Server) registerHandlers(server *wire.Server) {
+	server.RegisterConcurrent(wire.Op(OpStatus), func(_ context.Context, request wire.Request) (any, error) {
+		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
+			return nil, err
+		}
+		snapshot := s.snapshot()
+		return Response{OK: true, Status: &snapshot}, nil
+	})
+	server.RegisterConcurrent(wire.Op(OpMint), func(ctx context.Context, request wire.Request) (any, error) {
+		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
+			return nil, err
+		}
+		return s.handleMint(ctx), nil
+	})
+	server.RegisterConcurrent(wire.Op(OpKill), func(_ context.Context, request wire.Request) (any, error) {
+		var message ToggleRequest
+		if err := decodeBusinessRequest(request, &message); err != nil {
+			return nil, err
+		}
+		return s.handleKill(message.On), nil
+	})
+	server.RegisterConcurrent(wire.Op(OpShadow), func(_ context.Context, request wire.Request) (any, error) {
+		var message ToggleRequest
+		if err := decodeBusinessRequest(request, &message); err != nil {
+			return nil, err
+		}
+		return s.handleShadow(message.On), nil
+	})
+	server.RegisterConcurrent(wire.Op(OpGc), func(_ context.Context, request wire.Request) (any, error) {
+		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
+			return nil, err
+		}
+		return s.handleGc(), nil
+	})
+}
+
+func decodeBusinessRequest(request wire.Request, target any) error {
+	if request.Tenant != "" {
+		return errors.New("cc-squash control requests do not carry a tenant")
+	}
+	return decodeStrict(request.Payload, target)
+}
+
+type runtimeState struct{}
+
+func (runtimeState) Close() error { return nil }
+
+type runtimeResources struct {
+	server *Server
+	peer   *wire.LifecyclePeer
+}
+
+func (r runtimeResources) Close() error {
+	var seamErr error
+	if r.server.seam != nil {
+		seamErr = r.server.seam.Close()
+	}
+	return errors.Join(seamErr, r.peer.Close())
+}
+
+type runtimeWorkers struct {
+	server *Server
+	pool   *dksupervise.Pool
+
+	mu     sync.Mutex
+	cancel context.CancelFunc
+}
+
+func (w *runtimeWorkers) setCancel(cancel context.CancelFunc) {
+	w.mu.Lock()
+	w.cancel = cancel
+	w.mu.Unlock()
+}
+
+func (w *runtimeWorkers) Close() {
+	w.pool.Close()
+	w.server.shutdownProxy()
+}
+
+func (w *runtimeWorkers) Cancel() {
+	w.mu.Lock()
+	cancel := w.cancel
+	w.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	w.pool.Cancel()
+}
+
+func (w *runtimeWorkers) Wait(ctx context.Context) error {
+	poolErr := w.pool.Wait(ctx)
+	done := make(chan struct{})
+	go func() {
+		w.server.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return poolErr
+	case <-ctx.Done():
+		<-done
+		return errors.Join(poolErr, ctx.Err())
+	}
 }
 
 // shutdownProxy gracefully stops the supervised proxy on an intentional daemon
 // shutdown: it sends the seam shutdown frame and waits (bounded) for the child to
 // step down, so `ccs stop` / SIGTERM takes the proxy down with the daemon.
 //
-// Runs only after the supervise loop has quiesced (wg.Wait above), so no Tick
-// races a respawn against this teardown, and BEFORE the deferred seam Close — the
-// distinguisher that preserves crash fail-open. An EXPLICIT shutdown frame is the
-// intentional-stop signal; a bare seam drop (daemon crash, no frame) still leaves
-// the proxy serving standalone so live `ccs url` tokens survive until the daemon
-// respawns. The wait uses a fresh context because the daemon's own ctx is already
-// cancelled by the time teardown runs.
+// Worker intake is already closed, so supervision cannot admit a replacement
+// while the proxy steps down. The seam remains live until resource teardown:
+// an explicit shutdown frame takes the proxy down, while a bare seam drop after
+// a daemon crash still leaves it serving so live `ccs url` tokens survive until
+// the daemon respawns.
 func (s *Server) shutdownProxy() {
+	if s.policy == nil {
+		return
+	}
 	if err := s.policy.Shutdown(context.Background()); err != nil {
 		if errors.Is(err, proxyseam.ErrProxyNotConnected) {
 			return // no proxy connected; nothing to step down
@@ -236,10 +363,7 @@ func (s *Server) shutdownProxy() {
 // grace to the loop's normal revive/backoff — the genuinely-dead-on-startup
 // case the supervisor exists to handle.
 func (s *Server) bringUp(ctx context.Context) {
-	go s.seam.Start(ctx, s.onRegister)
-
-	spawn := proxySpawner{server: s}
-	if err := spawn.EnsureRunning(ctx); err != nil {
+	if err := s.spawner.EnsureRunning(ctx); err != nil {
 		s.log.Printf("spawn proxy: %v", err)
 	}
 	select {
@@ -249,7 +373,7 @@ func (s *Server) bringUp(ctx context.Context) {
 	case <-time.After(proxyStartupGrace):
 		s.log.Printf("proxy did not register within %s; starting supervision (revive will retry)", proxyStartupGrace)
 	}
-	s.sup = supervisor.BuildSupervisor(spawn, s.policy, supervisor.ProxyVersion())
+	s.sup = supervisor.BuildSupervisor(s.spawner, s.policy, supervisor.ProxyVersion())
 	supervisor.SuperviseLoop(ctx, s.sup)
 }
 
@@ -279,10 +403,14 @@ func (s *Server) onRegister(reg proxyseam.Register) {
 
 type proxySpawner struct {
 	server  *Server
+	pool    *dksupervise.Pool
 	timeout time.Duration
+
+	mu      sync.Mutex
+	process *dksupervise.Process
 }
 
-func (p proxySpawner) EnsureRunning(ctx context.Context) error {
+func (p *proxySpawner) EnsureRunning(ctx context.Context) error {
 	if p.server.policy.Registered() {
 		return nil
 	}
@@ -296,25 +424,60 @@ func (p proxySpawner) EnsureRunning(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return proc.Spawn{
-		Socket:    p.server.proxySock,
-		LogPath:   paths.LogPath(),
-		ExecPath:  bin,
-		Args:      []string{"--socket", p.server.proxySock, "--port", strconv.Itoa(p.server.currentProxyPort()), "--state-dir", paths.StateDir()},
-		Timeout:   p.Timeout(),
-		Available: p.server.policy.Registered,
-		CanHost:   func() error { return nil },
-	}.EnsureRunning(ctx)
+	logFile, err := os.OpenFile(paths.LogPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open proxy log: %w", err)
+	}
+	defer logFile.Close()
+	process, err := p.pool.Start(ctx, dksupervise.ProcessSpec{
+		RecoveryClass: proc.RecoveryTask,
+		Path:          bin,
+		Args: []string{
+			"--socket", p.server.proxySock,
+			"--port", strconv.Itoa(p.server.currentProxyPort()),
+			"--state-dir", paths.StateDir(),
+		},
+		Stdout: logFile, Stderr: logFile, ReadinessTimeout: p.Timeout(),
+		Ready: func(readyCtx context.Context, _ proc.Record) error {
+			return p.awaitReady(readyCtx)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.process = process
+	p.mu.Unlock()
+	return nil
 }
 
-func (p proxySpawner) Timeout() time.Duration {
+func (p *proxySpawner) Stop(ctx context.Context) (int, error) {
+	p.mu.Lock()
+	process := p.process
+	p.mu.Unlock()
+	if process == nil {
+		return 0, proc.ErrChildUnavailable
+	}
+	pid := process.Record().PID
+	if err := process.Stop(ctx); err != nil {
+		return 0, err
+	}
+	p.mu.Lock()
+	if p.process == process {
+		p.process = nil
+	}
+	p.mu.Unlock()
+	return pid, nil
+}
+
+func (p *proxySpawner) Timeout() time.Duration {
 	if p.timeout > 0 {
 		return p.timeout
 	}
 	return proc.DefaultSpawnTimeout
 }
 
-func (p proxySpawner) awaitReady(ctx context.Context) error {
+func (p *proxySpawner) awaitReady(ctx context.Context) error {
 	deadline := time.NewTimer(p.Timeout())
 	defer deadline.Stop()
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -342,85 +505,6 @@ func (s *Server) currentProxyPort() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.proxyPort
-}
-
-// listen binds the control socket single-entrant under a flock, refusing a live
-// same-version peer and evicting a version-skewed one. The flock — held by serve
-// for the daemon's lifetime — makes the stale-check/remove/bind sequence
-// single-entrant across processes; the cc-squash-specific contention policy is
-// the evict closure.
-func (s *Server) listen(ctx context.Context) (net.Listener, *os.File, error) {
-	return proc.SingleEntrant{
-		Socket:  s.socket,
-		Timeout: evictTimeout,
-		Evict:   s.evict,
-	}.Listen(ctx)
-}
-
-// evict is the SingleEntrant contention policy: health-probe the peer holding
-// the socket. A live same-version peer is a genuine double start — refuse. A
-// version-skewed peer is told to step down and waited out — evict. No peer
-// answered — make no claim (a free lock binds; a contended one is refused by
-// proc as a peer mid-start).
-func (s *Server) evict() (bool, error) {
-	c := &Client{socket: s.socket}
-	resp, err := c.Health()
-	if err != nil {
-		return false, nil // no live peer answered
-	}
-	if resp.Version == version.String() {
-		return false, errors.New("another cc-squash daemon at the same version is already running")
-	}
-	s.log.Printf("evicting version-skewed daemon (%s) holding the socket", resp.Version)
-	if _, err := c.Shutdown(); err != nil {
-		return false, err
-	}
-	if !c.WaitGone(evictTimeout) {
-		return false, errors.New("version-skewed daemon did not release the socket in time")
-	}
-	return true, nil
-}
-
-// handle serves one connection: decode one Request, dispatch it, encode one
-// Response. ctx bounds the daemon's lifecycle; the conn deadline independently
-// bounds a single slow client.
-func (s *Server) handle(ctx context.Context, conn net.Conn) {
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	var req Request
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
-		writeResp(conn, Response{OK: false, Error: "bad request: " + err.Error()})
-		return
-	}
-	writeResp(conn, s.dispatch(ctx, req))
-}
-
-func writeResp(conn net.Conn, r Response) {
-	r.Proto = ProtocolVersion
-	_ = json.NewEncoder(conn).Encode(r)
-}
-
-func (s *Server) dispatch(ctx context.Context, req Request) Response {
-	switch req.Op {
-	case OpHealth:
-		return Response{OK: true, Version: version.String()}
-	case OpStatus:
-		snap := s.snapshot()
-		return Response{OK: true, Version: version.String(), Status: &snap}
-	case OpMint:
-		return s.handleMint(ctx)
-	case OpKill:
-		return s.handleKill(req.On)
-	case OpShadow:
-		return s.handleShadow(req.On)
-	case OpGc:
-		return s.handleGc()
-	case OpShutdown:
-		s.triggerShutdown()
-		return Response{OK: true, Version: version.String()}
-	default:
-		return Response{OK: false, Error: "unknown op: " + string(req.Op)}
-	}
 }
 
 // handleMint is the hot path. It waits up to mintReadyTimeout for a cold-started
@@ -547,7 +631,6 @@ func (s *Server) snapshot() StatusSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return StatusSnapshot{
-		Proto:       ProtocolVersion,
 		Version:     version.String(),
 		GeneratedAt: time.Now().UTC(),
 		ProxyPort:   s.proxyPort,

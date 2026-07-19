@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -33,7 +34,7 @@ proxy URL claude should use as its base. Only the URL goes to stdout; every
 diagnostic goes to stderr, so ` + "`ANTHROPIC_BASE_URL=$(ccs url)`" + ` captures just the URL.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			url, err := resolveURL()
+			url, err := resolveURL(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -46,12 +47,13 @@ diagnostic goes to stderr, so ` + "`ANTHROPIC_BASE_URL=$(ccs url)`" + ` captures
 // resolveMint ensures the daemon is up and mints a fresh session, returning the
 // whole reply so a caller can read both the relay port/token and the rmcp
 // retrieve server's MCP port off one round-trip.
-func resolveMint() (control.Response, error) {
+func resolveMint(ctx context.Context) (control.Response, error) {
 	c := control.NewClient()
-	if !c.EnsureRunning(proxyEnsureTimeout) {
-		return control.Response{}, control.ErrDaemonUnavailable
+	defer c.Close()
+	if err := c.EnsureCurrent(ctx, proxyEnsureTimeout); err != nil {
+		return control.Response{}, err
 	}
-	resp, err := c.Mint()
+	resp, err := c.Mint(ctx)
 	if err != nil {
 		return control.Response{}, err
 	}
@@ -74,8 +76,8 @@ func mcpURL(resp control.Response) string {
 
 // resolveURL ensures the daemon is up, mints a session token, and returns the
 // proxy base URL the minted session answers at.
-func resolveURL() (string, error) {
-	resp, err := resolveMint()
+func resolveURL(ctx context.Context) (string, error) {
+	resp, err := resolveMint(ctx)
 	if err != nil {
 		return "", err
 	}

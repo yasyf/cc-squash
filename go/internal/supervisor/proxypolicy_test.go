@@ -42,7 +42,7 @@ func liveSeam(t *testing.T) (policy *ProxyPolicy, connectChild func(version stri
 	t.Cleanup(func() { _ = seam.Close() })
 
 	var pushes atomic.Int32
-	policy = NewProxyPolicy(seam, func() { pushes.Add(1) }, log.New(io.Discard, "", 0))
+	policy = NewProxyPolicy(seam, func() { pushes.Add(1) }, nil, log.New(io.Discard, "", 0))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -154,6 +154,18 @@ func TestProxyPolicyKillNoPid(t *testing.T) {
 	// reads it as "nothing to kill, socket free".
 	if _, err := policy.Kill(); err != proc.ErrChildUnavailable {
 		t.Fatalf("Kill with no captured pid = %v, want ErrChildUnavailable", err)
+	}
+}
+
+func TestProxyPolicyKillDelegatesToManagedProcessOwner(t *testing.T) {
+	called := false
+	policy := &ProxyPolicy{stop: func(context.Context) (int, error) {
+		called = true
+		return 4242, nil
+	}}
+	pid, err := policy.Kill()
+	if err != nil || pid != 4242 || !called {
+		t.Fatalf("Kill = pid %d, err %v, called %t", pid, err, called)
 	}
 }
 

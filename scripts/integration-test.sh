@@ -14,4 +14,4 @@ cargo build -p ccs-proxy --manifest-path "$repo_root/crates/Cargo.toml"
 
 echo "==> go test -tags integration ./internal/integration/"
 cd "$repo_root/go"
-go test -tags integration ./internal/integration/ -v "$@"
+go test -count=1 -tags integration ./internal/integration/ -v "$@"

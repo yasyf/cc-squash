@@ -13,7 +13,6 @@ import (
 func TestStatusJSONReadsPublishedSnapshot(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	want := control.StatusSnapshot{
-		Proto:       control.ProtocolVersion,
 		Version:     "9.9.9",
 		GeneratedAt: time.Unix(1_700_000_000, 0).UTC(),
 		ProxyPort:   50516,
@@ -46,7 +45,7 @@ func TestStatusJSONReadsPublishedSnapshot(t *testing.T) {
 func TestStatusPlainTableRendersFields(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if err := control.WriteStatus(control.StatusSnapshot{
-		Proto: control.ProtocolVersion, Version: "1.2.3", ProxyPort: 50600, ProxyPID: 7, Sessions: 2, Shadow: true,
+		Version: "1.2.3", ProxyPort: 50600, ProxyPID: 7, Sessions: 2, Shadow: true,
 	}); err != nil {
 		t.Fatalf("write status: %v", err)
 	}

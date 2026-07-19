@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
@@ -35,6 +34,7 @@ type ProxyPolicy struct {
 	// live sessions survive a proxy restart. The daemon owns the token set; the
 	// policy only triggers the re-push on the Respawned transition.
 	repush func()
+	stop   func(context.Context) (int, error)
 
 	mu         sync.Mutex
 	registered bool
@@ -45,8 +45,13 @@ type ProxyPolicy struct {
 // NewProxyPolicy builds the proxy supervision policy over the seam. repush
 // re-pushes the daemon's live session tokens after a respawn; diagnostics go to
 // logger.
-func NewProxyPolicy(seam *proxyseam.Server, repush func(), logger *log.Logger) *ProxyPolicy {
-	return &ProxyPolicy{seam: seam, repush: repush, log: logger}
+func NewProxyPolicy(
+	seam *proxyseam.Server,
+	repush func(),
+	stop func(context.Context) (int, error),
+	logger *log.Logger,
+) *ProxyPolicy {
+	return &ProxyPolicy{seam: seam, repush: repush, stop: stop, log: logger}
 }
 
 // NoteRegistered captures a proxy child's register frame — its os pid (for the
@@ -127,21 +132,13 @@ func (p *ProxyPolicy) WaitGone(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// Kill SIGKILLs the captured proxy pid — the peer-gated reap proc reaches only
-// on a wedged force-replace. An uncaptured pid (no child ever registered)
-// returns proc.ErrChildUnavailable so proc reads it as "nothing to kill, socket
-// free" and proceeds.
+// Kill delegates exact process-group termination to daemonkit's managed
+// process owner. The captured pid is observation only and never kill authority.
 func (p *ProxyPolicy) Kill() (int, error) {
-	p.mu.Lock()
-	pid := p.pid
-	p.mu.Unlock()
-	if pid == 0 {
+	if p.stop == nil {
 		return 0, proc.ErrChildUnavailable
 	}
-	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
-		return 0, err
-	}
-	return pid, nil
+	return p.stop(context.Background())
 }
 
 // Reconcile re-establishes desired state across a transition:

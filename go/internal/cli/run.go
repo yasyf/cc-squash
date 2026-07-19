@@ -31,7 +31,7 @@ This is the imperative equivalent of:
 		// Pass every argument straight through to claude; ccs owns no flags here.
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resp, err := resolveMint()
+			resp, err := resolveMint(cmd.Context())
 			if err != nil {
 				return err
 			}
