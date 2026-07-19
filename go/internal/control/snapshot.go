@@ -5,7 +5,6 @@ import (
 	"os"
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
-	"github.com/yasyf/fusekit/state"
 )
 
 // WriteStatus mirrors the daemon's status snapshot to disk atomically (0600),
@@ -15,7 +14,7 @@ func WriteStatus(snap StatusSnapshot) error {
 	if err != nil {
 		return err
 	}
-	return state.AtomicWrite(paths.StatusPath(), data, 0o600)
+	return paths.AtomicWrite(paths.StatusPath(), data, 0o600)
 }
 
 // ReadStatus reads the on-disk status snapshot the daemon last published.

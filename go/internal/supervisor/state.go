@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // ReconcileKind identifies a child lifecycle transition.
@@ -42,9 +42,15 @@ type Policy interface {
 	Reconcile(ctx context.Context, ev ReconcileEvent)
 }
 
+// Spawner starts the cc-squash proxy and waits until it is ready.
+type Spawner interface {
+	EnsureRunning(context.Context) error
+	Timeout() time.Duration
+}
+
 // Supervisor keeps the detached proxy alive at MyVersion.
 type Supervisor struct {
-	Spawn         proc.Spawn
+	Spawn         Spawner
 	MyVersion     string
 	Policy        Policy
 	GoneWait      time.Duration
@@ -69,10 +75,8 @@ func (s *Supervisor) Validate() error {
 		return errors.New("supervisor: Policy is required")
 	case s.MyVersion == "":
 		return errors.New("supervisor: MyVersion is required")
-	case s.Spawn.Available == nil:
-		return errors.New("supervisor: Spawn.Available is required")
-	case s.Spawn.CanHost == nil:
-		return errors.New("supervisor: Spawn.CanHost is required")
+	case s.Spawn == nil:
+		return errors.New("supervisor: Spawn is required")
 	}
 	return nil
 }
@@ -127,7 +131,7 @@ func (s *Supervisor) revive(ctx context.Context) {
 	if time.Now().Before(s.retryAt) {
 		return
 	}
-	if err := s.Spawn.EnsureRunning(); err != nil {
+	if err := s.Spawn.EnsureRunning(ctx); err != nil {
 		if errors.Is(err, proc.ErrSkipSpawn) {
 			return
 		}
@@ -180,7 +184,7 @@ func (s *Supervisor) Replace(ctx context.Context, force bool) (deferred bool) {
 	if ctx.Err() != nil {
 		return false
 	}
-	if err := s.Spawn.EnsureRunning(); err != nil {
+	if err := s.Spawn.EnsureRunning(ctx); err != nil {
 		if !errors.Is(err, proc.ErrSkipSpawn) {
 			s.noteSpawnFailure()
 		}
@@ -246,8 +250,8 @@ func (s *Supervisor) goneWait() time.Duration {
 	if s.GoneWait > 0 {
 		return s.GoneWait
 	}
-	if s.Spawn.Timeout > 0 {
-		return s.Spawn.Timeout
+	if timeout := s.Spawn.Timeout(); timeout > 0 {
+		return timeout
 	}
 	return proc.DefaultSpawnTimeout
 }

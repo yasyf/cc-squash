@@ -4,8 +4,6 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/yasyf/fusekit/proc"
 )
 
 // stubPolicy is a minimal Policy whose Probe counts ticks, so a loop test
@@ -27,12 +25,8 @@ func (stubPolicy) WaitGone(context.Context, time.Duration) bool { return true }
 func (stubPolicy) Kill() (int, error)                           { return 0, nil }
 func (stubPolicy) Reconcile(context.Context, ReconcileEvent)    {}
 
-func okSpawn() proc.Spawn {
-	return proc.Spawn{
-		Socket:    "/tmp/ccs-test.sock",
-		Available: func() bool { return true },
-		CanHost:   func() error { return nil },
-	}
+func okSpawn() Spawner {
+	return &fakeSpawner{}
 }
 
 func TestBuildSupervisorValidates(t *testing.T) {

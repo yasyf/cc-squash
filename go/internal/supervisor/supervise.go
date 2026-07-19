@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yasyf/fusekit/proc"
-	"github.com/yasyf/fusekit/version"
+	"github.com/yasyf/cc-squash/go/internal/version"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // SuperviseInterval is the proxy supervision cadence: a crashed proxy is
@@ -59,7 +59,7 @@ const (
 // spawn and policy, and Validates it — panicking on a misconfigured struct
 // (a missing Required field) exactly when the daemon wires it, rather than
 // nil-panicking deep inside a later revive or replace.
-func BuildSupervisor(spawn proc.Spawn, policy Policy, myVersion string) *Supervisor {
+func BuildSupervisor(spawn Spawner, policy Policy, myVersion string) *Supervisor {
 	sup := &Supervisor{
 		Spawn:         spawn,
 		MyVersion:     myVersion,
@@ -116,6 +116,9 @@ func superviseInterval() time.Duration {
 // agrees. Only the leading "v" prefix is stripped, so a Cargo prerelease like
 // "0.2.0-rc.1" round-trips untouched.
 func ProxyVersion() string {
+	if version.Version == "dev" {
+		return proxyDevVersion
+	}
 	return normalizeProxyVersion(version.String())
 }
 

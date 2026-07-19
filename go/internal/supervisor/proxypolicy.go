@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // waitGonePoll is how often WaitGone re-checks the seam while a retiring proxy

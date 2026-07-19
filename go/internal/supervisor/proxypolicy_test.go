@@ -12,7 +12,7 @@ import (
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // shortHome isolates the state dir under a short /tmp path: macOS caps a unix
@@ -150,7 +150,7 @@ func TestProxyPolicyReconcileChildDiedClearsIdentity(t *testing.T) {
 
 func TestProxyPolicyKillNoPid(t *testing.T) {
 	policy, _, _ := liveSeam(t)
-	// No child ever registered: Kill refuses with ErrChildUnavailable so proc
+	// No child ever registered: Kill refuses with ErrChildUnavailable so the supervisor
 	// reads it as "nothing to kill, socket free".
 	if _, err := policy.Kill(); err != proc.ErrChildUnavailable {
 		t.Fatalf("Kill with no captured pid = %v, want ErrChildUnavailable", err)
@@ -255,16 +255,10 @@ func TestSupervisorTickConvergesOnMatchedVersion(t *testing.T) {
 			child := connectChild(c.registered)
 			waitRegistered(t, policy)
 
-			// A no-op spawn keeps a replace from exec'ing a real binary; Available
-			// reports the seam's live registration so EnsureRunning short-circuits.
+			// A no-op spawn keeps a replace from exec'ing a real binary.
 			// The supervisor still drives the full Tick -> isSkew -> (Replace ->
 			// Shutdown) decision over the real seam.
-			spawn := proc.Spawn{
-				Socket:    paths.ProxySocketPath(),
-				Available: policy.Registered,
-				CanHost:   func() error { return nil },
-				Override:  func() error { return nil },
-			}
+			spawn := &fakeSpawner{}
 			// goneWait/spawn-timeout cap the replace legs to the test's timescale: on
 			// the replace path the child drops its seam right after the Shutdown (the
 			// proxy stepping down), so WaitGone returns promptly rather than running to

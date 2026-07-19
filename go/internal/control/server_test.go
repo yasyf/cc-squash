@@ -13,7 +13,7 @@ import (
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
-	"github.com/yasyf/fusekit/version"
+	"github.com/yasyf/cc-squash/go/internal/version"
 )
 
 // quietLogger discards daemon diagnostics so a test run stays clean.
@@ -24,9 +24,8 @@ func quietLogger(t *testing.T) *log.Logger {
 
 // fakeProxy is a stand-in for the Rust ccs-proxy child: it dials proxy.sock once
 // it exists, sends one register frame, and then drains control frames the daemon
-// pushes (recording the mint tokens). It connects through the SAME
-// proc.Spawn.Override seam (Server.spawnProxy) that production execs the real
-// binary through, so no real proxy is ever started.
+// pushes (recording the mint tokens). It connects through the server's explicit
+// test launch seam, so no real proxy is ever started.
 type fakeProxy struct {
 	port    int
 	mcpPort int
@@ -40,7 +39,7 @@ type fakeProxy struct {
 }
 
 // connect dials proxy.sock (polling until the daemon has bound it) and sends the
-// register frame. It is the body the daemon's Override seam invokes.
+// register frame. It is the body the daemon's test launch seam invokes.
 func (f *fakeProxy) connect(t *testing.T) error {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

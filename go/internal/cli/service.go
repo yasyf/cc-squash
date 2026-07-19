@@ -7,21 +7,22 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-squash/go/internal/control"
 	"github.com/yasyf/cc-squash/go/internal/paths"
-	"github.com/yasyf/fusekit/service"
+	"github.com/yasyf/daemonkit/service"
 )
 
 // ccsAgent is cc-squash's daemon LaunchAgent / brew-services descriptor: the
-// generic launchctl + Homebrew lifecycle (fusekit/service) configured with
+// generic launchctl + Homebrew lifecycle (daemonkit/service) configured with
 // cc-squash's label, formula, daemon args, log path, and PATH. The program
 // defaults to the running binary (os.Executable), so a Homebrew symlink stays a
 // stable launchd program path across upgrades.
 func ccsAgent() service.Agent {
 	return service.Agent{
-		Label:   "com.yasyf.cc-squash",
-		Formula: "cc-squash",
-		Args:    []string{"daemon"},
-		LogPath: paths.LogPath(),
-		Env:     map[string]string{"PATH": os.Getenv("PATH")},
+		Label:         "com.yasyf.cc-squash",
+		Formula:       "cc-squash",
+		Args:          []string{"daemon"},
+		LogPath:       paths.LogPath(),
+		Env:           map[string]string{"PATH": os.Getenv("PATH")},
+		RestartPolicy: service.RestartAlways,
 	}
 }
 
@@ -36,7 +37,7 @@ func newServiceCmd() *cobra.Command {
 			Short: "Install and start the user LaunchAgent",
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
-				if err := ccsAgent().Install(); err != nil {
+				if err := ccsAgent().Install(cmd.Context()); err != nil {
 					return err
 				}
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Installed and started the daemon.")
@@ -48,7 +49,7 @@ func newServiceCmd() *cobra.Command {
 			Short: "Stop the daemon and remove the LaunchAgent",
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
-				if err := ccsAgent().Uninstall(); err != nil {
+				if err := ccsAgent().Uninstall(cmd.Context()); err != nil {
 					return err
 				}
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Removed the LaunchAgent.")
@@ -61,7 +62,7 @@ func newServiceCmd() *cobra.Command {
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				out := cmd.OutOrStdout()
-				for _, line := range ccsAgent().StatusLines() {
+				for _, line := range ccsAgent().StatusLines(cmd.Context()) {
 					_, _ = fmt.Fprintln(out, line)
 				}
 				if resp, err := control.NewClient().Health(); err == nil && resp.OK {

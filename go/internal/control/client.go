@@ -2,13 +2,14 @@ package control
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // ErrDaemonUnavailable means the control socket could not be reached.
@@ -117,6 +118,8 @@ func (c *Client) EnsureRunning(timeout time.Duration) bool {
 	if err := paths.EnsureStateDir(); err != nil {
 		return false
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	return proc.Spawn{
 		Socket:    c.socket,
 		Args:      []string{"daemon"},
@@ -124,5 +127,5 @@ func (c *Client) EnsureRunning(timeout time.Duration) bool {
 		LogPath:   paths.LogPath(),
 		Available: c.Available,
 		CanHost:   func() error { return nil },
-	}.EnsureRunning() == nil
+	}.EnsureRunning(ctx) == nil
 }

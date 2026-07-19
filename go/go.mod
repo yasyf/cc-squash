@@ -5,7 +5,7 @@ go 1.26.5
 require (
 	github.com/pelletier/go-toml/v2 v2.4.2
 	github.com/spf13/cobra v1.10.2
-	github.com/yasyf/fusekit v1.3.0
+	github.com/yasyf/daemonkit v0.1.1-0.20260719034318-58eb06256d08
 )
 
 require (

@@ -6,7 +6,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-squash/go/internal/control"
 	"github.com/yasyf/cc-squash/go/internal/paths"
-	"github.com/yasyf/fusekit/version"
+	"github.com/yasyf/cc-squash/go/internal/version"
 )
 
 func newDoctorCmd() *cobra.Command {

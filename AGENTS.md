@@ -9,7 +9,7 @@ A live cache-economics rewriting proxy for long-running Claude Code sessions. Th
 cc-squash/
 ├── crates/           # Rust data plane: ccs-proxy (relay + L0/L1/L2), ccs-policy (pure
 │                     # decision engine), ccs-economics, ccs-refs, ccs-summarizer, ccs-core
-├── go/               # Go control plane: the ccs CLI, daemon, and proxy supervision (fusekit)
+├── go/               # Go control plane: the ccs CLI, daemon, and proxy supervision (daemonkit)
 ├── bin/              # Local build drop for live runs (ccs + ccs-proxy siblings)
 ├── .github/          # GitHub Actions workflows
 ├── AGENTS.md         # This file — rendered by cc-guides; edit .claude/fragments/AGENTS.md/*

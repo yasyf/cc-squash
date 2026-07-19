@@ -5,7 +5,7 @@ package cli
 
 import (
 	"github.com/spf13/cobra"
-	"github.com/yasyf/fusekit/version"
+	"github.com/yasyf/cc-squash/go/internal/version"
 )
 
 // NewRootCmd builds the root command and attaches every subcommand. Bare `ccs`

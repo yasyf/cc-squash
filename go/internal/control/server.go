@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strconv"
 	"sync"
@@ -18,8 +18,8 @@ import (
 	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
 	"github.com/yasyf/cc-squash/go/internal/supervisor"
-	"github.com/yasyf/fusekit/proc"
-	"github.com/yasyf/fusekit/version"
+	"github.com/yasyf/cc-squash/go/internal/version"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // evictTimeout bounds how long a starting daemon waits for a version-skewed peer
@@ -54,9 +54,8 @@ type Server struct {
 	sup    *supervisor.Supervisor
 	policy *supervisor.ProxyPolicy
 
-	// spawnProxy overrides the detached ccs-proxy spawn; nil execs the real
-	// binary. Tests inject a fake child that connects to proxy.sock and registers
-	// through the SAME proc.Spawn.Override seam, so no real proxy is exec'd.
+	// spawnProxy overrides the detached ccs-proxy launch in tests; production
+	// delegates launch, process limits, and reaping to daemonkit.
 	spawnProxy func() error
 
 	// mintTimeout bounds OpMint's wait for a cold-started proxy to register; zero
@@ -115,7 +114,7 @@ func (s *Server) serve(ctx context.Context) error {
 	if err := paths.EnsureStateDir(); err != nil {
 		return err
 	}
-	ln, lock, err := s.listen()
+	ln, lock, err := s.listen(ctx)
 	if err != nil {
 		return err
 	}
@@ -239,14 +238,8 @@ func (s *Server) shutdownProxy() {
 func (s *Server) bringUp(ctx context.Context) {
 	go s.seam.Start(ctx, s.onRegister)
 
-	spawn := proc.Spawn{
-		Socket:    s.proxySock,
-		LogPath:   paths.LogPath(),
-		Available: s.policy.Registered,
-		CanHost:   func() error { return nil },
-		Override:  s.spawnProxyChild,
-	}
-	if err := spawn.EnsureRunning(); err != nil {
+	spawn := proxySpawner{server: s}
+	if err := spawn.EnsureRunning(ctx); err != nil {
 		s.log.Printf("spawn proxy: %v", err)
 	}
 	select {
@@ -284,36 +277,60 @@ func (s *Server) onRegister(reg proxyseam.Register) {
 	s.publishStatus()
 }
 
-// spawnProxyChild is the proc.Spawn.Override: it execs the detached Rust
-// ccs-proxy on the seam socket, routed through the spawnProxy seam so tests
-// inject a fake child the same way production spawns the real one. The port is
-// read dynamically (currentProxyPort): 0 lets the OS assign one on the very
-// first start, and the prior registered port is reused on every respawn, so a
-// crash-replaced proxy re-binds the SAME port and every outstanding `ccs url`
-// token keeps resolving. Returns nil so a started child is awaited by
-// EnsureRunning's come-up loop (the child registers, flipping Available true).
-func (s *Server) spawnProxyChild() error {
-	if s.spawnProxy != nil {
-		return s.spawnProxy()
+type proxySpawner struct {
+	server  *Server
+	timeout time.Duration
+}
+
+func (p proxySpawner) EnsureRunning(ctx context.Context) error {
+	if p.server.policy.Registered() {
+		return nil
+	}
+	if p.server.spawnProxy != nil {
+		if err := p.server.spawnProxy(); err != nil {
+			return fmt.Errorf("spawn proxy test child: %w", err)
+		}
+		return p.awaitReady(ctx)
 	}
 	bin, err := ProxyBinaryPath()
 	if err != nil {
 		return err
 	}
-	logFile, err := os.OpenFile(paths.LogPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
+	return proc.Spawn{
+		Socket:    p.server.proxySock,
+		LogPath:   paths.LogPath(),
+		ExecPath:  bin,
+		Args:      []string{"--socket", p.server.proxySock, "--port", strconv.Itoa(p.server.currentProxyPort()), "--state-dir", paths.StateDir()},
+		Timeout:   p.Timeout(),
+		Available: p.server.policy.Registered,
+		CanHost:   func() error { return nil },
+	}.EnsureRunning(ctx)
+}
+
+func (p proxySpawner) Timeout() time.Duration {
+	if p.timeout > 0 {
+		return p.timeout
 	}
-	defer func() { _ = logFile.Close() }()
-	cmd := exec.Command(bin, "--socket", s.proxySock, "--port", strconv.Itoa(s.currentProxyPort()), "--state-dir", paths.StateDir())
-	cmd.Stdin = nil
-	cmd.Stdout, cmd.Stderr = logFile, logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from our session
-	if err := cmd.Start(); err != nil {
-		return err
+	return proc.DefaultSpawnTimeout
+}
+
+func (p proxySpawner) awaitReady(ctx context.Context) error {
+	deadline := time.NewTimer(p.Timeout())
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if p.server.policy.Registered() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: waiting for proxy: %w", proc.ErrChildUnavailable, ctx.Err())
+		case <-deadline.C:
+			return fmt.Errorf("%w: proxy did not register within %s", proc.ErrChildUnavailable, p.Timeout())
+		case <-ticker.C:
+		}
 	}
-	go func() { _ = cmd.Wait() }() // reap so the exited child never strands a zombie
-	return nil
 }
 
 // currentProxyPort is the port the next spawned proxy must bind: 0 before any
@@ -332,12 +349,12 @@ func (s *Server) currentProxyPort() int {
 // for the daemon's lifetime — makes the stale-check/remove/bind sequence
 // single-entrant across processes; the cc-squash-specific contention policy is
 // the evict closure.
-func (s *Server) listen() (net.Listener, *os.File, error) {
+func (s *Server) listen(ctx context.Context) (net.Listener, *os.File, error) {
 	return proc.SingleEntrant{
 		Socket:  s.socket,
 		Timeout: evictTimeout,
 		Evict:   s.evict,
-	}.Listen()
+	}.Listen(ctx)
 }
 
 // evict is the SingleEntrant contention policy: health-probe the peer holding

@@ -4,9 +4,21 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/yasyf/fusekit/proc"
 )
+
+type fakeSpawner struct {
+	timeout time.Duration
+	ensure  func(context.Context) error
+}
+
+func (s *fakeSpawner) EnsureRunning(ctx context.Context) error {
+	if s.ensure == nil {
+		return nil
+	}
+	return s.ensure(ctx)
+}
+
+func (s *fakeSpawner) Timeout() time.Duration { return s.timeout }
 
 type statePolicy struct {
 	verdict   Verdict
@@ -33,12 +45,9 @@ func (p *statePolicy) Reconcile(_ context.Context, event ReconcileEvent) {
 	p.events = append(p.events, event.Kind)
 }
 
-func stateSpawn(policy *statePolicy, version string, spawns *int) proc.Spawn {
-	return proc.Spawn{
-		Socket:    "/tmp/ccs-state-test.sock",
-		Available: func() bool { return policy.verdict.Reachable },
-		CanHost:   func() error { return nil },
-		Override: func() error {
+func stateSpawn(policy *statePolicy, version string, spawns *int) Spawner {
+	return &fakeSpawner{
+		ensure: func(context.Context) error {
 			(*spawns)++
 			policy.verdict = Verdict{Reachable: true, Version: version}
 			policy.peerAlive = true
