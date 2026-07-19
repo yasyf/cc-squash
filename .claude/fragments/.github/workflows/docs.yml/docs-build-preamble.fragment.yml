@@ -1,0 +1,16 @@
+name: Documentation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "docs/**"
+      - "README.md"
+      - "great-docs.yml"
+      - ".github/workflows/docs.yml"
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true

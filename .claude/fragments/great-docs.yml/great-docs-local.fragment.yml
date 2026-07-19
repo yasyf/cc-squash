@@ -1,0 +1,36 @@
+# Great Docs configuration — https://posit-dev.github.io/great-docs/
+# Content-only build (no Python package): README homepage + narrative only.
+
+display_name: cc-squash
+repo: https://github.com/yasyf/cc-squash
+site_url: "https://yasyf.github.io/cc-squash/"
+pypi: false
+
+reference: false
+package_info_page: false
+mcp:
+  enabled: false
+# bare `skill: false` is ignored — get("skill.enabled") defaults True
+skill:
+  enabled: false
+
+logo: docs/assets/logo.png
+
+navbar_color: "#2b1d10"
+accent_color:
+  light: "#9a6700"
+  dark: "#f0c060"
+
+social_cards:
+  image: docs/assets/social-preview.jpg
+  twitter_site: "@yasyf"
+
+hero:
+  name: cc-squash
+  tagline: "Compact ruthlessly. Regret nothing."
+
+authors:
+  - name: Yasyf Mohamedali
+    role: Maintainer
+    github: yasyf
+    email: yasyfm@gmail.com

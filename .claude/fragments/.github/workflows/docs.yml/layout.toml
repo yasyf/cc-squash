@@ -1,0 +1,9 @@
+fragments = [
+  "docs-build-preamble",
+  "cc-skills:docs-build-head",
+  "cc-skills:docs-build-content-only",
+  "cc-skills:docs-publish",
+]
+
+[sources.cc-skills]
+source = "github:yasyf/cc-skills@main"
