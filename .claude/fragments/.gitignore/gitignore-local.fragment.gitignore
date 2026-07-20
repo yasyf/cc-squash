@@ -1,0 +1,12 @@
+# Go
+go/bin/
+*.test
+*.out
+
+# Rust
+**/*.rs.bk
+
+# Release tooling
+dist/
+tap-staging/
+bin/
