@@ -35,7 +35,7 @@ func testDaemonRole(t *testing.T) daemonrole.Classifier {
 	return daemonrole.Classifier{RoleID: DaemonRoleID, RolePath: filepath.Clean(executable)}
 }
 
-// fakeProxy is a stand-in for the Rust ccs-proxy child: it dials proxy.sock once
+// fakeProxy is a stand-in for the Rust ccs-proxy child: it dials proxy-v1.sock once
 // it exists, sends one register frame, and then drains control frames the daemon
 // pushes (recording the mint tokens). It connects through the server's explicit
 // test launch seam, so no real proxy is ever started.
@@ -51,7 +51,7 @@ type fakeProxy struct {
 	reader *bufio.Reader
 }
 
-// connect dials proxy.sock (polling until the daemon has bound it) and sends the
+// connect dials proxy-v1.sock (polling until the daemon has bound it) and sends the
 // register frame. It is the body the daemon's test launch seam invokes.
 func (f *fakeProxy) connect(t *testing.T) error {
 	t.Helper()
@@ -68,8 +68,13 @@ func (f *fakeProxy) connect(t *testing.T) error {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	mcpPort := f.mcpPort
+	if mcpPort == 0 {
+		mcpPort = f.port + 1
+	}
 	frame, err := proxyseam.Encode(proxyseam.Register{
-		Type: proxyseam.MsgRegister, Port: f.port, MCPPort: f.mcpPort, Version: f.version, PID: f.pid,
+		Type: proxyseam.MsgRegister, Protocol: proxyseam.ProtocolVersion,
+		Port: f.port, MCPPort: mcpPort, Version: f.version, PID: f.pid,
 	})
 	if err != nil {
 		return err
@@ -359,7 +364,7 @@ func writeTestConfig(t *testing.T, toml string) {
 	if err := os.MkdirAll(paths.StateDir(), 0o700); err != nil {
 		t.Fatalf("mkdir state dir: %v", err)
 	}
-	if err := os.WriteFile(paths.ConfigPath(), []byte(toml), 0o600); err != nil {
+	if err := os.WriteFile(paths.ConfigPath(), []byte("schema_version = 1\n"+toml), 0o600); err != nil {
 		t.Fatalf("write config.toml: %v", err)
 	}
 }
@@ -554,7 +559,7 @@ func TestActivationAcknowledgesRetiredProxyReceiptAfterDerivedStateCleanup(t *te
 	if err := paths.EnsureStateDir(); err != nil {
 		t.Fatalf("ensure state: %v", err)
 	}
-	if err := WriteStatus(StatusSnapshot{Version: "retired"}); err != nil {
+	if err := WriteStatus(StatusSnapshot{SchemaVersion: StatusSchemaVersion, Version: "retired"}); err != nil {
 		t.Fatalf("seed status: %v", err)
 	}
 	if err := WritePort(50999); err != nil {
@@ -623,19 +628,19 @@ func TestServerStatusFileWritten(t *testing.T) {
 	srv := newServerWithProxy(t, f)
 	startServer(t, srv)
 
-	// onRegister writes status.json atomically once the proxy registers; poll for
+	// onRegister writes status-v1.json atomically once the proxy registers; poll for
 	// it (the bring-up is asynchronous).
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		snap, err := ReadStatus()
 		if err == nil && snap.ProxyPort == 50900 {
 			if snap.ProxyPID != 13 {
-				t.Fatalf("status.json pid = %d, want 13", snap.ProxyPID)
+				t.Fatalf("status-v1.json pid = %d, want 13", snap.ProxyPID)
 			}
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("status.json never reflected the proxy port (last err %v)", err)
+			t.Fatalf("status-v1.json never reflected the proxy port (last err %v)", err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -647,7 +652,7 @@ func TestServerStatusFileWritten(t *testing.T) {
 }
 
 // TestServerKillReflectedInStatusFile is the BUG A regression: a kill/shadow
-// toggle must refresh status.json so out-of-process readers (`ccs status`, `ccs
+// toggle must refresh status-v1.json so out-of-process readers (`ccs status`, `ccs
 // kill status`, both via ReadStatus) see the live value, not a stale snapshot
 // from the last register.
 func TestServerKillReflectedInStatusFile(t *testing.T) {
@@ -657,18 +662,18 @@ func TestServerKillReflectedInStatusFile(t *testing.T) {
 	c := NewClient()
 	t.Cleanup(func() { _ = c.Close() })
 
-	// Wait for the cold-start register so status.json exists with kill=off,
+	// Wait for the cold-start register so status-v1.json exists with kill=off,
 	// then drain the register's effect by reading the first status.
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		if snap, err := ReadStatus(); err == nil && snap.ProxyPort == 51000 {
 			if snap.Kill || snap.Shadow {
-				t.Fatalf("cold status.json already toggled on: %+v", snap)
+				t.Fatalf("cold status-v1.json already toggled on: %+v", snap)
 			}
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("status.json never reflected the cold-start proxy port")
+			t.Fatal("status-v1.json never reflected the cold-start proxy port")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -677,14 +682,14 @@ func TestServerKillReflectedInStatusFile(t *testing.T) {
 		t.Fatalf("kill on: %v", err)
 	}
 	if snap, err := ReadStatus(); err != nil || !snap.Kill {
-		t.Fatalf("status.json kill = %v (err %v) after `kill on`, want true", snap.Kill, err)
+		t.Fatalf("status-v1.json kill = %v (err %v) after `kill on`, want true", snap.Kill, err)
 	}
 
 	if _, err := c.Shadow(t.Context(), true); err != nil {
 		t.Fatalf("shadow on: %v", err)
 	}
 	if snap, err := ReadStatus(); err != nil || !snap.Shadow {
-		t.Fatalf("status.json shadow = %v (err %v) after `shadow on`, want true", snap.Shadow, err)
+		t.Fatalf("status-v1.json shadow = %v (err %v) after `shadow on`, want true", snap.Shadow, err)
 	}
 
 	if _, err := c.Kill(t.Context(), false); err != nil {
@@ -695,11 +700,11 @@ func TestServerKillReflectedInStatusFile(t *testing.T) {
 		t.Fatalf("read status after kill off: %v", err)
 	}
 	if snap.Kill {
-		t.Fatalf("status.json kill = true after `kill off`, want false: %+v", snap)
+		t.Fatalf("status-v1.json kill = true after `kill off`, want false: %+v", snap)
 	}
 	// Shadow stays on — the toggles are independent.
 	if !snap.Shadow {
-		t.Fatalf("status.json shadow flipped off when only kill was toggled: %+v", snap)
+		t.Fatalf("status-v1.json shadow flipped off when only kill was toggled: %+v", snap)
 	}
 }
 

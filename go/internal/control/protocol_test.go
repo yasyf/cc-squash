@@ -30,7 +30,8 @@ func TestResponseRoundTrip(t *testing.T) {
 	want := Response{
 		OK: true, Port: 50515, Token: "tok-abc",
 		Status: &StatusSnapshot{
-			Version: "1.2.3", GeneratedAt: time.Unix(1_700_000_000, 0).UTC(),
+			SchemaVersion: StatusSchemaVersion,
+			Version:       "1.2.3", GeneratedAt: time.Unix(1_700_000_000, 0).UTC(),
 			ProxyPort: 50516, ProxyPID: 4242, Sessions: 3, Shadow: true,
 		},
 		Kill: true, Shadow: true,
@@ -63,7 +64,7 @@ func TestResponseOmitsEmptyStatus(t *testing.T) {
 }
 
 func TestBusinessBuildIsIndependentOfRelease(t *testing.T) {
-	if BusinessBuild != "cc-squash.control.v2" {
+	if BusinessBuild != "cc-squash.control.v1" {
 		t.Fatalf("business build = %q", BusinessBuild)
 	}
 }

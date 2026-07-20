@@ -44,7 +44,7 @@ var urlPattern = regexp.MustCompile(`^http://127\.0\.0\.1:(\d+)/s/([^/\n]+)\n$`)
 // second rather than the 10s production tick.
 const superviseInterval = 100 * time.Millisecond
 
-// statusSnapshot mirrors the fields of ~/.cc-squash/status.json this test reads.
+// statusSnapshot mirrors the fields of ~/.cc-squash/status-v1.json this test reads.
 // It is decoded straight from `ccs status --json`.
 type statusSnapshot struct {
 	ProxyPort int `json:"proxy_port"`
@@ -111,6 +111,13 @@ func newHarness(t *testing.T) *harness {
 		t.Fatalf("temp HOME: %v", err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	stateDir := filepath.Join(home, ".cc-squash")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("state dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "config.toml"), []byte("schema_version = 1\n"), 0o600); err != nil {
+		t.Fatalf("config: %v", err)
+	}
 
 	dir, err := os.MkdirTemp("/tmp", "ccs-it-bin")
 	if err != nil {
@@ -127,12 +134,13 @@ func newHarness(t *testing.T) *harness {
 
 	// Place ccs-proxy as a sibling of ccs so the daemon's ProxyBinaryPath
 	// (sibling-of-os.Executable) resolves it without touching the user's PATH.
-	cargo := exec.Command("cargo", "build", "-p", "ccs-proxy")
+	cargoTarget := filepath.Join(dir, "cargo-target")
+	cargo := exec.Command("cargo", "build", "-p", "ccs-proxy", "--target-dir", cargoTarget)
 	cargo.Dir = filepath.Join(root, "crates")
 	if out, err := cargo.CombinedOutput(); err != nil {
 		t.Fatalf("cargo build ccs-proxy: %v\n%s", err, out)
 	}
-	copyExecutable(t, filepath.Join(root, "crates", "target", "debug", "ccs-proxy"), filepath.Join(dir, "ccs-proxy"))
+	copyExecutable(t, filepath.Join(cargoTarget, "debug", "ccs-proxy"), filepath.Join(dir, "ccs-proxy"))
 
 	return &harness{
 		t:    t,

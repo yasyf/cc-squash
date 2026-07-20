@@ -17,7 +17,7 @@ import (
 
 // shortHome isolates the state dir under a short /tmp path: macOS caps a unix
 // socket path at 104 bytes, and the default t.TempDir() overflows it once
-// paths.ProxySocketPath() appends ~/.cc-squash/proxy.sock.
+// paths.ProxySocketPath() appends ~/.cc-squash/proxy-v1.sock.
 func shortHome(t *testing.T) {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "ccs-home")
@@ -55,7 +55,8 @@ func liveSeam(t *testing.T) (policy *ProxyPolicy, connectChild func(version stri
 		}
 		t.Cleanup(func() { _ = conn.Close() })
 		frame, _ := proxyseam.Encode(proxyseam.Register{
-			Type: proxyseam.MsgRegister, Port: 50515, Version: version, PID: os.Getpid(),
+			Type: proxyseam.MsgRegister, Protocol: proxyseam.ProtocolVersion,
+			Port: 50515, MCPPort: 50516, Version: version, PID: os.Getpid(),
 		})
 		if _, werr := conn.Write(frame); werr != nil {
 			t.Fatalf("child register: %v", werr)

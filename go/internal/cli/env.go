@@ -44,14 +44,14 @@ to enable retrieve, or use ` + "`ccs run`" + ` which wires it automatically.`,
 }
 
 // writeMCPConfig renders the per-session cc-squash MCP server config and writes
-// it to paths.StateDir()/mcp.json, returning the path. `ccs env` points
+// it to the epoch-1 generated config path, returning the path. `ccs env` points
 // CC_SQUASH_MCP_CONFIG at it so the user can hand it to `claude --mcp-config`.
 func writeMCPConfig(resp control.Response) (string, error) {
 	cfg, err := mcpConfigJSON(mcpURL(resp))
 	if err != nil {
 		return "", err
 	}
-	path := paths.StateDir() + "/mcp.json"
+	path := paths.MCPConfigPath()
 	if err := os.WriteFile(path, []byte(cfg+"\n"), 0o600); err != nil {
 		return "", err
 	}

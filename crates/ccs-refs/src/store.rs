@@ -1,7 +1,8 @@
 //! `RefStore` — the single tokio-rusqlite actor: sole writer (`put`), sole Rust
 //! reader (`materialize`), plus `retrieve` and `gc`. One connection, never a
 //! second; Layer 6's Go RO-CAS host opens `mode=ro` as a separate process. The
-//! schema is additive-only once that host reads it.
+//! schema is exact at epoch 1; there are no readers or migrations for earlier
+//! stores.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::HashSet;
@@ -14,11 +15,13 @@ use crate::bm25;
 use crate::hash::content_address;
 use crate::record::{Materialized, RefError, RefRecord, RetrieveResult};
 
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS refs (
+const SCHEMA_VERSION: i64 = 1;
+
+const SCHEMA: &str = "CREATE TABLE refs (
   ref_id TEXT PRIMARY KEY, original BLOB NOT NULL, byte_len INTEGER NOT NULL,
   token_estimate INTEGER NOT NULL, source_uuid TEXT NOT NULL, session_id TEXT NOT NULL,
   kind TEXT NOT NULL, created_at REAL NOT NULL, last_access_at REAL NOT NULL,
-  access_count INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0);";
+  access_count INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0)";
 
 const PRAGMAS: &str =
     "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;";
@@ -34,21 +37,53 @@ pub struct RefStore {
 impl RefStore {
     /// Open (creating if needed) the refs database at `db_path`.
     ///
-    /// Applies the WAL PRAGMAs, authors the schema, and best-effort chmods the
-    /// db file to `0600`.
+    /// Applies the WAL PRAGMAs, authors a fresh epoch-1 schema, or requires an
+    /// existing database to match it exactly. There are no migrations.
     pub async fn open(db_path: impl AsRef<Path>) -> Result<RefStore, RefError> {
         let db_path = db_path.as_ref().to_owned();
+        ensure_private_file(&db_path)?;
         let connection = Connection::open(&db_path)
             .await
             .map_err(tokio_rusqlite::Error::from)?;
         connection
             .call(|conn| {
+                let object_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let version: i64 =
+                    conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+                if object_count == 0 && version == 0 {
+                    let transaction = conn.transaction()?;
+                    transaction.execute_batch(SCHEMA)?;
+                    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                    transaction.commit()?;
+                    conn.execute_batch(PRAGMAS)?;
+                    return Ok(Ok(()));
+                }
+                if version != SCHEMA_VERSION {
+                    return Ok(Err(format!(
+                        "user_version={version}, want {SCHEMA_VERSION}"
+                    )));
+                }
+                let stored_schema: Option<String> = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='refs'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if object_count != 1 || stored_schema.as_deref() != Some(SCHEMA) {
+                    return Ok(Err(
+                        "objects differ from the exact epoch-1 schema".to_owned()
+                    ));
+                }
                 conn.execute_batch(PRAGMAS)?;
-                conn.execute_batch(SCHEMA)?;
-                Ok(())
+                Ok(Ok(()))
             })
-            .await?;
-        chmod_0600(&db_path);
+            .await?
+            .map_err(RefError::Schema)?;
         Ok(RefStore { connection })
     }
 
@@ -250,7 +285,15 @@ impl RefStore {
     }
 }
 
-fn chmod_0600(path: &Path) {
+fn ensure_private_file(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }

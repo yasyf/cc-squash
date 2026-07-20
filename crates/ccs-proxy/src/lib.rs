@@ -4,7 +4,7 @@
 //! request, prices keep-vs-evict per context segment and rewrites the request
 //! to minimise prompt-cache cost. Layer 1 is the RelayCore: a transparent,
 //! fail-open passthrough plus the v0 `<summary>` synthesis capability. The
-//! Go control plane (`ccs`) supervises this child over `proxy.sock`.
+//! Go control plane (`ccs`) supervises this child over `proxy-v1.sock`.
 //!
 //! Cardinal invariant: fail-open to identity. Any error/timeout/panic ⇒ forward
 //! the original request and relay the original response byte-for-byte. Unlike the

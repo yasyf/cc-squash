@@ -23,7 +23,7 @@ func newStatusCmd() *cobra.Command {
 			return runStatus(cmd, jsonOut)
 		},
 	}
-	cmd.Flags().BoolVar(&jsonOut, "json", false, "print the status snapshot JSON (same schema as ~/.cc-squash/status.json)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "print the status snapshot JSON (same schema as ~/.cc-squash/status-v1.json)")
 	return cmd
 }
 

@@ -7,13 +7,13 @@
 //!
 //! - [`hash::content_address`] — the SOLE place bytes become a digest.
 //! - [`record`] — `RefRecord` / `Materialized` / `RetrieveResult` / `RefError`.
-//! - [`store::RefStore`] — the single tokio-rusqlite actor (sole writer + sole Rust reader).
+//! - [`store::RefStore`] — the exact epoch-1 tokio-rusqlite actor (sole writer + sole Rust reader).
 //! - [`marker`] — `REF_MARKER` regex, `extract_refs`, placeholder + backref renderers.
 //! - [`dedup`] — §3d dedup gates; `dedupe_key` is the content-address.
 //! - [`bm25`] — hand-rolled BM25 search-within for `retrieve`.
 //!
 //! `RefStore` is the sole writer and `materialize` the sole Rust reader; once the
-//! Layer-6 Go RO-CAS host reads `refs.db`, the schema is additive-only.
+//! The refs database is derived epoch-1 state and is rebuilt at a hard cut.
 
 pub mod bm25;
 pub mod dedup;

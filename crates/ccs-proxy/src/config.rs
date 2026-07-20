@@ -12,7 +12,7 @@ use serde::Deserialize;
 /// partial frame (or an empty `{}`) keeps the pure-engine defaults; the control
 /// surface can push partial updates without a schema break.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RelayConfig {
     pub economics: EconomicsKnobs,
     pub policy: PolicyKnobs,
@@ -22,7 +22,7 @@ pub struct RelayConfig {
 /// frame omitting a knob keeps the engine default, single-sourced from
 /// [`EconomicsConfig::default`].
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EconomicsKnobs {
     #[serde(default = "default_npv_floor")]
     pub npv_floor: f64,
@@ -69,7 +69,7 @@ impl From<EconomicsKnobs> for EconomicsConfig {
 /// omitting a knob keeps the engine default, single-sourced from
 /// [`PolicyConfig::default`].
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PolicyKnobs {
     #[serde(default = "default_recency_window_n")]
     pub recency_window_n: usize,
@@ -174,8 +174,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_knobs_are_ignored() {
-        serde_json::from_str::<RelayConfig>(r#"{"economics":{"future_knob":1.0}}"#)
-            .expect("unknown knob is ignored, not an error");
+    fn unknown_knobs_are_rejected() {
+        assert!(
+            serde_json::from_str::<RelayConfig>(r#"{"economics":{"future_knob":1.0}}"#).is_err()
+        );
     }
 }

@@ -17,7 +17,7 @@ import (
 // shortHome isolates the state dir under a short /tmp path: macOS caps a unix
 // socket path (sun_path) at 104 bytes, and the default t.TempDir() under
 // /var/folders/... overflows it once paths.ProxySocketPath() appends
-// ~/.cc-squash/proxy.sock.
+// ~/.cc-squash/proxy-v1.sock.
 func shortHome(t *testing.T) {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "ccs-home")
@@ -39,7 +39,7 @@ func newTestServer(t *testing.T) *Server {
 	return srv
 }
 
-// dialChild connects to proxy.sock as the Rust child would, after the Server has
+// dialChild connects to proxy-v1.sock as the Rust child would, after the Server has
 // bound it.
 func dialChild(t *testing.T) net.Conn {
 	t.Helper()
@@ -51,6 +51,24 @@ func dialChild(t *testing.T) net.Conn {
 	return conn
 }
 
+func registerChild(t *testing.T, conn net.Conn, register Register) {
+	t.Helper()
+	frame, err := Encode(register)
+	if err != nil {
+		t.Fatalf("encode register: %v", err)
+	}
+	if _, err := conn.Write(frame); err != nil {
+		t.Fatalf("write register: %v", err)
+	}
+}
+
+func defaultRegister() Register {
+	return Register{
+		Type: MsgRegister, Protocol: ProtocolVersion, Port: 50516, MCPPort: 50517,
+		Version: "0.1.0", PID: 4242,
+	}
+}
+
 func TestServerRegisterAndMint(t *testing.T) {
 	srv := newTestServer(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -60,14 +78,8 @@ func TestServerRegisterAndMint(t *testing.T) {
 	go srv.Start(ctx, func(r Register) { registered <- r })
 
 	conn := dialChild(t)
-	want := Register{Type: MsgRegister, Port: 50516, Version: "0.1.0", PID: 4242}
-	frame, err := Encode(want)
-	if err != nil {
-		t.Fatalf("encode register: %v", err)
-	}
-	if _, err := conn.Write(frame); err != nil {
-		t.Fatalf("write register: %v", err)
-	}
+	want := defaultRegister()
+	registerChild(t, conn, want)
 
 	select {
 	case got := <-registered:
@@ -123,6 +135,34 @@ func TestSendBeforeConnectFailsOpen(t *testing.T) {
 	}
 }
 
+func TestServerRejectsNonV1Register(t *testing.T) {
+	srv := newTestServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	registered := make(chan Register, 1)
+	go srv.Start(ctx, func(register Register) { registered <- register })
+
+	conn := dialChild(t)
+	_, err := conn.Write([]byte(`{"type":"register","protocol":0,"port":50516,"mcp_port":50517,"version":"0.1.0","pid":4242}` + "\n"))
+	if err != nil {
+		t.Fatalf("write stale register: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("stale proxy connection remained open")
+	}
+	if srv.Connected() {
+		t.Fatal("stale proxy was admitted")
+	}
+	select {
+	case got := <-registered:
+		t.Fatalf("stale proxy registered: %+v", got)
+	default:
+	}
+}
+
 func TestSendEmptyConfigDefaultsToObject(t *testing.T) {
 	srv := newTestServer(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -130,6 +170,7 @@ func TestSendEmptyConfigDefaultsToObject(t *testing.T) {
 	go srv.Start(ctx, func(Register) {})
 
 	conn := dialChild(t)
+	registerChild(t, conn, defaultRegister())
 	if err := waitConnected(srv); err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +198,7 @@ func TestServerSurvivesChildReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first dial: %v", err)
 	}
+	registerChild(t, first, defaultRegister())
 	if err := waitConnected(srv); err != nil {
 		t.Fatal(err)
 	}
@@ -170,6 +212,7 @@ func TestServerSurvivesChildReconnect(t *testing.T) {
 
 	// A respawned child reconnects to the still-open listener and can be minted.
 	second := dialChild(t)
+	registerChild(t, second, defaultRegister())
 	if err := waitConnected(srv); err != nil {
 		t.Fatal(err)
 	}
@@ -191,6 +234,7 @@ func TestServerCancellationClosesConnectedChild(t *testing.T) {
 	}()
 
 	conn := dialChild(t)
+	registerChild(t, conn, defaultRegister())
 	if err := waitConnected(srv); err != nil {
 		t.Fatal(err)
 	}

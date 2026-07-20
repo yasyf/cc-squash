@@ -7,7 +7,7 @@ import (
 )
 
 func TestEncodeAppendsNewline(t *testing.T) {
-	data, err := Encode(Shutdown{Type: MsgShutdown})
+	data, err := Encode(Shutdown{Type: MsgShutdown, Protocol: ProtocolVersion})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -24,12 +24,12 @@ func TestRoundTripDispatch(t *testing.T) {
 		id  string
 		msg any
 	}{
-		{"register", Register{Type: MsgRegister, Port: 50516, MCPPort: 50517, Version: "0.1.0", PID: 4242}},
-		{"evict", Evict{Type: MsgEvict, Token: "tok-abc"}},
-		{"shadow", Shadow{Type: MsgShadow, On: true}},
-		{"kill", Kill{Type: MsgKill, On: true}},
-		{"gc", Gc{Type: MsgGc}},
-		{"shutdown", Shutdown{Type: MsgShutdown}},
+		{"register", Register{Type: MsgRegister, Protocol: ProtocolVersion, Port: 50516, MCPPort: 50517, Version: "0.1.0", PID: 4242}},
+		{"evict", Evict{Type: MsgEvict, Protocol: ProtocolVersion, Token: "tok-abc"}},
+		{"shadow", Shadow{Type: MsgShadow, Protocol: ProtocolVersion, On: true}},
+		{"kill", Kill{Type: MsgKill, Protocol: ProtocolVersion, On: true}},
+		{"gc", Gc{Type: MsgGc, Protocol: ProtocolVersion}},
+		{"shutdown", Shutdown{Type: MsgShutdown, Protocol: ProtocolVersion}},
 	} {
 		t.Run(tc.id, func(t *testing.T) {
 			frame, err := Encode(tc.msg)
@@ -50,7 +50,7 @@ func TestRoundTripDispatch(t *testing.T) {
 // TestRoundTripMint covers Mint separately: its Config json.RawMessage is a
 // []byte, so the struct is not comparable with == and needs field-wise checks.
 func TestRoundTripMint(t *testing.T) {
-	want := Mint{Type: MsgMint, Token: "tok-abc", Config: json.RawMessage(`{"k":1}`)}
+	want := Mint{Type: MsgMint, Protocol: ProtocolVersion, Token: "tok-abc", Config: json.RawMessage(`{"k":1}`)}
 	frame, err := Encode(want)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -63,7 +63,7 @@ func TestRoundTripMint(t *testing.T) {
 	if !ok {
 		t.Fatalf("decoded to %T, want Mint", decoded)
 	}
-	if got.Type != want.Type || got.Token != want.Token || !bytes.Equal(got.Config, want.Config) {
+	if got.Type != want.Type || got.Protocol != want.Protocol || got.Token != want.Token || !bytes.Equal(got.Config, want.Config) {
 		t.Fatalf("mint mismatch: got %+v, want %+v", got, want)
 	}
 }
@@ -73,7 +73,7 @@ func TestRoundTripMint(t *testing.T) {
 // Go must read it onto Register.MCPPort. The literal here is the shape seam.rs
 // emits.
 func TestRegisterDecodesMCPPort(t *testing.T) {
-	decoded, err := Decode([]byte(`{"type":"register","port":50516,"mcp_port":50517,"version":"0.1.0","pid":4242}`))
+	decoded, err := Decode([]byte(`{"type":"register","protocol":1,"port":50516,"mcp_port":50517,"version":"0.1.0","pid":4242}`))
 	if err != nil {
 		t.Fatalf("decode register: %v", err)
 	}
@@ -83,6 +83,25 @@ func TestRegisterDecodesMCPPort(t *testing.T) {
 	}
 	if reg.Port != 50516 || reg.MCPPort != 50517 {
 		t.Fatalf("register = port %d mcp_port %d, want 50516/50517", reg.Port, reg.MCPPort)
+	}
+}
+
+func TestProtocolIsExact(t *testing.T) {
+	for _, frame := range []string{
+		`{"type":"shutdown"}`,
+		`{"type":"shutdown","protocol":2}`,
+		`{"type":"shutdown","protocol":1,"legacy":true}`,
+		`{"type":"shutdown","protocol":1}{}`,
+	} {
+		if _, err := Decode([]byte(frame)); err == nil {
+			t.Fatalf("Decode accepted %s", frame)
+		}
+	}
+	if _, err := Encode(Shutdown{Type: MsgShutdown}); err == nil {
+		t.Fatal("Encode accepted a frame without protocol 1")
+	}
+	if _, err := Encode(Shutdown{Type: MsgKill, Protocol: ProtocolVersion}); err == nil {
+		t.Fatal("Encode accepted a concrete message with the wrong type")
 	}
 }
 

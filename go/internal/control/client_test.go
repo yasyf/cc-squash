@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/version"
 )
 
@@ -20,6 +21,12 @@ func shortHome(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	t.Setenv("HOME", dir)
+	if err := paths.EnsureStateDir(); err != nil {
+		t.Fatalf("state dir: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigPath(), []byte("schema_version = 1\n"), 0o600); err != nil {
+		t.Fatalf("config: %v", err)
+	}
 }
 
 func TestClientPersistentBusinessAndLifecycleRoundTrips(t *testing.T) {

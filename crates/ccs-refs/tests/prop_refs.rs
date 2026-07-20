@@ -31,7 +31,7 @@ proptest! {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
             let dir = tempdir().unwrap();
-            let store = RefStore::open(dir.path().join("refs.db")).await.unwrap();
+            let store = RefStore::open(dir.path().join("refs-v1.db")).await.unwrap();
 
             let mut ids: Vec<RefId> = Vec::new();
             for payload in &payloads {

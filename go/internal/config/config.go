@@ -6,8 +6,10 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 
 	toml "github.com/pelletier/go-toml/v2"
@@ -39,25 +41,31 @@ type Policy struct {
 // reads. Both sections are pointers so an entirely-unset section is omitted from
 // the JSON the seam carries.
 type Config struct {
-	Economics *Economics `toml:"economics" json:"economics,omitempty"`
-	Policy    *Policy    `toml:"policy" json:"policy,omitempty"`
+	SchemaVersion int        `toml:"schema_version" json:"-"`
+	Economics     *Economics `toml:"economics" json:"economics,omitempty"`
+	Policy        *Policy    `toml:"policy" json:"policy,omitempty"`
 }
 
 // Load reads ~/.cc-squash/config.toml and returns the seam JSON the daemon
-// pushes to the proxy on every mint. An absent file yields `{}` (engine
-// defaults, not an error); a present file is parsed and re-marshalled so the
-// JSON carries only the keys the user set.
+// pushes to the proxy on every mint. The retained source-of-truth configuration
+// must explicitly declare schema version 1; there is no legacy reader or
+// automatic migration.
 func Load() (json.RawMessage, error) {
 	data, err := os.ReadFile(paths.ConfigPath())
 	if errors.Is(err, os.ErrNotExist) {
-		return json.RawMessage("{}"), nil
+		return nil, fmt.Errorf("%s is required with schema_version = 1", paths.ConfigPath())
 	}
 	if err != nil {
 		return nil, err
 	}
 	var cfg Config
-	if err := toml.Unmarshal(data, &cfg); err != nil {
+	decoder := toml.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cfg); err != nil {
 		return nil, err
+	}
+	if cfg.SchemaVersion != 1 {
+		return nil, fmt.Errorf("%s has schema_version = %d, want 1; transfer the retained settings manually", paths.ConfigPath(), cfg.SchemaVersion)
 	}
 	return json.Marshal(cfg)
 }

@@ -9,7 +9,7 @@ use tempfile::tempdir;
 
 async fn store() -> (tempfile::TempDir, RefStore) {
     let dir = tempdir().unwrap();
-    let store = RefStore::open(dir.path().join("refs.db")).await.unwrap();
+    let store = RefStore::open(dir.path().join("refs-v1.db")).await.unwrap();
     (dir, store)
 }
 
@@ -225,7 +225,7 @@ async fn fuse_flag_gates_the_read_line() {
 #[tokio::test]
 async fn store_reopens_across_sessions() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("refs.db");
+    let path = dir.path().join("refs-v1.db");
     let ref_id = {
         let store = RefStore::open(&path).await.unwrap();
         store
@@ -250,4 +250,69 @@ async fn store_reopens_across_sessions() {
             .text,
         "durable"
     );
+}
+
+#[tokio::test]
+async fn fresh_store_authors_epoch_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("refs-v1.db");
+    let store = RefStore::open(&path).await.unwrap();
+    drop(store);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let connection = tokio_rusqlite::Connection::open(path).await.unwrap();
+    let version = connection
+        .call(|conn| conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)))
+        .await
+        .unwrap();
+    assert_eq!(version, 1);
+}
+
+#[tokio::test]
+async fn store_rejects_non_v1_without_migration() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("refs-v1.db");
+    let connection = tokio_rusqlite::Connection::open(&path).await.unwrap();
+    connection
+        .call(|conn| -> tokio_rusqlite::rusqlite::Result<()> {
+            conn.execute_batch("CREATE TABLE legacy (id INTEGER PRIMARY KEY);")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    drop(connection);
+
+    let error = RefStore::open(&path)
+        .await
+        .err()
+        .expect("legacy store opened");
+    assert!(error.to_string().contains("schema mismatch"));
+}
+
+#[tokio::test]
+async fn store_rejects_v1_with_extra_objects() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("refs-v1.db");
+    let store = RefStore::open(&path).await.unwrap();
+    drop(store);
+    let connection = tokio_rusqlite::Connection::open(&path).await.unwrap();
+    connection
+        .call(|conn| -> tokio_rusqlite::rusqlite::Result<()> {
+            conn.execute_batch("CREATE TABLE unexpected (value TEXT NOT NULL);")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    drop(connection);
+
+    let error = RefStore::open(&path)
+        .await
+        .err()
+        .expect("skewed store opened");
+    assert!(error.to_string().contains("schema mismatch"));
 }

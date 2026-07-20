@@ -1427,7 +1427,7 @@ mod tests {
         assert!(payload.len() >= 1024, "the payload clears the dedup floor");
 
         let dir = tempfile::TempDir::new().unwrap();
-        let store = RefStore::open(dir.path().join("refs.db")).await.unwrap();
+        let store = RefStore::open(dir.path().join("refs-v1.db")).await.unwrap();
         let session = SessionId::new("s");
         let record = store
             .put(

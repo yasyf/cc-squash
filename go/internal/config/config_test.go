@@ -33,18 +33,21 @@ func homeWithConfig(t *testing.T, toml string) {
 
 func TestLoad(t *testing.T) {
 	cases := []struct {
-		name string
-		toml string
-		want string
+		name    string
+		toml    string
+		want    string
+		wantErr bool
 	}{
 		{
-			name: "absent file yields empty object",
-			toml: "",
-			want: `{}`,
+			name:    "absent file requires manual cutover",
+			toml:    "",
+			wantErr: true,
 		},
 		{
 			name: "econ and policy keys round-trip to snake_case json",
-			toml: `[economics]
+			toml: `schema_version = 1
+
+[economics]
 npv_floor = 0.5
 ttl_forced_s = 120.0
 
@@ -56,21 +59,44 @@ cache_hint_cap = 8
 		},
 		{
 			name: "unset section is omitted entirely",
-			toml: `[policy]
+			toml: `schema_version = 1
+
+[policy]
 lookback_positions = 40
 `,
 			want: `{"policy":{"lookback_positions":40}}`,
 		},
 		{
 			name: "empty config file yields empty object",
-			toml: "# just a comment\n",
+			toml: "schema_version = 1\n# just a comment\n",
 			want: `{}`,
+		},
+		{
+			name:    "missing schema version is rejected",
+			toml:    "[policy]\nlookback_positions = 40\n",
+			wantErr: true,
+		},
+		{
+			name:    "non-v1 schema is rejected",
+			toml:    "schema_version = 2\n",
+			wantErr: true,
+		},
+		{
+			name:    "unknown schema field is rejected",
+			toml:    "schema_version = 1\nold_mode = true\n",
+			wantErr: true,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			homeWithConfig(t, c.toml)
 			got, err := Load()
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("Load() succeeded with %s", got)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("Load: %v", err)
 			}

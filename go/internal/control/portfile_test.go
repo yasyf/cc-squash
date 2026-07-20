@@ -35,3 +35,18 @@ func TestWritePortPerm0600(t *testing.T) {
 		t.Fatalf("got perm %o, want 600", perm)
 	}
 }
+
+func TestPortFileRejectsNonV1Content(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := paths.EnsureStateDir(); err != nil {
+		t.Fatalf("state dir: %v", err)
+	}
+	for _, data := range []string{"0", "65536", "50515\n", " 50515"} {
+		if err := os.WriteFile(paths.PortFilePath(), []byte(data), 0o600); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+		if _, err := ReadPort(); err == nil {
+			t.Fatalf("ReadPort accepted %q", data)
+		}
+	}
+}

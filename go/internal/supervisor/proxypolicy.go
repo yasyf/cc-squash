@@ -17,7 +17,7 @@ const waitGonePoll = 50 * time.Millisecond
 // ProxyPolicy implements Policy for the Rust ccs-proxy child. The generic
 // revive/replace/breaker mechanism is Supervisor's; this policy supplies
 // the cc-squash judgements and child-control effects, all routed through the
-// proxy.sock seam (the data plane carries no separate health socket — the seam
+// proxy-v1.sock seam (the data plane carries no separate health socket — the seam
 // connection IS the liveness signal). The proxy is itself the data plane, so a
 // crash-loop has no symlink fallback to retreat to: Retreat logs and the next
 // Tick retries.

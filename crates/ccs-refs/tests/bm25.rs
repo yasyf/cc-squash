@@ -34,7 +34,7 @@ fn no_match_returns_a_sensible_default() {
 #[tokio::test]
 async fn retrieve_with_query_searches_within_the_stored_original() {
     let dir = tempdir().unwrap();
-    let store = RefStore::open(dir.path().join("refs.db")).await.unwrap();
+    let store = RefStore::open(dir.path().join("refs-v1.db")).await.unwrap();
     let rec = store
         .put(
             DOC.as_bytes(),

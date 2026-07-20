@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 #[derive(Parser, Debug)]
 #[command(name = "ccs-proxy", version)]
 struct Args {
-    /// Path to the Go control-plane seam socket (`proxy.sock`). When present the
+    /// Path to the Go control-plane epoch-1 seam socket. When present the
     /// proxy connects, registers, and applies control frames; when absent it
     /// serves standalone (no-seam dev mode).
     #[arg(long)]
@@ -26,10 +26,10 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     port: u16,
 
-    /// Directory for the refs database (`<state_dir>/refs.db`). When absent the
+    /// Exact path for the epoch-1 refs database. When absent the
     /// store opens at an ephemeral temp path (no-seam dev mode).
     #[arg(long)]
-    state_dir: Option<String>,
+    refs_db: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("ccs-proxy listening on http://{addr}");
     tracing::info!(%addr, %mcp_addr, "ccs-proxy relay starting (Layer 1)");
 
-    let store = Arc::new(RefStore::open(refs_db_path(args.state_dir.as_deref())).await?);
+    let store = Arc::new(RefStore::open(refs_db_path(args.refs_db)).await?);
     let state = AppState::new(store)?;
 
     // A seam `shutdown` frame and a SIGTERM/SIGINT both resolve through this one
@@ -137,12 +137,11 @@ fn warn_if_unset(var: &str) {
     }
 }
 
-/// The refs database path: `<state_dir>/refs.db` under the seam, else an
-/// ephemeral temp path keyed by pid for no-seam dev mode. The store is always
-/// present, so dev mode still gets a real (throwaway) db.
-fn refs_db_path(state_dir: Option<&str>) -> PathBuf {
-    match state_dir {
-        Some(dir) => PathBuf::from(dir).join("refs.db"),
-        None => std::env::temp_dir().join(format!("ccs-refs-{}.db", std::process::id())),
+/// The exact refs database path under the seam, else an ephemeral epoch-1 path
+/// keyed by pid for no-seam dev mode.
+fn refs_db_path(path: Option<PathBuf>) -> PathBuf {
+    match path {
+        Some(path) => path,
+        None => std::env::temp_dir().join(format!("ccs-refs-v1-{}.db", std::process::id())),
     }
 }

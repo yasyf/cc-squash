@@ -26,17 +26,17 @@ func SocketPath() string {
 
 // PortFilePath is the file holding the daemon's listening port.
 func PortFilePath() string {
-	return path("daemon.port")
+	return path("daemon-v1.port")
 }
 
 // ProxySocketPath is the unix socket the Rust ccs-proxy data plane listens on.
 func ProxySocketPath() string {
-	return path("proxy.sock")
+	return path("proxy-v1.sock")
 }
 
 // RefsDbPath is the SQLite database the Rust proxy opens for staged refs.
 func RefsDbPath() string {
-	return path("refs.db")
+	return path("refs-v1.db")
 }
 
 // LogPath is the daemon's log file.
@@ -46,7 +46,12 @@ func LogPath() string {
 
 // StatusPath is the out-of-process status mirror a status command reads.
 func StatusPath() string {
-	return path("status.json")
+	return path("status-v1.json")
+}
+
+// MCPConfigPath is the generated per-session Claude MCP configuration.
+func MCPConfigPath() string {
+	return path("mcp-v1.json")
 }
 
 // ConfigPath is the user's cc-squash configuration file.

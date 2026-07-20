@@ -9,7 +9,7 @@ use tempfile::tempdir;
 
 async fn store() -> (tempfile::TempDir, RefStore) {
     let dir = tempdir().unwrap();
-    let store = RefStore::open(dir.path().join("refs.db")).await.unwrap();
+    let store = RefStore::open(dir.path().join("refs-v1.db")).await.unwrap();
     (dir, store)
 }
 

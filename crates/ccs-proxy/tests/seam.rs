@@ -1,4 +1,4 @@
-//! Integration tests for the Rust end of the `proxy.sock` seam, driven against a
+//! Integration tests for the Rust end of the `proxy-v1.sock` seam, driven against a
 //! fake Go peer: a `tokio` `UnixListener` stands in for the control plane, accepts
 //! the proxy's connection, asserts the `register` frame's shape, then pushes
 //! `mint`/`kill`/`shutdown` control frames and observes the effect on the shared
@@ -87,6 +87,7 @@ async fn registers_then_applies_mint_kill_and_shutdown() {
     // 1. The register frame announces the bound port, version, and pid.
     let reg = read_frame(&mut peer_read).await;
     assert_eq!(reg["type"], "register");
+    assert_eq!(reg["protocol"], 1);
     assert_eq!(reg["port"], 54321);
     assert_eq!(reg["mcp_port"], 54322);
     assert_eq!(reg["version"], env!("CARGO_PKG_VERSION"));
@@ -95,9 +96,9 @@ async fn registers_then_applies_mint_kill_and_shutdown() {
         u64::from(std::process::id()),
     );
 
-    // 2. mint registers the token (with an unknown config field, ignored).
+    // 2. mint registers the token under the exact protocol.
     peer_write
-        .write_all(b"{\"type\":\"mint\",\"token\":\"tok-seam\",\"config\":{\"future\":1}}\n")
+        .write_all(b"{\"type\":\"mint\",\"protocol\":1,\"token\":\"tok-seam\",\"config\":{}}\n")
         .await
         .expect("send mint");
     let token = SessionToken("tok-seam".to_owned());
@@ -109,14 +110,14 @@ async fn registers_then_applies_mint_kill_and_shutdown() {
 
     // 3. kill flips the panic button.
     peer_write
-        .write_all(b"{\"type\":\"kill\",\"on\":true}\n")
+        .write_all(b"{\"type\":\"kill\",\"protocol\":1,\"on\":true}\n")
         .await
         .expect("send kill");
     await_until(|| state.kill.load(Ordering::Relaxed), "kill flips the flag").await;
 
     // 4. shutdown fires the shared notify and ends the read loop.
     peer_write
-        .write_all(b"{\"type\":\"shutdown\"}\n")
+        .write_all(b"{\"type\":\"shutdown\",\"protocol\":1}\n")
         .await
         .expect("send shutdown");
     tokio::time::timeout(Duration::from_secs(2), shutdown.notified())
@@ -147,13 +148,13 @@ async fn evict_removes_a_minted_session() {
 
     let token = SessionToken("tok-evict".to_owned());
     peer_write
-        .write_all(b"{\"type\":\"mint\",\"token\":\"tok-evict\",\"config\":{}}\n")
+        .write_all(b"{\"type\":\"mint\",\"protocol\":1,\"token\":\"tok-evict\",\"config\":{}}\n")
         .await
         .expect("send mint");
     await_until(|| state.sessions.contains_key(&token), "mint registers").await;
 
     peer_write
-        .write_all(b"{\"type\":\"evict\",\"token\":\"tok-evict\"}\n")
+        .write_all(b"{\"type\":\"evict\",\"protocol\":1,\"token\":\"tok-evict\"}\n")
         .await
         .expect("send evict");
     await_until(|| !state.sessions.contains_key(&token), "evict removes").await;
@@ -162,37 +163,35 @@ async fn evict_removes_a_minted_session() {
 }
 
 #[tokio::test]
-async fn malformed_frame_does_not_stop_the_loop() {
+async fn malformed_frame_ends_the_protocol_session() {
     let path = socket_path("malformed");
     let listener = UnixListener::bind(&path).expect("bind seam");
     let state = state().await;
     let shutdown = Arc::new(Notify::new());
 
     let client = UnixStream::connect(&path).await.expect("connect seam");
-    tokio::spawn(run_seam(client, state.clone(), shutdown, 40001, 40011));
+    let seam = tokio::spawn(run_seam(client, state.clone(), shutdown, 40001, 40011));
 
     let (peer, _) = listener.accept().await.expect("accept proxy");
     let (peer_read, mut peer_write) = peer.into_split();
     let mut peer_read = BufReader::new(peer_read);
     let _ = read_frame(&mut peer_read).await; // drain register
 
-    // A garbage line, then a valid mint: the loop must skip the first and apply
-    // the second, proving a malformed frame is fail-open, not fatal.
+    // A garbage line ends the exact protocol session before a later frame can
+    // mutate state.
     peer_write
         .write_all(
-            b"this is not json\n{\"type\":\"mint\",\"token\":\"after-garbage\",\"config\":{}}\n",
+            b"this is not json\n{\"type\":\"mint\",\"protocol\":1,\"token\":\"after-garbage\",\"config\":{}}\n",
         )
         .await
         .expect("send frames");
-    await_until(
-        || {
-            state
-                .sessions
-                .contains_key(&SessionToken("after-garbage".to_owned()))
-        },
-        "loop survives a malformed frame and applies the next",
-    )
-    .await;
+    tokio::time::timeout(Duration::from_secs(2), seam)
+        .await
+        .expect("seam did not reject malformed frame")
+        .expect("seam task panicked");
+    assert!(!state
+        .sessions
+        .contains_key(&SessionToken("after-garbage".to_owned())));
 
     let _ = std::fs::remove_file(&path);
 }

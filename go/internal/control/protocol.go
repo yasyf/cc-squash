@@ -6,7 +6,10 @@ import "time"
 
 // BusinessBuild is the exact cc-squash control schema identity. Release
 // identity is carried independently as daemonkit's LifecycleBuild.
-const BusinessBuild = "cc-squash.control.v2"
+const BusinessBuild = "cc-squash.control.v1"
+
+// StatusSchemaVersion is the exact on-disk status snapshot schema.
+const StatusSchemaVersion = 1
 
 // Op is a control request operation.
 type Op string
@@ -32,14 +35,15 @@ type ToggleRequest struct {
 // mirrored on disk for out-of-process readers. Layer-1 minimal; defined here so
 // other packages decode it without a forward dependency on the daemon.
 type StatusSnapshot struct {
-	Version     string    `json:"version"`
-	GeneratedAt time.Time `json:"generated_at"`
-	ProxyPort   int       `json:"proxy_port"`
-	ProxyMCPort int       `json:"proxy_mcp_port"`
-	ProxyPID    int       `json:"proxy_pid"`
-	Sessions    int       `json:"sessions"`
-	Kill        bool      `json:"kill"`
-	Shadow      bool      `json:"shadow"`
+	SchemaVersion int       `json:"schema_version"`
+	Version       string    `json:"version"`
+	GeneratedAt   time.Time `json:"generated_at"`
+	ProxyPort     int       `json:"proxy_port"`
+	ProxyMCPort   int       `json:"proxy_mcp_port"`
+	ProxyPID      int       `json:"proxy_pid"`
+	Sessions      int       `json:"sessions"`
+	Kill          bool      `json:"kill"`
+	Shadow        bool      `json:"shadow"`
 }
 
 // Response is one business-operation reply.

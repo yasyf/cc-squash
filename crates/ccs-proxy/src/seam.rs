@@ -1,5 +1,5 @@
-//! The Rust client end of the `proxy.sock` seam. The Go control plane binds and
-//! listens on `proxy.sock`; this proxy is spawned with `--socket=<path>` and
+//! The Rust client end of the `proxy-v1.sock` seam. The Go control plane binds
+//! it; this proxy is spawned with `--socket=<path>` and
 //! connects as the client. After connecting it sends a single [`Register`] frame
 //! announcing its bound TCP port, version, and pid; thereafter the control plane
 //! streams [`Control`] frames (mint/evict/shadow/kill/shutdown) one line-delimited
@@ -25,6 +25,8 @@ use crate::app::AppState;
 use crate::config::RelayConfig;
 use crate::demux::{SessionCtx, SessionToken};
 
+const PROTOCOL_VERSION: u32 = 1;
+
 /// The grace window a ref is protected from GC after it is first stored. MUST
 /// exceed the worst-case squash→persist latency: a ref that was just staged and
 /// spliced but whose owning session hasn't yet re-staged (so it's no longer in
@@ -46,6 +48,7 @@ const MAX_REFS_BYTES: u64 = 256 * 1024 * 1024;
 struct Register {
     #[serde(rename = "type")]
     kind: &'static str,
+    protocol: u32,
     port: u16,
     mcp_port: u16,
     version: &'static str,
@@ -56,6 +59,7 @@ impl Register {
     fn announce(port: u16, mcp_port: u16) -> Self {
         Self {
             kind: "register",
+            protocol: PROTOCOL_VERSION,
             port,
             mcp_port,
             version: env!("CARGO_PKG_VERSION"),
@@ -64,28 +68,47 @@ impl Register {
     }
 }
 
-/// A Go -> Rust control frame. Internally tagged on `type`; unknown fields are
-/// ignored (the per-session config slice deserialises permissively), and the
-/// `config` payload defaults to an empty [`RelayConfig`] when Go omits it.
+/// A Go -> Rust control frame. Every frame carries the exact protocol epoch;
+/// unknown or omitted fields reject the session.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 enum Control {
     Mint {
+        protocol: u32,
         token: String,
-        #[serde(default)]
         config: RelayConfig,
     },
     Evict {
+        protocol: u32,
         token: String,
     },
     Shadow {
+        protocol: u32,
         on: bool,
     },
     Kill {
+        protocol: u32,
         on: bool,
     },
-    Gc,
-    Shutdown,
+    Gc {
+        protocol: u32,
+    },
+    Shutdown {
+        protocol: u32,
+    },
+}
+
+impl Control {
+    fn protocol(&self) -> u32 {
+        match self {
+            Self::Mint { protocol, .. }
+            | Self::Evict { protocol, .. }
+            | Self::Shadow { protocol, .. }
+            | Self::Kill { protocol, .. }
+            | Self::Gc { protocol }
+            | Self::Shutdown { protocol } => *protocol,
+        }
+    }
 }
 
 /// Connect, register, and run the read loop until the stream ends or a
@@ -129,6 +152,10 @@ pub async fn run_seam<S>(
                     shutdown.notify_one();
                     return;
                 }
+                ControlOutcome::ProtocolError => {
+                    tracing::warn!("seam rejected a non-v1 control frame; serving standalone");
+                    return;
+                }
             },
             Ok(None) => {
                 tracing::warn!("seam closed by control plane; serving standalone");
@@ -146,13 +173,18 @@ pub async fn run_seam<S>(
 enum ControlOutcome {
     Continue,
     Shutdown,
+    ProtocolError,
 }
 
 /// Parse one line and apply it to the control surface. A malformed line is logged
 /// and skipped (fail-open), keeping the loop alive for the next frame.
 fn apply(line: &str, state: &AppState) -> ControlOutcome {
-    match serde_json::from_str::<Control>(line) {
-        Ok(Control::Mint { token, config }) => {
+    let control = match serde_json::from_str::<Control>(line) {
+        Ok(control) if control.protocol() == PROTOCOL_VERSION => control,
+        Ok(_) | Err(_) => return ControlOutcome::ProtocolError,
+    };
+    match control {
+        Control::Mint { token, config, .. } if !token.is_empty() => {
             state.sessions.insert(
                 SessionToken(token.clone()),
                 SessionCtx {
@@ -163,27 +195,24 @@ fn apply(line: &str, state: &AppState) -> ControlOutcome {
             );
             ControlOutcome::Continue
         }
-        Ok(Control::Evict { token }) => {
+        Control::Evict { token, .. } if !token.is_empty() => {
             state.sessions.remove(&SessionToken(token));
             ControlOutcome::Continue
         }
-        Ok(Control::Shadow { on }) => {
+        Control::Shadow { on, .. } => {
             state.shadow.store(on, Ordering::Relaxed);
             ControlOutcome::Continue
         }
-        Ok(Control::Kill { on }) => {
+        Control::Kill { on, .. } => {
             state.kill.store(on, Ordering::Relaxed);
             ControlOutcome::Continue
         }
-        Ok(Control::Gc) => {
+        Control::Gc { .. } => {
             run_gc(state);
             ControlOutcome::Continue
         }
-        Ok(Control::Shutdown) => ControlOutcome::Shutdown,
-        Err(e) => {
-            tracing::warn!(error = %e, "seam dropping malformed frame");
-            ControlOutcome::Continue
-        }
+        Control::Shutdown { .. } => ControlOutcome::Shutdown,
+        Control::Mint { .. } | Control::Evict { .. } => ControlOutcome::ProtocolError,
     }
 }
 
@@ -278,6 +307,7 @@ mod tests {
     fn register_frame_shape() {
         let json = serde_json::to_value(Register::announce(8080, 9090)).unwrap();
         assert_eq!(json["type"], "register");
+        assert_eq!(json["protocol"], PROTOCOL_VERSION);
         assert_eq!(json["port"], 8080);
         assert_eq!(json["mcp_port"], 9090);
         assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
@@ -288,7 +318,10 @@ mod tests {
     fn mint_inserts_session_with_config() {
         let state = state();
         assert!(matches!(
-            apply(r#"{"type":"mint","token":"tok-a","config":{}}"#, &state),
+            apply(
+                r#"{"type":"mint","protocol":1,"token":"tok-a","config":{}}"#,
+                &state
+            ),
             ControlOutcome::Continue
         ));
         assert!(state
@@ -297,22 +330,28 @@ mod tests {
     }
 
     #[test]
-    fn mint_without_config_defaults() {
+    fn mint_without_config_is_rejected() {
         let state = state();
-        apply(r#"{"type":"mint","token":"tok-b"}"#, &state);
-        assert!(state
+        assert!(matches!(
+            apply(r#"{"type":"mint","protocol":1,"token":"tok-b"}"#, &state),
+            ControlOutcome::ProtocolError
+        ));
+        assert!(!state
             .sessions
             .contains_key(&SessionToken("tok-b".to_owned())));
     }
 
     #[test]
-    fn mint_ignores_unknown_config_fields() {
+    fn mint_rejects_unknown_config_fields() {
         let state = state();
-        apply(
-            r#"{"type":"mint","token":"tok-c","config":{"future_knob":42}}"#,
-            &state,
-        );
-        assert!(state
+        assert!(matches!(
+            apply(
+                r#"{"type":"mint","protocol":1,"token":"tok-c","config":{"future_knob":42}}"#,
+                &state,
+            ),
+            ControlOutcome::ProtocolError
+        ));
+        assert!(!state
             .sessions
             .contains_key(&SessionToken("tok-c".to_owned())));
     }
@@ -320,8 +359,11 @@ mod tests {
     #[test]
     fn evict_removes_session() {
         let state = state();
-        apply(r#"{"type":"mint","token":"tok-d","config":{}}"#, &state);
-        apply(r#"{"type":"evict","token":"tok-d"}"#, &state);
+        apply(
+            r#"{"type":"mint","protocol":1,"token":"tok-d","config":{}}"#,
+            &state,
+        );
+        apply(r#"{"type":"evict","protocol":1,"token":"tok-d"}"#, &state);
         assert!(!state
             .sessions
             .contains_key(&SessionToken("tok-d".to_owned())));
@@ -330,11 +372,11 @@ mod tests {
     #[test]
     fn kill_and_shadow_flip_flags() {
         let state = state();
-        apply(r#"{"type":"kill","on":true}"#, &state);
+        apply(r#"{"type":"kill","protocol":1,"on":true}"#, &state);
         assert!(state.kill.load(Ordering::Relaxed));
-        apply(r#"{"type":"shadow","on":true}"#, &state);
+        apply(r#"{"type":"shadow","protocol":1,"on":true}"#, &state);
         assert!(state.shadow.load(Ordering::Relaxed));
-        apply(r#"{"type":"kill","on":false}"#, &state);
+        apply(r#"{"type":"kill","protocol":1,"on":false}"#, &state);
         assert!(!state.kill.load(Ordering::Relaxed));
     }
 
@@ -342,21 +384,25 @@ mod tests {
     fn shutdown_frame_signals_shutdown() {
         let state = state();
         assert!(matches!(
-            apply(r#"{"type":"shutdown"}"#, &state),
+            apply(r#"{"type":"shutdown","protocol":1}"#, &state),
             ControlOutcome::Shutdown
         ));
     }
 
     #[test]
-    fn malformed_frame_is_skipped_not_fatal() {
+    fn malformed_or_non_v1_frame_is_rejected() {
         let state = state();
         assert!(matches!(
             apply("{ not json", &state),
-            ControlOutcome::Continue
+            ControlOutcome::ProtocolError
         ));
         assert!(matches!(
-            apply(r#"{"type":"unknown-kind","x":1}"#, &state),
-            ControlOutcome::Continue
+            apply(r#"{"type":"unknown-kind","protocol":1}"#, &state),
+            ControlOutcome::ProtocolError
+        ));
+        assert!(matches!(
+            apply(r#"{"type":"gc","protocol":2}"#, &state),
+            ControlOutcome::ProtocolError
         ));
     }
 
@@ -465,7 +511,7 @@ mod tests {
         // The Gc control frame itself is non-fatal (spawns the sweep, keeps the loop).
         let _guard = rt.enter();
         assert!(matches!(
-            apply(r#"{"type":"gc"}"#, &state),
+            apply(r#"{"type":"gc","protocol":1}"#, &state),
             ControlOutcome::Continue
         ));
     }

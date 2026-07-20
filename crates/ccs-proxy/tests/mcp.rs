@@ -29,7 +29,7 @@ struct Harness {
 impl Harness {
     async fn start() -> Self {
         let dir = TempDir::new().unwrap();
-        let store = Arc::new(RefStore::open(dir.path().join("refs.db")).await.unwrap());
+        let store = Arc::new(RefStore::open(dir.path().join("refs-v1.db")).await.unwrap());
         let state =
             AppState::with_upstream(reqwest::Url::parse("http://127.0.0.1:1").unwrap(), store)
                 .unwrap();
@@ -235,7 +235,7 @@ async fn mcp_panic_isolated_from_relay() {
     use tower::ServiceExt;
 
     let dir = TempDir::new().unwrap();
-    let store = Arc::new(RefStore::open(dir.path().join("refs.db")).await.unwrap());
+    let store = Arc::new(RefStore::open(dir.path().join("refs-v1.db")).await.unwrap());
     let state =
         AppState::with_upstream(reqwest::Url::parse("http://127.0.0.1:1").unwrap(), store).unwrap();
     let router = mcp_router(state);

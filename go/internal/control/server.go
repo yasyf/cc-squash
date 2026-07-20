@@ -435,7 +435,7 @@ func (p *proxySpawner) EnsureRunning(ctx context.Context) error {
 		Args: []string{
 			"--socket", p.server.proxySock,
 			"--port", strconv.Itoa(p.server.currentProxyPort()),
-			"--state-dir", paths.StateDir(),
+			"--refs-db", paths.RefsDbPath(),
 		},
 		Stdout: logFile, Stderr: logFile, ReadinessTimeout: p.Timeout(),
 		Ready: func(readyCtx context.Context, _ proc.Record) error {
@@ -556,7 +556,7 @@ func (s *Server) awaitProxyReady(ctx context.Context) {
 
 // handleKill records the kill toggle as the daemon's own state (the single
 // source of truth — it is exactly what the proxy is now running), pushes it over
-// the seam (fail-open), and refreshes status.json so both `ccs status` and `ccs
+// the seam (fail-open), and refreshes status-v1.json so both `ccs status` and `ccs
 // kill status` reflect it immediately.
 func (s *Server) handleKill(on bool) Response {
 	s.mu.Lock()
@@ -570,7 +570,7 @@ func (s *Server) handleKill(on bool) Response {
 }
 
 // handleShadow records the shadow toggle as the daemon's own state, pushes it
-// over the seam (fail-open), and refreshes status.json so the status views
+// over the seam (fail-open), and refreshes status-v1.json so the status views
 // reflect it immediately.
 func (s *Server) handleShadow(on bool) Response {
 	s.mu.Lock()
@@ -598,7 +598,7 @@ func (s *Server) handleGc() Response {
 	return Response{OK: true}
 }
 
-// publishStatus mirrors the live snapshot to status.json so out-of-process
+// publishStatus mirrors the live snapshot to status-v1.json so out-of-process
 // readers (`ccs status`, `ccs kill status`) see the daemon's current state
 // without querying the socket. A write failure is logged, not fatal — the
 // in-memory snapshot OpStatus serves stays authoritative.
@@ -631,13 +631,14 @@ func (s *Server) snapshot() StatusSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return StatusSnapshot{
-		Version:     version.String(),
-		GeneratedAt: time.Now().UTC(),
-		ProxyPort:   s.proxyPort,
-		ProxyMCPort: s.mcpPort,
-		ProxyPID:    s.proxyPID,
-		Sessions:    len(s.tokens),
-		Kill:        s.kill,
-		Shadow:      s.shadow,
+		SchemaVersion: StatusSchemaVersion,
+		Version:       version.String(),
+		GeneratedAt:   time.Now().UTC(),
+		ProxyPort:     s.proxyPort,
+		ProxyMCPort:   s.mcpPort,
+		ProxyPID:      s.proxyPID,
+		Sessions:      len(s.tokens),
+		Kill:          s.kill,
+		Shadow:        s.shadow,
 	}
 }

@@ -2,7 +2,7 @@
 // control plane's own version. The generic state machine — revive a dead child
 // under spawn backoff and a crash-loop breaker, spare an alive-but-wedged one,
 // replace a version-skewed one — lives here; ProxyPolicy supplies every
-// cc-squash judgement (what "reachable" means over the proxy.sock seam, how the
+// cc-squash judgement (what "reachable" means over the proxy-v1.sock seam, how the
 // child is shut down / waited out / killed, what to re-establish after a
 // respawn). SuperviseLoop drives the cadence.
 package supervisor

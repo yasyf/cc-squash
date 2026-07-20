@@ -38,7 +38,7 @@ fn harness() -> &'static Harness {
                 .mount(&upstream)
                 .await;
             let store = Arc::new(
-                RefStore::open(refs_dir.path().join("refs.db"))
+                RefStore::open(refs_dir.path().join("refs-v1.db"))
                     .await
                     .expect("open refs db"),
             );

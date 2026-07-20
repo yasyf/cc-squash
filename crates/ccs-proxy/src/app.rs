@@ -46,7 +46,8 @@ pub struct AppState {
     /// The relay config the control plane hot-swaps in; read on the hot path.
     pub config: Arc<ArcSwap<RelayConfig>>,
     /// The content-addressed reversible store. Always present — opened against
-    /// `state_dir/refs.db` under the seam, or an ephemeral temp db in no-seam
+    /// the exact `refs-v1.db` passed by the control plane, or an ephemeral temp
+    /// db in no-seam
     /// dev mode and tests. Construct it with [`RefStore::open`] in async main
     /// and hand the `Arc` here.
     pub store: Arc<RefStore>,

@@ -59,7 +59,13 @@ pub enum RetrieveResult {
 /// An error from the reversible store.
 #[derive(Debug, thiserror::Error)]
 pub enum RefError {
+    /// A local filesystem operation failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     /// A database error from the underlying sqlite connection.
     #[error(transparent)]
     Db(#[from] tokio_rusqlite::Error),
+    /// The database is not the exact epoch-1 schema.
+    #[error("refs store schema mismatch: {0}")]
+    Schema(String),
 }
