@@ -130,7 +130,7 @@ jobs:
       # the default GITHUB_TOKEN cannot push cross-repo.
       - name: Publish the formula to the tap
         if: ${{ !contains(github.ref_name, '-') }}
-        uses: yasyf/homebrew-tap/.github/actions/publish@v1
+        uses: yasyf/homebrew-tap/.github/actions/publish@v2
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: tap-staging
