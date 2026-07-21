@@ -70,6 +70,12 @@ func StartLockPath() string { return daemon.StartLockPath() }
 // ProcessStorePath is daemonkit's durable process identity and receipt ledger.
 func ProcessStorePath() string { return path("processes.db") }
 
+// ServiceStatePath is daemonkit's exact desired LaunchAgent set.
+func ServiceStatePath() string { return path("services-v1.db") }
+
+// ServiceProcessStorePath is daemonkit's service-worker identity and receipt ledger.
+func ServiceProcessStorePath() string { return path("service-processes-v1.db") }
+
 // BinDir holds binaries the daemon manages (the ccs-proxy child).
 func BinDir() string {
 	return path("bin")
