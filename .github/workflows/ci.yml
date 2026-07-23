@@ -76,9 +76,10 @@ jobs:
   # build + cargo build -p ccs-proxy), so this job just needs both toolchains.
   # Build-tagged `integration`, so the default `go` job never compiles it; this
   # job passes `-tags integration`. Separate from the unit gates so a flaky
-  # process-spawning run does not block them, but it runs on every push/PR.
+  # process-spawning run does not block them, but it runs on every push/PR. The
+  # control plane is launchd-managed, so this end-to-end gate must run on macOS.
   integration:
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
 
