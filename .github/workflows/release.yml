@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   verify-tag-on-main:
     runs-on: ubuntu-latest
@@ -104,15 +108,6 @@ jobs:
           name: tarballs
           path: dist/*.tar.gz
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            dist/*.tar.gz
-            dist/SHA256SUMS.txt
-          generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-
       # The formula lives in the shared external tap yasyf/homebrew-tap (it stays
       # a Formula, not a cask, for its `service` block — see the template), so
       # `brew install yasyf/tap/cc-squash` works without a bespoke tap URL.
@@ -126,10 +121,120 @@ jobs:
           substitutions: |
             __SHA_TARBALL__=${{ steps.shas.outputs.tarball }}
 
-      # HOMEBREW_TAP_TOKEN must be a PAT with push access to yasyf/homebrew-tap;
-      # the default GITHUB_TOKEN cannot push cross-repo.
-      - name: Publish the formula to the tap
+      - name: Verify the exact rendered formula
         if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          TARBALL_SHA: ${{ steps.shas.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          formula=tap-staging/Formula/cc-squash.rb
+          test -f "$formula"
+          ruby -c "$formula"
+          brew style "$formula"
+          if grep -Eq '__[A-Z0-9_]+__' "$formula"; then
+            echo "::error::unfilled template token remains in $formula"
+            exit 1
+          fi
+          grep -Fqx "  url \"https://github.com/yasyf/cc-squash/releases/download/${GITHUB_REF_NAME}/cc-squash-${GITHUB_REF_NAME}-darwin-universal.tar.gz\"" "$formula"
+          grep -Fqx "  sha256 \"${TARBALL_SHA}\"" "$formula"
+
+      - name: Upload the verified formula delivery
+        if: ${{ !contains(github.ref_name, '-') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: cc-squash-formula-${{ github.ref_name }}
+          path: tap-staging
+          if-no-files-found: error
+
+      - name: Record the exact release asset manifest
+        run: |
+          set -euo pipefail
+          archive="dist/cc-squash-${GITHUB_REF_NAME}-darwin-universal.tar.gz"
+          test -f "$archive"
+          test -f dist/SHA256SUMS.txt
+          test "$(wc -l < dist/SHA256SUMS.txt | tr -d ' ')" = 1
+          grep -Fq "  $(basename "$archive")" dist/SHA256SUMS.txt
+          printf '%s\n' "$archive" dist/SHA256SUMS.txt > "$RUNNER_TEMP/cc-squash-release-assets"
+
+      - name: Stage and verify the complete draft release
+        id: draft
+        uses: yasyf/homebrew-tap/.github/actions/stage-draft-release@54e3e194bda69896894a82c17fcdb2822beefab5
+        with:
+          token: ${{ github.token }}
+          tag: ${{ github.ref_name }}
+          manifest: ${{ runner.temp }}/cc-squash-release-assets
+          title: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+      - name: Smoke-test the exact downloaded release
+        env:
+          DOWNLOADED: ${{ steps.draft.outputs['download-dir'] }}
+        run: |
+          set -euo pipefail
+          archive="cc-squash-${GITHUB_REF_NAME}-darwin-universal.tar.gz"
+          (
+            cd "$DOWNLOADED"
+            shasum -a 256 -c SHA256SUMS.txt
+          )
+
+          contents="$RUNNER_TEMP/archive-contents"
+          printf '%s\n' ccs ccs-proxy > "$RUNNER_TEMP/expected-archive-contents"
+          tar -tzf "$DOWNLOADED/$archive" | sort > "$contents"
+          diff -u "$RUNNER_TEMP/expected-archive-contents" "$contents"
+
+          unpack="$RUNNER_TEMP/downloaded-release-smoke"
+          rm -rf "$unpack"
+          mkdir -p "$unpack"
+          tar -xzf "$DOWNLOADED/$archive" -C "$unpack"
+          for binary in ccs ccs-proxy; do
+            lipo -verify_arch arm64 x86_64 "$unpack/$binary"
+            codesign --verify --strict --verbose=2 "$unpack/$binary"
+            actual_team="$(codesign -dvv "$unpack/$binary" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+            test "$actual_team" = "$TEAM_ID"
+            spctl --assess --type execute --verbose=4 "$unpack/$binary"
+          done
+          "$unpack/ccs" --version | grep -Fq "$GITHUB_REF_NAME"
+          "$unpack/ccs-proxy" --version
+
+      - name: Publish the verified release
+        uses: yasyf/homebrew-tap/.github/actions/publish-draft-release@54e3e194bda69896894a82c17fcdb2822beefab5
+        with:
+          token: ${{ github.token }}
+          release-id: ${{ steps.draft.outputs['release-id'] }}
+          tag: ${{ github.ref_name }}
+          manifest: ${{ runner.temp }}/cc-squash-release-assets
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make-latest: ${{ !contains(github.ref_name, '-') }}
+
+  publish-tap:
+    needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the verified formula delivery
+        uses: actions/download-artifact@v8
+        with:
+          name: cc-squash-formula-${{ github.ref_name }}
+          path: tap-staging
+
+      - name: Verify the downloaded formula delivery
+        run: |
+          set -euo pipefail
+          formula=tap-staging/Formula/cc-squash.rb
+          test -f "$formula"
+          test "$(find tap-staging -type f | wc -l | tr -d ' ')" = 1
+          ruby -c "$formula"
+          grep -Fqx "  url \"https://github.com/yasyf/cc-squash/releases/download/${GITHUB_REF_NAME}/cc-squash-${GITHUB_REF_NAME}-darwin-universal.tar.gz\"" "$formula"
+          if grep -Eq '__[A-Z0-9_]+__' "$formula"; then
+            echo "::error::unfilled template token remains in $formula"
+            exit 1
+          fi
+
+      # HOMEBREW_TAP_TOKEN must be a PAT with push access to yasyf/homebrew-tap;
+      # the default GITHUB_TOKEN cannot push cross-repo. This separate job is
+      # intentionally last so a tap-only failure can rerun without rebuilding
+      # timestamp-signed release assets that are already public.
+      - name: Publish the formula to the tap
         uses: yasyf/homebrew-tap/.github/actions/publish@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
