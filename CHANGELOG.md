@@ -11,5 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Pin daemonkit v0.9.0 for the exact fleet-wide runtime hard cut.
+- Hard-cut service convergence to daemonkit v0.10.0 with an exact canonical
+  program and a fresh replacement-fenced controller-state epoch.
 
 [Unreleased]: https://github.com/yasyf/cc-squash/commits/main

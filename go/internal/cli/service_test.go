@@ -100,13 +100,21 @@ func TestEnsureDaemonCurrentConvergesServiceThenWaitsForBusinessHealth(t *testin
 	t.Setenv("HOME", "/tmp/ccs-service-home")
 	controller := useRecordingServiceController(t)
 	client := &runtimeClientStub{}
+	program, err := service.CanonicalExecutable()
+	if err != nil {
+		t.Fatalf("canonical executable: %v", err)
+	}
 
 	if err := ensureDaemonCurrentWith(t.Context(), time.Second, client); err != nil {
 		t.Fatalf("ensure current: %v", err)
 	}
 	if len(controller.desired) != 1 || len(controller.desired[0]) != 1 ||
-		controller.desired[0][0].Label != ccsAgent().Label {
+		controller.desired[0][0].Label != control.DaemonRoleID ||
+		controller.desired[0][0].Program != program {
 		t.Fatalf("desired service state = %+v", controller.desired)
+	}
+	if _, err := controller.desired[0][0].Plist(); err != nil {
+		t.Fatalf("render desired service: %v", err)
 	}
 	if got := controller.desired[0][0].Env["HOME"]; got != "/tmp/ccs-service-home" {
 		t.Fatalf("service HOME = %q", got)

@@ -68,7 +68,7 @@ func LocksDir() string {
 func ProcessStorePath() string { return path("processes.db") }
 
 // ServiceStatePath is daemonkit's exact desired LaunchAgent set.
-func ServiceStatePath() string { return path("services-v1.db") }
+func ServiceStatePath() string { return path("services-v2.db") }
 
 // ServiceProcessStorePath is daemonkit's service-worker identity and receipt ledger.
 func ServiceProcessStorePath() string { return path("service-processes-v1.db") }

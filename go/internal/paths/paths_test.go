@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestEpochOneDerivedPaths(t *testing.T) {
+func TestDerivedPaths(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	for name, path := range map[string]string{
 		"port":              PortFilePath(),
@@ -25,8 +25,8 @@ func TestEpochOneDerivedPaths(t *testing.T) {
 		filepath.Base(RefsDbPath()) != "refs-v1.db" ||
 		filepath.Base(StatusPath()) != "status-v1.json" ||
 		filepath.Base(MCPConfigPath()) != "mcp-v1.json" ||
-		filepath.Base(ServiceStatePath()) != "services-v1.db" ||
+		filepath.Base(ServiceStatePath()) != "services-v2.db" ||
 		filepath.Base(ServiceProcessStorePath()) != "service-processes-v1.db" {
-		t.Fatal("derived paths are not the exact epoch-1 names")
+		t.Fatal("derived paths are not the exact epoch names")
 	}
 }

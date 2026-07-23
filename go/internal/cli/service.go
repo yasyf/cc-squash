@@ -44,17 +44,20 @@ var openServiceController = func(ctx context.Context) (serviceController, error)
 
 // ccsAgent is cc-squash's daemon LaunchAgent / brew-services descriptor: the
 // generic launchctl + Homebrew lifecycle (daemonkit/service) configured with
-// cc-squash's label, formula, daemon args, log path, HOME, and PATH. The program
-// defaults to the running binary (os.Executable), so a Homebrew symlink stays a
-// stable launchd program path across upgrades.
-func ccsAgent() service.Agent {
+// cc-squash's label, formula, daemon args, log path, HOME, and PATH.
+func ccsAgent() (service.Agent, error) {
+	program, err := service.CanonicalExecutable()
+	if err != nil {
+		return service.Agent{}, err
+	}
 	return service.Agent{
 		Label:         control.DaemonRoleID,
+		Program:       program,
 		Args:          []string{"daemon"},
 		LogPath:       paths.LogPath(),
 		Env:           map[string]string{"HOME": os.Getenv("HOME"), "PATH": os.Getenv("PATH")},
 		RestartPolicy: service.RestartAlways,
-	}
+	}, nil
 }
 
 func withServiceController(
@@ -110,6 +113,10 @@ func installDaemonServiceWith(ctx context.Context, timeout time.Duration, client
 }
 
 func convergeDaemonService(ctx context.Context, client daemonRuntimeClient, current bool) error {
+	agent, err := ccsAgent()
+	if err != nil {
+		return err
+	}
 	var observed *control.RuntimeHealth
 	if !current {
 		health, err := client.RuntimeHealth(ctx)
@@ -127,7 +134,7 @@ func convergeDaemonService(ctx context.Context, client daemonRuntimeClient, curr
 				return err
 			}
 		}
-		return controller.Converge(ctx, []service.Agent{ccsAgent()})
+		return controller.Converge(ctx, []service.Agent{agent})
 	})
 }
 
