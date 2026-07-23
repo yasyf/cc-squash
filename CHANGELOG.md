@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-07-23
+
+### Fixed
+- Bind draft staging to the exact created release ID and use the concurrent
+  tap publisher so release creation cannot race tag-based discovery.
+
 ## [0.6.1] - 2026-07-23
 
 ### Fixed
@@ -21,4 +27,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   program and a fresh replacement-fenced controller-state epoch.
 
 [Unreleased]: https://github.com/yasyf/cc-squash/commits/main
+[0.6.2]: https://github.com/yasyf/cc-squash/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/yasyf/cc-squash/compare/v0.6.0...v0.6.1
