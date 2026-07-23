@@ -12,9 +12,13 @@ func TestRootCmdRegistersSubcommands(t *testing.T) {
 		got = append(got, c.Name())
 	}
 	slices.Sort(got)
-	want := []string{"daemon", "doctor", "env", "gc", "kill", "logs", "run", "service", "shadow", "status", "stop", "url"}
+	want := []string{stopRuntimeCommand, "daemon", "doctor", "env", "gc", "kill", "logs", "run", "service", "shadow", "status", "stop", "url"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("subcommands = %v, want %v", got, want)
+	}
+	stopRuntime, _, err := root.Find([]string{stopRuntimeCommand})
+	if err != nil || stopRuntime == root || !stopRuntime.Hidden {
+		t.Fatalf("hidden stop runtime command = %+v, err = %v", stopRuntime, err)
 	}
 }
 

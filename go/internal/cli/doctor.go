@@ -24,12 +24,12 @@ func newDoctorCmd() *cobra.Command {
 			switch {
 			case err != nil:
 				_, _ = fmt.Fprintf(out, "daemon: not responding (%v)\n", err)
-			case health.Build != version.String():
-				_, _ = fmt.Fprintf(out, "daemon: running, version skew (%s)\n", health.Build)
+			case health.RuntimeBuild != version.String():
+				_, _ = fmt.Fprintf(out, "daemon: running, version skew (%s)\n", health.RuntimeBuild)
 			case health.Draining:
-				_, _ = fmt.Fprintf(out, "daemon: draining (%s)\n", health.Build)
+				_, _ = fmt.Fprintf(out, "daemon: draining (%s)\n", health.RuntimeBuild)
 			default:
-				_, _ = fmt.Fprintf(out, "daemon: %s (%s)\n", health.State, health.Build)
+				_, _ = fmt.Fprintf(out, "daemon: %s (%s)\n", health.State, health.RuntimeBuild)
 			}
 			return nil
 		},

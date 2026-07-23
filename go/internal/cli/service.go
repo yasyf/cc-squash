@@ -10,21 +10,26 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-squash/go/internal/control"
 	"github.com/yasyf/cc-squash/go/internal/paths"
+	"github.com/yasyf/cc-squash/go/internal/version"
 	"github.com/yasyf/daemonkit/service"
+	"github.com/yasyf/daemonkit/wire"
 )
 
 const (
 	serviceWorkerLimit  = 1
 	serviceCloseTimeout = 30 * time.Second
+	stopRuntimeCommand  = "__stop-runtime"
 )
 
 type serviceController interface {
 	Converge(context.Context, []service.Agent) error
+	StopRuntime(context.Context, service.StopControlSpec) (wire.StopResult, error)
 	Close(context.Context) error
 }
 
 type daemonRuntimeClient interface {
 	Current(context.Context) bool
+	RuntimeHealth(context.Context) (control.RuntimeHealth, error)
 	WaitReady(context.Context, time.Duration) error
 	WaitGone(context.Context, time.Duration) error
 }
@@ -81,10 +86,11 @@ func ensureDaemonCurrent(ctx context.Context, timeout time.Duration) error {
 }
 
 func ensureDaemonCurrentWith(ctx context.Context, timeout time.Duration, client daemonRuntimeClient) error {
-	if client.Current(ctx) {
+	current := client.Current(ctx)
+	if current {
 		return nil
 	}
-	if err := convergeService(ctx, []service.Agent{ccsAgent()}); err != nil {
+	if err := convergeDaemonService(ctx, client, current); err != nil {
 		return err
 	}
 	return client.WaitReady(ctx, timeout)
@@ -97,10 +103,62 @@ func installDaemonService(ctx context.Context, timeout time.Duration) error {
 }
 
 func installDaemonServiceWith(ctx context.Context, timeout time.Duration, client daemonRuntimeClient) error {
-	if err := convergeService(ctx, []service.Agent{ccsAgent()}); err != nil {
+	if err := convergeDaemonService(ctx, client, client.Current(ctx)); err != nil {
 		return err
 	}
 	return client.WaitReady(ctx, timeout)
+}
+
+func convergeDaemonService(ctx context.Context, client daemonRuntimeClient, current bool) error {
+	var observed *control.RuntimeHealth
+	if !current {
+		health, err := client.RuntimeHealth(ctx)
+		if err == nil {
+			observed = &health
+		}
+	}
+	return withServiceController(ctx, func(controller serviceController) error {
+		if observed != nil {
+			spec, err := daemonStopSpec(*observed)
+			if err != nil {
+				return err
+			}
+			if _, err := controller.StopRuntime(ctx, spec); err != nil {
+				return err
+			}
+		}
+		return controller.Converge(ctx, []service.Agent{ccsAgent()})
+	})
+}
+
+func daemonStopSpec(health control.RuntimeHealth) (service.StopControlSpec, error) {
+	executable, err := service.CanonicalExecutable()
+	if err != nil {
+		return service.StopControlSpec{}, err
+	}
+	intent := wire.StopIntentRestart
+	if health.RuntimeBuild != version.String() {
+		intent = wire.StopIntentUpgrade
+	}
+	return service.StopControlSpec{
+		Executable: executable, Args: []string{stopRuntimeCommand},
+		Role: control.StopControlRoleID, RuntimeBuild: version.String(),
+		RuntimeProtocol: int(wire.ProtocolVersion), TargetProcessGeneration: health.ProcessGeneration,
+		Intent: intent,
+	}, nil
+}
+
+func newStopRuntimeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use: stopRuntimeCommand, Hidden: true, Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			_, err := service.RunStopControlChild(cmd.Context(), service.StopControlClientConfig{
+				Dial: wire.UnixDialer(paths.SocketPath()), WireBuild: control.WireBuild,
+				RuntimeProtocol: int(wire.ProtocolVersion),
+			})
+			return err
+		},
+	}
 }
 
 func removeDaemonService(ctx context.Context, timeout time.Duration) error {
@@ -155,7 +213,7 @@ func newServiceCmd() *cobra.Command {
 				client := control.NewClient()
 				defer client.Close()
 				if health, err := client.RuntimeHealth(cmd.Context()); err == nil {
-					_, _ = fmt.Fprintf(out, "Daemon: running (%s, %s)\n", health.Build, health.State)
+					_, _ = fmt.Fprintf(out, "Daemon: running (%s, %s)\n", health.RuntimeBuild, health.State)
 				} else {
 					_, _ = fmt.Fprintln(out, "Daemon: not responding")
 				}

@@ -8,8 +8,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -389,7 +389,9 @@ func TestServerProtocolRoundTrips(t *testing.T) {
 		if err != nil {
 			t.Fatalf("health: %v", err)
 		}
-		if health.Build != version.String() {
+		if health.RuntimeBuild != version.String() || health.RuntimeProtocol != int(wire.ProtocolVersion) ||
+			health.PID <= 1 || health.ProcessGeneration == "" || !health.Ready ||
+			health.State != "healthy" || health.Draining || health.Busy {
 			t.Fatalf("health = %+v", health)
 		}
 	})
@@ -442,6 +444,68 @@ func TestServerProtocolRoundTrips(t *testing.T) {
 			t.Fatal("unknown op unexpectedly succeeded")
 		}
 	})
+}
+
+type gatedRuntimeReadiness struct {
+	entered   chan struct{}
+	release   chan error
+	published atomic.Bool
+}
+
+func (r *gatedRuntimeReadiness) BeforeReady(ctx context.Context) error {
+	close(r.entered)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-r.release:
+		return err
+	}
+}
+
+func (r *gatedRuntimeReadiness) AfterReady(err error) { r.published.Store(err == nil) }
+
+func (r *gatedRuntimeReadiness) Published() bool { return r.published.Load() }
+
+func TestRuntimeHealthAvailableBeforePublication(t *testing.T) {
+	shortHome(t)
+	server, err := NewServer(testDaemonRole(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	server.log = quietLogger(t)
+	server.spawnProxy = func() error { return nil }
+	readiness := &gatedRuntimeReadiness{entered: make(chan struct{}), release: make(chan error, 1)}
+	server.readiness = readiness
+	startServer(t, server)
+	select {
+	case <-readiness.entered:
+	case <-time.After(time.Second):
+		t.Fatal("runtime readiness did not start")
+	}
+
+	client := NewClient()
+	t.Cleanup(func() { _ = client.Close() })
+	starting, err := client.RuntimeHealth(t.Context())
+	if err != nil {
+		t.Fatalf("pre-ready runtime health: %v", err)
+	}
+	if starting.RuntimeBuild != version.String() || starting.RuntimeProtocol != int(wire.ProtocolVersion) ||
+		starting.PID <= 1 || starting.ProcessGeneration == "" || starting.Ready ||
+		starting.State != "healthy" || starting.Draining || starting.Busy {
+		t.Fatalf("pre-ready runtime health = %+v", starting)
+	}
+
+	readiness.release <- nil
+	if err := client.WaitReady(t.Context(), time.Second); err != nil {
+		t.Fatalf("WaitReady after publication: %v", err)
+	}
+	ready, err := client.RuntimeHealth(t.Context())
+	if err != nil {
+		t.Fatalf("published runtime health: %v", err)
+	}
+	if !ready.Ready || ready.ProcessGeneration != starting.ProcessGeneration {
+		t.Fatalf("published runtime health = %+v, starting = %+v", ready, starting)
+	}
 }
 
 func TestServerMintDemux(t *testing.T) {
@@ -517,7 +581,7 @@ func TestServerSeamFailOpen(t *testing.T) {
 	}
 
 	// The daemon is still alive: Health answers immediately.
-	if health, err := client.RuntimeHealth(t.Context()); err != nil || health.Build != version.String() {
+	if health, err := client.RuntimeHealth(t.Context()); err != nil || health.RuntimeBuild != version.String() {
 		t.Fatalf("daemon wedged after a fail-open mint: health=%+v err=%v", health, err)
 	}
 }
@@ -543,11 +607,11 @@ func TestServerSameReleaseDoesNotReplaceLivePeer(t *testing.T) {
 	}
 }
 
-func TestServerRejectsWrongBusinessBuildBeforeDispatch(t *testing.T) {
+func TestServerRejectsWrongWireBuildBeforeDispatch(t *testing.T) {
 	server := newServerWithProxy(t, &fakeProxy{port: 50810, pid: 12})
 	startServer(t, server)
 	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(server.socket), Build: "cc-squash.control.wrong",
+		Dial: wire.UnixDialer(server.socket), WireBuild: "cc-squash.control.wrong",
 	})
 	if err != nil {
 		t.Fatalf("wrong business build handshake: %v", err)
@@ -559,35 +623,6 @@ func TestServerRejectsWrongBusinessBuildBeforeDispatch(t *testing.T) {
 	}
 	if result.Outcome != wire.Rejected || result.Response.Reason != wire.ErrBuildMismatch.Error() {
 		t.Fatalf("wrong business build result = %#v", result)
-	}
-}
-
-func TestOrdinaryBusinessHealthCannotReachProtectedLifecycle(t *testing.T) {
-	shortHome(t)
-	server, err := NewServer(daemonrole.Classifier{
-		RoleID: DaemonRoleID, RolePath: "/usr/bin/true",
-	})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	server.log = quietLogger(t)
-	server.spawnProxy = func() error { return nil }
-	startServer(t, server)
-
-	client := NewClient()
-	t.Cleanup(func() { _ = client.Close() })
-	health, err := client.RuntimeHealth(t.Context())
-	if err != nil || health.Build != version.String() || health.PID <= 1 {
-		t.Fatalf("ordinary runtime health = %+v, err = %v", health, err)
-	}
-
-	lifecycle := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(server.socket), Build: BusinessBuild, LifecycleBuild: version.String(),
-	}}
-	t.Cleanup(func() { _ = lifecycle.Close() })
-	if _, err := lifecycle.Health(t.Context()); err == nil ||
-		!strings.Contains(err.Error(), wire.ErrProtectedSessionRequired.Error()) {
-		t.Fatalf("ordinary lifecycle health = %v, want protected-session rejection", err)
 	}
 }
 
@@ -746,7 +781,7 @@ func TestServerKillReflectedInStatusFile(t *testing.T) {
 }
 
 // TestServerShutdownStepsDownProxy is the BUG B regression: an intentional
-// daemon shutdown (context cancellation, lifecycle shutdown, or SIGTERM)
+// daemon shutdown (context cancellation, authorized stop, or SIGTERM)
 // must send the proxy an explicit seam Shutdown frame so `ccs stop` takes the
 // proxy down with the daemon — not leave it orphaned on a bare seam drop.
 func TestServerShutdownStepsDownProxy(t *testing.T) {

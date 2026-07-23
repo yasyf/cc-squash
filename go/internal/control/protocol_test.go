@@ -1,11 +1,12 @@
 package control
 
 import (
+	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -33,8 +34,8 @@ func TestResponseRoundTrip(t *testing.T) {
 	want := Response{
 		OK: true, Port: 50515, Token: "tok-abc",
 		RuntimeHealth: &RuntimeHealth{
-			Build: "1.2.3", Protocol: int(wire.ProtocolVersion), PID: 42,
-			State: dkdaemon.StateHealthy,
+			RuntimeBuild: "1.2.3", RuntimeProtocol: int(wire.ProtocolVersion), PID: 42,
+			ProcessGeneration: "process-generation", Ready: true, State: RuntimeStateHealthy,
 		},
 		Status: &StatusSnapshot{
 			SchemaVersion: StatusSchemaVersion,
@@ -74,8 +75,15 @@ func TestResponseOmitsEmptyStatus(t *testing.T) {
 	}
 }
 
-func TestBusinessBuildIsIndependentOfRelease(t *testing.T) {
-	if BusinessBuild != "cc-squash.control.v1" {
-		t.Fatalf("business build = %q", BusinessBuild)
+func TestWireBuildIsIndependentOfRelease(t *testing.T) {
+	if len(WireSchemaFingerprint) != 64 {
+		t.Fatalf("wire schema fingerprint length = %d", len(WireSchemaFingerprint))
+	}
+	if _, err := hex.DecodeString(WireSchemaFingerprint); err != nil {
+		t.Fatalf("wire schema fingerprint = %q: %v", WireSchemaFingerprint, err)
+	}
+	want := "com.yasyf.cc-squash.control/" + WireSchemaFingerprint + "/v1"
+	if WireBuild != want || strings.Contains(WireBuild, "1.2.3") {
+		t.Fatalf("wire build = %q", WireBuild)
 	}
 }

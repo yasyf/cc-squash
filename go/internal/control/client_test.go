@@ -9,7 +9,6 @@ import (
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/version"
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -42,8 +41,8 @@ func TestClientPersistentBusinessRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("health: %v", err)
 	}
-	if health.Build != version.String() {
-		t.Fatalf("health build = %q, want %q", health.Build, version.String())
+	if health.RuntimeBuild != version.String() {
+		t.Fatalf("health build = %q, want %q", health.RuntimeBuild, version.String())
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	var status Response
@@ -78,22 +77,25 @@ func TestClientUnavailable(t *testing.T) {
 
 func TestRuntimeHealthRequiresExactIdentityAndState(t *testing.T) {
 	health := RuntimeHealth{
-		Build: version.String(), Protocol: int(wire.ProtocolVersion), PID: 42,
-		State: dkdaemon.StateHealthy,
+		RuntimeBuild: version.String(), RuntimeProtocol: int(wire.ProtocolVersion), PID: 42,
+		ProcessGeneration: "process-generation", Ready: true, State: RuntimeStateHealthy,
 	}
 	if err := validateRuntimeHealth(health); err != nil {
 		t.Fatalf("valid health: %v", err)
 	}
-	client := newClient("/tmp/unused", BusinessBuild, version.String())
+	client := newClient("/tmp/unused", WireBuild, version.String())
 	if !client.current(health) {
 		t.Fatal("exact healthy runtime was not current")
 	}
 
 	tests := map[string]func(*RuntimeHealth){
-		"build":    func(h *RuntimeHealth) { h.Build = "" },
-		"protocol": func(h *RuntimeHealth) { h.Protocol = 0 },
+		"build":    func(h *RuntimeHealth) { h.RuntimeBuild = "" },
+		"protocol": func(h *RuntimeHealth) { h.RuntimeProtocol = 0 },
 		"pid":      func(h *RuntimeHealth) { h.PID = 1 },
-		"state":    func(h *RuntimeHealth) { h.State = "unknown" },
+		"generation": func(h *RuntimeHealth) {
+			h.ProcessGeneration = ""
+		},
+		"state": func(h *RuntimeHealth) { h.State = "unknown" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -105,9 +107,10 @@ func TestRuntimeHealthRequiresExactIdentityAndState(t *testing.T) {
 		})
 	}
 	for name, mutate := range map[string]func(*RuntimeHealth){
-		"wrong build": func(h *RuntimeHealth) { h.Build = "other" },
+		"wrong build": func(h *RuntimeHealth) { h.RuntimeBuild = "other" },
+		"not ready":   func(h *RuntimeHealth) { h.Ready = false },
 		"draining":    func(h *RuntimeHealth) { h.Draining = true },
-		"degraded":    func(h *RuntimeHealth) { h.State = dkdaemon.StateDegraded },
+		"degraded":    func(h *RuntimeHealth) { h.State = RuntimeStateDegraded },
 	} {
 		t.Run(name, func(t *testing.T) {
 			notCurrent := health

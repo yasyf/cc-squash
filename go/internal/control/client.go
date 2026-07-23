@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/daemonrole"
 	"github.com/yasyf/daemonkit/wire"
 
@@ -25,15 +24,18 @@ import (
 // DaemonRoleID is the exact service label shared by launch and peer trust.
 const DaemonRoleID = "com.yasyf.cc-squash.daemon"
 
+// StopControlRoleID is the exact receipt role authorized to settle the daemon.
+const StopControlRoleID = "com.yasyf.cc-squash.stop-control"
+
 // ErrDaemonUnavailable means the control socket could not be reached.
 var ErrDaemonUnavailable = errors.New("cc-squash daemon not running")
 
 // Client maintains one exact persistent business session. Failed business
 // calls are never replayed.
 type Client struct {
-	socket        string
-	businessBuild string
-	releaseBuild  string
+	socket       string
+	wireBuild    string
+	runtimeBuild string
 
 	mu       sync.Mutex
 	business *wire.Client
@@ -41,11 +43,11 @@ type Client struct {
 
 // NewClient returns a lazy persistent client for the current exact builds.
 func NewClient() *Client {
-	return newClient(paths.SocketPath(), BusinessBuild, version.String())
+	return newClient(paths.SocketPath(), WireBuild, version.String())
 }
 
-func newClient(socket, businessBuild, releaseBuild string) *Client {
-	return &Client{socket: socket, businessBuild: businessBuild, releaseBuild: releaseBuild}
+func newClient(socket, wireBuild, runtimeBuild string) *Client {
+	return &Client{socket: socket, wireBuild: wireBuild, runtimeBuild: runtimeBuild}
 }
 
 // DaemonRole resolves the stable ccs executable alias shared by launch and
@@ -167,22 +169,25 @@ func (c *Client) WaitReady(ctx context.Context, timeout time.Duration) error {
 }
 
 func (c *Client) current(health RuntimeHealth) bool {
-	return health.Build == c.releaseBuild && health.Protocol == int(wire.ProtocolVersion) &&
-		health.State == dkdaemon.StateHealthy && !health.Draining
+	return health.RuntimeBuild == c.runtimeBuild && health.RuntimeProtocol == int(wire.ProtocolVersion) &&
+		health.Ready && health.State == RuntimeStateHealthy && !health.Draining
 }
 
 func validateRuntimeHealth(health RuntimeHealth) error {
-	if health.Build == "" {
+	if health.RuntimeBuild == "" {
 		return errors.New("runtime.health build is empty")
 	}
-	if health.Protocol <= 0 {
+	if health.RuntimeProtocol <= 0 {
 		return errors.New("runtime.health protocol is invalid")
 	}
 	if health.PID <= 1 {
 		return errors.New("runtime.health PID is invalid")
 	}
+	if health.ProcessGeneration == "" {
+		return errors.New("runtime.health generation is empty")
+	}
 	switch health.State {
-	case dkdaemon.StateHealthy, dkdaemon.StateDegraded, dkdaemon.StateFailed:
+	case RuntimeStateHealthy, RuntimeStateDegraded, RuntimeStateFailed:
 		return nil
 	default:
 		return fmt.Errorf("runtime.health state %q is invalid", health.State)
@@ -229,7 +234,7 @@ func (c *Client) businessSession(ctx context.Context) (*wire.Client, error) {
 		return c.business, nil
 	}
 	session, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(c.socket), Build: c.businessBuild,
+		Dial: wire.UnixDialer(c.socket), WireBuild: c.wireBuild,
 	})
 	if err != nil {
 		if unavailable(err) {

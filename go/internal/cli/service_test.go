@@ -2,32 +2,65 @@ package cli
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-squash/go/internal/control"
+	"github.com/yasyf/cc-squash/go/internal/version"
 	"github.com/yasyf/daemonkit/service"
+	"github.com/yasyf/daemonkit/wire"
 )
 
 type recordingServiceController struct {
 	desired [][]service.Agent
+	stops   []service.StopControlSpec
+	steps   *[]string
 }
 
 func (c *recordingServiceController) Converge(_ context.Context, agents []service.Agent) error {
+	if c.steps != nil {
+		*c.steps = append(*c.steps, "converge")
+	}
 	c.desired = append(c.desired, append([]service.Agent(nil), agents...))
 	return nil
+}
+
+func (c *recordingServiceController) StopRuntime(
+	_ context.Context,
+	spec service.StopControlSpec,
+) (wire.StopResult, error) {
+	if c.steps != nil {
+		*c.steps = append(*c.steps, "stop")
+	}
+	c.stops = append(c.stops, spec)
+	return wire.StopResult{Stopped: true}, nil
 }
 
 func (*recordingServiceController) Close(context.Context) error { return nil }
 
 type runtimeClientStub struct {
-	current   bool
-	waitReady int
-	waitGone  int
+	current         bool
+	health          control.RuntimeHealth
+	healthAvailable bool
+	waitReady       int
+	waitGone        int
+	steps           *[]string
 }
 
 func (c *runtimeClientStub) Current(context.Context) bool { return c.current }
 
+func (c *runtimeClientStub) RuntimeHealth(context.Context) (control.RuntimeHealth, error) {
+	if !c.healthAvailable {
+		return control.RuntimeHealth{}, control.ErrDaemonUnavailable
+	}
+	return c.health, nil
+}
+
 func (c *runtimeClientStub) WaitReady(context.Context, time.Duration) error {
+	if c.steps != nil {
+		*c.steps = append(*c.steps, "ready")
+	}
 	c.waitReady++
 	return nil
 }
@@ -80,6 +113,38 @@ func TestEnsureDaemonCurrentConvergesServiceThenWaitsForBusinessHealth(t *testin
 	}
 	if client.waitReady != 1 {
 		t.Fatalf("wait ready calls = %d, want 1", client.waitReady)
+	}
+}
+
+func TestEnsureDaemonCurrentStopsOlderRuntimeBeforeConvergingSuccessor(t *testing.T) {
+	t.Setenv("HOME", "/tmp/ccs-service-home")
+	steps := []string{}
+	controller := useRecordingServiceController(t)
+	controller.steps = &steps
+	client := &runtimeClientStub{
+		healthAvailable: true,
+		health: control.RuntimeHealth{
+			RuntimeBuild: "0.0.1", RuntimeProtocol: int(wire.ProtocolVersion), PID: 42,
+			ProcessGeneration: "older-runtime", Ready: true, State: control.RuntimeStateHealthy,
+		},
+		steps: &steps,
+	}
+
+	if err := ensureDaemonCurrentWith(t.Context(), time.Second, client); err != nil {
+		t.Fatalf("ensure current: %v", err)
+	}
+	if !slices.Equal(steps, []string{"stop", "converge", "ready"}) {
+		t.Fatalf("replacement steps = %v", steps)
+	}
+	if len(controller.stops) != 1 {
+		t.Fatalf("stop specs = %+v", controller.stops)
+	}
+	spec := controller.stops[0]
+	if spec.Executable == "" || !slices.Equal(spec.Args, []string{stopRuntimeCommand}) ||
+		spec.Role != control.StopControlRoleID || spec.RuntimeBuild != version.String() ||
+		spec.RuntimeProtocol != int(wire.ProtocolVersion) || spec.TargetProcessGeneration != "older-runtime" ||
+		spec.Intent != wire.StopIntentUpgrade {
+		t.Fatalf("stop spec = %+v", spec)
 	}
 }
 

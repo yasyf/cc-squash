@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/config"
@@ -42,12 +43,13 @@ const proxyStartupGrace = 5 * time.Second
 const proxyShutdownGrace = 3 * time.Second
 
 // Server is the cc-squash product control plane. Daemonkit owns its listener,
-// lifecycle, transport, admission, process identities, and reaping.
+// process runtime, transport, admission, process identities, and reaping.
 type Server struct {
 	socket    string
 	proxySock string
 	log       *log.Logger
 	role      daemonrole.Classifier
+	readiness wire.ReadinessBarrier
 
 	seam    *proxyseam.Server
 	sup     *supervisor.Supervisor
@@ -99,6 +101,7 @@ func NewServer(role daemonrole.Classifier) (*Server, error) {
 		proxySock:  paths.ProxySocketPath(),
 		log:        log.New(os.Stderr, "[cc-squash] ", log.LstdFlags),
 		role:       role,
+		readiness:  &runtimeReadiness{},
 		proxyReady: make(chan struct{}),
 		tokens:     map[Token]struct{}{},
 	}, nil
@@ -106,11 +109,10 @@ func NewServer(role daemonrole.Classifier) (*Server, error) {
 
 // Run is the entry point for `ccs daemon`.
 func (s *Server) Run(ctx context.Context) error {
-	wireServer, runtime, err := s.runtime()
+	runtime, err := s.runtime()
 	if err != nil {
 		return err
 	}
-	wireServer.RegisterLifecycle(runtime)
 	err = runtime.Run(ctx)
 	if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 		return nil
@@ -118,39 +120,70 @@ func (s *Server) Run(ctx context.Context) error {
 	return err
 }
 
-func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
+func (s *Server) runtime() (*dkdaemon.Runtime, error) {
 	if err := paths.EnsureStateDir(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if err := paths.EnsureLockDir(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	var generation [16]byte
 	if _, err := rand.Read(generation[:]); err != nil {
-		return nil, nil, fmt.Errorf("generate process generation: %w", err)
+		return nil, fmt.Errorf("generate process generation: %w", err)
 	}
+	processStore := &proc.FileStore{Path: paths.ProcessStorePath()}
 	s.reaper = &proc.Reaper{
-		Store:      &proc.FileStore{Path: paths.ProcessStorePath()},
+		Store:      processStore,
 		Generation: hex.EncodeToString(generation[:]),
 	}
 	pool, err := dksupervise.NewPool(1, s.reaper)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	s.pool = pool
-	wireServer := &wire.Server{
-		Build: BusinessBuild, LifecycleBuild: version.String(),
-		ReservedProtectedSessions: 1, ProtectedSessionClassifier: s.role,
-	}
-	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(s.socket), Build: BusinessBuild, LifecycleBuild: version.String(),
-	}}
+	wireServer := &wire.Server{WireBuild: WireBuild}
 	workers := &runtimeWorkers{server: s, pool: pool}
-	runtime, err := dkdaemon.NewRuntime(dkdaemon.RuntimeConfig{
-		Socket: s.socket, Build: version.String(), Protocol: int(wire.ProtocolVersion),
-		Peer: peer, Contract: dkdaemon.RequestDaemon, WaitMode: dkdaemon.PIDExit,
-		Admission: &drain.Intake{}, Server: wireServer, Workers: workers,
-		State: runtimeState{}, Resources: runtimeResources{server: s, peer: peer},
+	readiness := s.readiness
+	var runtime *dkdaemon.Runtime
+	runtime, err = wire.NewRuntime(wire.RuntimeConfig{
+		Socket: s.socket, RuntimeBuild: version.String(), RuntimeProtocol: int(wire.ProtocolVersion),
+		Wire:       wireServer,
+		Classifier: s.role, ReservedProtectedSessions: 1,
+		StopVerifier: wire.StopVerifier{
+			Classifier: s.role, Role: StopControlRoleID,
+			Store: &proc.FileStore{Path: paths.ServiceProcessStorePath()},
+		},
+		Observations: []wire.ObservationRoute{{
+			Op: wire.Op(OpRuntimeHealth), MaxResponseBytes: 16 << 10, AvailableBeforeReady: true,
+			Handler: func(ctx context.Context, request wire.ObservationRequest) (wire.ObservationResponse, error) {
+				if request.Tenant != "" {
+					return wire.ObservationResponse{}, errors.New("cc-squash control requests do not carry a tenant")
+				}
+				if err := decodeStrict(request.Payload, &EmptyRequest{}); err != nil {
+					return wire.ObservationResponse{}, err
+				}
+				health, err := runtime.Health(ctx)
+				if err != nil {
+					return wire.ObservationResponse{}, err
+				}
+				state, err := runtimeStateFromDaemon(health.State)
+				if err != nil {
+					return wire.ObservationResponse{}, err
+				}
+				payload, err := json.Marshal(Response{OK: true, RuntimeHealth: &RuntimeHealth{
+					RuntimeBuild: health.RuntimeBuild, RuntimeProtocol: health.RuntimeProtocol, PID: health.PID,
+					ProcessGeneration: health.ProcessGeneration, Ready: readiness.Published(),
+					State: state, Draining: health.Draining, Busy: health.Busy,
+				}})
+				if err != nil {
+					return wire.ObservationResponse{}, fmt.Errorf("encode runtime health observation: %w", err)
+				}
+				return wire.ObservationResponse{Payload: payload}, nil
+			},
+		}},
+		Readiness: readiness,
+		Admission: &drain.Intake{}, Workers: workers,
+		State: runtimeState{}, Resources: runtimeResources{server: s},
 		Activate: func(activation dkdaemon.Activation) error {
 			return s.activate(activation, workers)
 		},
@@ -159,11 +192,10 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 		pool.Close()
 		pool.Cancel()
 		_ = pool.Wait(context.Background())
-		_ = peer.Close()
-		return nil, nil, err
+		return nil, err
 	}
-	s.registerHandlers(wireServer, runtime)
-	return wireServer, runtime, nil
+	s.registerHandlers(wireServer)
+	return runtime, nil
 }
 
 func (s *Server) activate(activation dkdaemon.Activation, workers *runtimeWorkers) error {
@@ -216,20 +248,7 @@ func clearRetiredProxyState() error {
 	return errors.Join(errs...)
 }
 
-func (s *Server) registerHandlers(server *wire.Server, runtime *dkdaemon.Runtime) {
-	server.RegisterConcurrent(wire.Op(OpRuntimeHealth), func(ctx context.Context, request wire.Request) (any, error) {
-		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
-			return nil, err
-		}
-		health, err := runtime.Health(ctx)
-		if err != nil {
-			return nil, err
-		}
-		return Response{OK: true, RuntimeHealth: &RuntimeHealth{
-			Build: health.Build, Protocol: health.Protocol, PID: health.PID,
-			State: health.State, Draining: health.Draining, Busy: health.Busy,
-		}}, nil
-	})
+func (s *Server) registerHandlers(server *wire.Server) {
 	server.RegisterConcurrent(wire.Op(OpStatus), func(_ context.Context, request wire.Request) (any, error) {
 		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
 			return nil, err
@@ -272,21 +291,42 @@ func decodeBusinessRequest(request wire.Request, target any) error {
 	return decodeStrict(request.Payload, target)
 }
 
+func runtimeStateFromDaemon(state dkdaemon.State) (RuntimeState, error) {
+	switch state {
+	case dkdaemon.StateHealthy:
+		return RuntimeStateHealthy, nil
+	case dkdaemon.StateDegraded:
+		return RuntimeStateDegraded, nil
+	case dkdaemon.StateFailed:
+		return RuntimeStateFailed, nil
+	default:
+		return "", fmt.Errorf("daemon runtime state %q is not exact", state)
+	}
+}
+
 type runtimeState struct{}
 
 func (runtimeState) Close() error { return nil }
 
+type runtimeReadiness struct {
+	published atomic.Bool
+}
+
+func (*runtimeReadiness) BeforeReady(context.Context) error { return nil }
+
+func (r *runtimeReadiness) AfterReady(err error) { r.published.Store(err == nil) }
+
+func (r *runtimeReadiness) Published() bool { return r.published.Load() }
+
 type runtimeResources struct {
 	server *Server
-	peer   *wire.LifecyclePeer
 }
 
 func (r runtimeResources) Close() error {
-	var seamErr error
 	if r.server.seam != nil {
-		seamErr = r.server.seam.Close()
+		return r.server.seam.Close()
 	}
-	return errors.Join(seamErr, r.peer.Close())
+	return nil
 }
 
 type runtimeWorkers struct {
