@@ -394,11 +394,11 @@ func (s *Server) onRegister(reg proxyseam.Register) {
 	s.mcpPort = reg.MCPPort
 	s.proxyPID = reg.PID
 	s.mu.Unlock()
-	s.readyOnce.Do(func() { close(s.proxyReady) })
 	if err := WritePort(reg.Port); err != nil {
 		s.log.Printf("write port-file: %v", err)
 	}
 	s.publishStatus()
+	s.readyOnce.Do(func() { close(s.proxyReady) })
 }
 
 type proxySpawner struct {

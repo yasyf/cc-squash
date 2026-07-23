@@ -253,6 +253,13 @@ func TestServerColdStartMint(t *testing.T) {
 	if resp.Token == "" {
 		t.Fatal("mint returned an empty token")
 	}
+	status, err := ReadStatus()
+	if err != nil {
+		t.Fatalf("read status after mint: %v", err)
+	}
+	if status.ProxyPort != resp.Port || status.ProxyPID != f.pid {
+		t.Fatalf("status after mint = %+v, want proxy port %d pid %d", status, resp.Port, f.pid)
+	}
 	// The fake proxy must have received the exact token over the seam.
 	got, err := f.readMint()
 	if err != nil {
