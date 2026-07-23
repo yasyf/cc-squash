@@ -172,9 +172,20 @@ func (f *fakeProxy) stepDownOnShutdown(t *testing.T) <-chan struct{} {
 	return seen
 }
 
-// startServer runs srv.Run in the background under the test's isolated HOME and
-// waits for its control socket to accept connections.
+// startServer runs srv.Run and waits for exact runtime admission.
 func startServer(t *testing.T, srv *Server) (cancel context.CancelFunc) {
+	t.Helper()
+	cancel = startServerSocket(t, srv)
+	client := NewClient()
+	t.Cleanup(func() { _ = client.Close() })
+	if err := client.WaitReady(t.Context(), 2*time.Second); err != nil {
+		t.Fatalf("runtime never became ready: %v", err)
+	}
+	return cancel
+}
+
+// startServerSocket waits only for the pre-admission health socket.
+func startServerSocket(t *testing.T, srv *Server) (cancel context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -476,7 +487,7 @@ func TestRuntimeHealthAvailableBeforePublication(t *testing.T) {
 	server.spawnProxy = func() error { return nil }
 	readiness := &gatedRuntimeReadiness{entered: make(chan struct{}), release: make(chan error, 1)}
 	server.readiness = readiness
-	startServer(t, server)
+	startServerSocket(t, server)
 	select {
 	case <-readiness.entered:
 	case <-time.After(time.Second):

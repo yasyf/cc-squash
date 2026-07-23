@@ -124,7 +124,7 @@ func TestRuntimeHealthRequiresExactIdentityAndState(t *testing.T) {
 
 func TestWaitReadyObservesExactRelease(t *testing.T) {
 	server := newServerWithProxy(t, &fakeProxy{port: 50516, pid: 4242})
-	startServer(t, server)
+	startServerSocket(t, server)
 	client := NewClient()
 	t.Cleanup(func() { _ = client.Close() })
 	if err := client.WaitReady(t.Context(), time.Second); err != nil {
