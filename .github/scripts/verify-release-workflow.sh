@@ -39,6 +39,8 @@ for required in \
   grep -Fq "$required" "$workflow"
 done
 
+test "$(awk '/^  publish-tap:$/ { getline; print; exit }' "$workflow")" = '    needs: release'
+
 line() { grep -Fn "$1" "$workflow" | cut -d: -f1; }
 render="$(line 'name: Render the formula')"
 formula="$(line 'name: Verify the exact rendered formula')"
