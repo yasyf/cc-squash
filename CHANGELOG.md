@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-23
+
+### Fixed
+- Correct the downloaded universal-binary architecture check and keep
+  Gatekeeper assessment out of bare command-line executable validation.
+
 ### Added
 - Initial scaffolding.
 
@@ -15,3 +21,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   program and a fresh replacement-fenced controller-state epoch.
 
 [Unreleased]: https://github.com/yasyf/cc-squash/commits/main
+[0.6.1]: https://github.com/yasyf/cc-squash/compare/v0.6.0...v0.6.1

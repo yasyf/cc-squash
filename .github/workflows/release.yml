@@ -187,11 +187,10 @@ jobs:
           mkdir -p "$unpack"
           tar -xzf "$DOWNLOADED/$archive" -C "$unpack"
           for binary in ccs ccs-proxy; do
-            lipo -verify_arch arm64 x86_64 "$unpack/$binary"
+            lipo "$unpack/$binary" -verify_arch arm64 x86_64
             codesign --verify --strict --verbose=2 "$unpack/$binary"
             actual_team="$(codesign -dvv "$unpack/$binary" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
             test "$actual_team" = "$TEAM_ID"
-            spctl --assess --type execute --verbose=4 "$unpack/$binary"
           done
           "$unpack/ccs" --version | grep -Fq "$GITHUB_REF_NAME"
           "$unpack/ccs-proxy" --version
