@@ -23,6 +23,12 @@ type serviceController interface {
 	Close(context.Context) error
 }
 
+type daemonRuntimeClient interface {
+	Current(context.Context) bool
+	WaitReady(context.Context, time.Duration) error
+	WaitGone(context.Context, time.Duration) error
+}
+
 var openServiceController = func(ctx context.Context) (serviceController, error) {
 	return service.NewController(ctx, service.ControllerConfig{
 		StatePath:   paths.ServiceStatePath(),
@@ -33,7 +39,7 @@ var openServiceController = func(ctx context.Context) (serviceController, error)
 
 // ccsAgent is cc-squash's daemon LaunchAgent / brew-services descriptor: the
 // generic launchctl + Homebrew lifecycle (daemonkit/service) configured with
-// cc-squash's label, formula, daemon args, log path, and PATH. The program
+// cc-squash's label, formula, daemon args, log path, HOME, and PATH. The program
 // defaults to the running binary (os.Executable), so a Homebrew symlink stays a
 // stable launchd program path across upgrades.
 func ccsAgent() service.Agent {
@@ -41,7 +47,7 @@ func ccsAgent() service.Agent {
 		Label:         control.DaemonRoleID,
 		Args:          []string{"daemon"},
 		LogPath:       paths.LogPath(),
-		Env:           map[string]string{"PATH": os.Getenv("PATH")},
+		Env:           map[string]string{"HOME": os.Getenv("HOME"), "PATH": os.Getenv("PATH")},
 		RestartPolicy: service.RestartAlways,
 	}
 }
@@ -68,6 +74,48 @@ func convergeService(ctx context.Context, agents []service.Agent) error {
 	})
 }
 
+func ensureDaemonCurrent(ctx context.Context, timeout time.Duration) error {
+	client := control.NewClient()
+	defer client.Close()
+	return ensureDaemonCurrentWith(ctx, timeout, client)
+}
+
+func ensureDaemonCurrentWith(ctx context.Context, timeout time.Duration, client daemonRuntimeClient) error {
+	if client.Current(ctx) {
+		return nil
+	}
+	if err := convergeService(ctx, []service.Agent{ccsAgent()}); err != nil {
+		return err
+	}
+	return client.WaitReady(ctx, timeout)
+}
+
+func installDaemonService(ctx context.Context, timeout time.Duration) error {
+	client := control.NewClient()
+	defer client.Close()
+	return installDaemonServiceWith(ctx, timeout, client)
+}
+
+func installDaemonServiceWith(ctx context.Context, timeout time.Duration, client daemonRuntimeClient) error {
+	if err := convergeService(ctx, []service.Agent{ccsAgent()}); err != nil {
+		return err
+	}
+	return client.WaitReady(ctx, timeout)
+}
+
+func removeDaemonService(ctx context.Context, timeout time.Duration) error {
+	client := control.NewClient()
+	defer client.Close()
+	return removeDaemonServiceWith(ctx, timeout, client)
+}
+
+func removeDaemonServiceWith(ctx context.Context, timeout time.Duration, client daemonRuntimeClient) error {
+	if err := convergeService(ctx, nil); err != nil {
+		return err
+	}
+	return client.WaitGone(ctx, timeout)
+}
+
 func newServiceCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "service",
@@ -79,7 +127,7 @@ func newServiceCmd() *cobra.Command {
 			Short: "Install and start the user LaunchAgent",
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
-				if err := convergeService(cmd.Context(), []service.Agent{ccsAgent()}); err != nil {
+				if err := installDaemonService(cmd.Context(), proxyEnsureTimeout); err != nil {
 					return err
 				}
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Installed and started the daemon.")
@@ -91,7 +139,7 @@ func newServiceCmd() *cobra.Command {
 			Short: "Stop the daemon and remove the LaunchAgent",
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
-				if err := convergeService(cmd.Context(), nil); err != nil {
+				if err := removeDaemonService(cmd.Context(), stopGoneWait); err != nil {
 					return err
 				}
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Removed the LaunchAgent.")
@@ -106,8 +154,8 @@ func newServiceCmd() *cobra.Command {
 				out := cmd.OutOrStdout()
 				client := control.NewClient()
 				defer client.Close()
-				if health, err := client.Health(cmd.Context()); err == nil {
-					_, _ = fmt.Fprintf(out, "Daemon: running (%s)\n", health.Build)
+				if health, err := client.RuntimeHealth(cmd.Context()); err == nil {
+					_, _ = fmt.Fprintf(out, "Daemon: running (%s, %s)\n", health.Build, health.State)
 				} else {
 					_, _ = fmt.Fprintln(out, "Daemon: not responding")
 				}

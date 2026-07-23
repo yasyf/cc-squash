@@ -20,14 +20,16 @@ func newDoctorCmd() *cobra.Command {
 			_, _ = fmt.Fprintf(out, "socket: %s\n", paths.SocketPath())
 			client := control.NewClient()
 			defer client.Close()
-			health, err := client.Health(cmd.Context())
+			health, err := client.RuntimeHealth(cmd.Context())
 			switch {
 			case err != nil:
 				_, _ = fmt.Fprintf(out, "daemon: not responding (%v)\n", err)
 			case health.Build != version.String():
 				_, _ = fmt.Fprintf(out, "daemon: running, version skew (%s)\n", health.Build)
+			case health.Draining:
+				_, _ = fmt.Fprintf(out, "daemon: draining (%s)\n", health.Build)
 			default:
-				_, _ = fmt.Fprintf(out, "daemon: healthy (%s)\n", health.Build)
+				_, _ = fmt.Fprintf(out, "daemon: %s (%s)\n", health.State, health.Build)
 			}
 			return nil
 		},

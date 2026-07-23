@@ -16,7 +16,7 @@ func newGCCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			c := control.NewClient()
 			defer c.Close()
-			if err := c.EnsureCurrent(cmd.Context(), proxyEnsureTimeout); err != nil {
+			if err := ensureDaemonCurrent(cmd.Context(), proxyEnsureTimeout); err != nil {
 				return err
 			}
 			resp, err := c.Gc(cmd.Context())

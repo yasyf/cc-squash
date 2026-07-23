@@ -2,10 +2,14 @@
 // persistent session transport.
 package control
 
-import "time"
+import (
+	"time"
+
+	dkdaemon "github.com/yasyf/daemonkit/daemon"
+)
 
 // BusinessBuild is the exact cc-squash control schema identity. Release
-// identity is carried independently as daemonkit's LifecycleBuild.
+// identity is reported independently by OpRuntimeHealth.
 const BusinessBuild = "cc-squash.control.v1"
 
 // StatusSchemaVersion is the exact on-disk status snapshot schema.
@@ -16,11 +20,12 @@ type Op string
 
 // Recognized control request operations.
 const (
-	OpStatus Op = "status" // full status snapshot
-	OpMint   Op = "mint"   // mint a session token for the proxy
-	OpKill   Op = "kill"   // toggle the proxy kill switch
-	OpShadow Op = "shadow" // toggle proxy shadow mode
-	OpGc     Op = "gc"     // sweep the proxy's ref store to its reachable set
+	OpRuntimeHealth Op = "runtime.health" // exact product runtime identity and readiness
+	OpStatus        Op = "status"         // full status snapshot
+	OpMint          Op = "mint"           // mint a session token for the proxy
+	OpKill          Op = "kill"           // toggle the proxy kill switch
+	OpShadow        Op = "shadow"         // toggle proxy shadow mode
+	OpGc            Op = "gc"             // sweep the proxy's ref store to its reachable set
 )
 
 // EmptyRequest is the exact payload for argument-free operations.
@@ -29,6 +34,17 @@ type EmptyRequest struct{}
 // ToggleRequest is the exact payload for kill and shadow operations.
 type ToggleRequest struct {
 	On bool `json:"on"`
+}
+
+// RuntimeHealth is the daemon's exact product-visible runtime identity and
+// lifecycle state.
+type RuntimeHealth struct {
+	Build    string         `json:"build"`
+	Protocol int            `json:"protocol"`
+	PID      int            `json:"pid"`
+	State    dkdaemon.State `json:"state"`
+	Draining bool           `json:"draining"`
+	Busy     bool           `json:"busy"`
 }
 
 // StatusSnapshot is the daemon's full status view, returned by OpStatus and
@@ -48,12 +64,13 @@ type StatusSnapshot struct {
 
 // Response is one business-operation reply.
 type Response struct {
-	OK      bool            `json:"ok"`
-	Error   string          `json:"error,omitempty"`
-	Port    int             `json:"port,omitempty"`
-	MCPPort int             `json:"mcp_port,omitempty"` // mint: the rmcp retrieve server port
-	Token   string          `json:"token,omitempty"`    // mint
-	Status  *StatusSnapshot `json:"status,omitempty"`   // status
-	Kill    bool            `json:"kill,omitempty"`
-	Shadow  bool            `json:"shadow,omitempty"`
+	OK            bool            `json:"ok"`
+	Error         string          `json:"error,omitempty"`
+	Port          int             `json:"port,omitempty"`
+	MCPPort       int             `json:"mcp_port,omitempty"` // mint: the rmcp retrieve server port
+	Token         string          `json:"token,omitempty"`    // mint
+	RuntimeHealth *RuntimeHealth  `json:"runtime_health,omitempty"`
+	Status        *StatusSnapshot `json:"status,omitempty"` // status
+	Kill          bool            `json:"kill,omitempty"`
+	Shadow        bool            `json:"shadow,omitempty"`
 }

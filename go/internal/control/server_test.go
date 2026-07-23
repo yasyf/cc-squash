@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -384,7 +385,7 @@ func TestServerProtocolRoundTrips(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 
 	t.Run("health", func(t *testing.T) {
-		health, err := c.Health(t.Context())
+		health, err := c.RuntimeHealth(t.Context())
 		if err != nil {
 			t.Fatalf("health: %v", err)
 		}
@@ -516,7 +517,7 @@ func TestServerSeamFailOpen(t *testing.T) {
 	}
 
 	// The daemon is still alive: Health answers immediately.
-	if health, err := client.Health(t.Context()); err != nil || health.Build != version.String() {
+	if health, err := client.RuntimeHealth(t.Context()); err != nil || health.Build != version.String() {
 		t.Fatalf("daemon wedged after a fail-open mint: health=%+v err=%v", health, err)
 	}
 }
@@ -537,7 +538,7 @@ func TestServerSameReleaseDoesNotReplaceLivePeer(t *testing.T) {
 	}
 	client := NewClient()
 	t.Cleanup(func() { _ = client.Close() })
-	if health, err := client.Health(t.Context()); err != nil || health.PID == 0 {
+	if health, err := client.RuntimeHealth(t.Context()); err != nil || health.PID == 0 {
 		t.Fatalf("incumbent unavailable after contender: health=%+v err=%v", health, err)
 	}
 }
@@ -558,6 +559,35 @@ func TestServerRejectsWrongBusinessBuildBeforeDispatch(t *testing.T) {
 	}
 	if result.Outcome != wire.Rejected || result.Response.Reason != wire.ErrBuildMismatch.Error() {
 		t.Fatalf("wrong business build result = %#v", result)
+	}
+}
+
+func TestOrdinaryBusinessHealthCannotReachProtectedLifecycle(t *testing.T) {
+	shortHome(t)
+	server, err := NewServer(daemonrole.Classifier{
+		RoleID: DaemonRoleID, RolePath: "/usr/bin/true",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	server.log = quietLogger(t)
+	server.spawnProxy = func() error { return nil }
+	startServer(t, server)
+
+	client := NewClient()
+	t.Cleanup(func() { _ = client.Close() })
+	health, err := client.RuntimeHealth(t.Context())
+	if err != nil || health.Build != version.String() || health.PID <= 1 {
+		t.Fatalf("ordinary runtime health = %+v, err = %v", health, err)
+	}
+
+	lifecycle := &wire.LifecyclePeer{Config: wire.ClientConfig{
+		Dial: wire.UnixDialer(server.socket), Build: BusinessBuild, LifecycleBuild: version.String(),
+	}}
+	t.Cleanup(func() { _ = lifecycle.Close() })
+	if _, err := lifecycle.Health(t.Context()); err == nil ||
+		!strings.Contains(err.Error(), wire.ErrProtectedSessionRequired.Error()) {
+		t.Fatalf("ordinary lifecycle health = %v, want protected-session rejection", err)
 	}
 }
 

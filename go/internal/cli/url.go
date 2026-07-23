@@ -50,7 +50,7 @@ diagnostic goes to stderr, so ` + "`ANTHROPIC_BASE_URL=$(ccs url)`" + ` captures
 func resolveMint(ctx context.Context) (control.Response, error) {
 	c := control.NewClient()
 	defer c.Close()
-	if err := c.EnsureCurrent(ctx, proxyEnsureTimeout); err != nil {
+	if err := ensureDaemonCurrent(ctx, proxyEnsureTimeout); err != nil {
 		return control.Response{}, err
 	}
 	resp, err := c.Mint(ctx)

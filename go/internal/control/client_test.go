@@ -9,6 +9,8 @@ import (
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/version"
+	dkdaemon "github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/wire"
 )
 
 // shortHome isolates the state dir under a short path because Darwin unix
@@ -29,23 +31,31 @@ func shortHome(t *testing.T) {
 	}
 }
 
-func TestClientPersistentBusinessAndLifecycleRoundTrips(t *testing.T) {
+func TestClientPersistentBusinessRoundTrips(t *testing.T) {
 	proxy := &fakeProxy{port: 50516, mcpPort: 50517, pid: 4242}
 	server := newServerWithProxy(t, proxy)
 	startServer(t, server)
 
 	client := NewClient()
 	t.Cleanup(func() { _ = client.Close() })
-	health, err := client.Health(t.Context())
+	health, err := client.RuntimeHealth(t.Context())
 	if err != nil {
 		t.Fatalf("health: %v", err)
 	}
 	if health.Build != version.String() {
 		t.Fatalf("health build = %q, want %q", health.Build, version.String())
 	}
-	status, err := client.Status(t.Context())
-	if err != nil || status.Status == nil || status.Status.ProxyPort != 50516 {
-		t.Fatalf("status = %+v, err = %v", status, err)
+	deadline := time.Now().Add(3 * time.Second)
+	var status Response
+	for {
+		status, err = client.Status(t.Context())
+		if err == nil && status.Status != nil && status.Status.ProxyPort == 50516 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status = %+v, err = %v", status, err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	kill, err := client.Kill(t.Context(), true)
 	if err != nil || !kill.Kill {
@@ -61,25 +71,68 @@ func TestClientUnavailable(t *testing.T) {
 	shortHome(t)
 	client := NewClient()
 	t.Cleanup(func() { _ = client.Close() })
-	if _, err := client.Health(t.Context()); !errors.Is(err, ErrDaemonUnavailable) {
+	if _, err := client.RuntimeHealth(t.Context()); !errors.Is(err, ErrDaemonUnavailable) {
 		t.Fatalf("got %v, want ErrDaemonUnavailable", err)
 	}
 }
 
-func TestEnsureCurrentShortCircuitsAtExactRelease(t *testing.T) {
+func TestRuntimeHealthRequiresExactIdentityAndState(t *testing.T) {
+	health := RuntimeHealth{
+		Build: version.String(), Protocol: int(wire.ProtocolVersion), PID: 42,
+		State: dkdaemon.StateHealthy,
+	}
+	if err := validateRuntimeHealth(health); err != nil {
+		t.Fatalf("valid health: %v", err)
+	}
+	client := newClient("/tmp/unused", BusinessBuild, version.String())
+	if !client.current(health) {
+		t.Fatal("exact healthy runtime was not current")
+	}
+
+	tests := map[string]func(*RuntimeHealth){
+		"build":    func(h *RuntimeHealth) { h.Build = "" },
+		"protocol": func(h *RuntimeHealth) { h.Protocol = 0 },
+		"pid":      func(h *RuntimeHealth) { h.PID = 1 },
+		"state":    func(h *RuntimeHealth) { h.State = "unknown" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			invalid := health
+			mutate(&invalid)
+			if err := validateRuntimeHealth(invalid); err == nil {
+				t.Fatalf("validateRuntimeHealth(%+v) succeeded", invalid)
+			}
+		})
+	}
+	for name, mutate := range map[string]func(*RuntimeHealth){
+		"wrong build": func(h *RuntimeHealth) { h.Build = "other" },
+		"draining":    func(h *RuntimeHealth) { h.Draining = true },
+		"degraded":    func(h *RuntimeHealth) { h.State = dkdaemon.StateDegraded },
+	} {
+		t.Run(name, func(t *testing.T) {
+			notCurrent := health
+			mutate(&notCurrent)
+			if client.current(notCurrent) {
+				t.Fatalf("runtime unexpectedly current: %+v", notCurrent)
+			}
+		})
+	}
+}
+
+func TestWaitReadyObservesExactRelease(t *testing.T) {
 	server := newServerWithProxy(t, &fakeProxy{port: 50516, pid: 4242})
 	startServer(t, server)
 	client := NewClient()
 	t.Cleanup(func() { _ = client.Close() })
-	if err := client.EnsureCurrent(t.Context(), time.Second); err != nil {
-		t.Fatalf("EnsureCurrent: %v", err)
+	if err := client.WaitReady(t.Context(), time.Second); err != nil {
+		t.Fatalf("WaitReady: %v", err)
 	}
 }
 
 func TestWaitGoneObservesRuntimeShutdown(t *testing.T) {
 	proxy := &fakeProxy{port: 50516, pid: 4242}
 	server := newServerWithProxy(t, proxy)
-	startServer(t, server)
+	cancelServer := startServer(t, server)
 	client := NewClient()
 	t.Cleanup(func() { _ = client.Close() })
 	deadline := time.Now().Add(3 * time.Second)
@@ -94,9 +147,7 @@ func TestWaitGoneObservesRuntimeShutdown(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	seen := proxy.stepDownOnShutdown(t)
-	if err := client.Shutdown(t.Context()); err != nil {
-		t.Fatalf("shutdown: %v", err)
-	}
+	cancelServer()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	if err := client.WaitGone(ctx, 4*time.Second); err != nil {

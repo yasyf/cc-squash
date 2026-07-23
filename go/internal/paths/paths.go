@@ -64,9 +64,6 @@ func LocksDir() string {
 	return daemon.LockDir()
 }
 
-// StartLockPath serializes daemonkit cold-start and upgrade attempts.
-func StartLockPath() string { return daemon.StartLockPath() }
-
 // ProcessStorePath is daemonkit's durable process identity and receipt ledger.
 func ProcessStorePath() string { return path("processes.db") }
 

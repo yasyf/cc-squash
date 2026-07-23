@@ -142,7 +142,6 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 		Build: BusinessBuild, LifecycleBuild: version.String(),
 		ReservedProtectedSessions: 1, ProtectedSessionClassifier: s.role,
 	}
-	s.registerHandlers(wireServer)
 	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
 		Dial: wire.UnixDialer(s.socket), Build: BusinessBuild, LifecycleBuild: version.String(),
 	}}
@@ -163,6 +162,7 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 		_ = peer.Close()
 		return nil, nil, err
 	}
+	s.registerHandlers(wireServer, runtime)
 	return wireServer, runtime, nil
 }
 
@@ -216,7 +216,20 @@ func clearRetiredProxyState() error {
 	return errors.Join(errs...)
 }
 
-func (s *Server) registerHandlers(server *wire.Server) {
+func (s *Server) registerHandlers(server *wire.Server, runtime *dkdaemon.Runtime) {
+	server.RegisterConcurrent(wire.Op(OpRuntimeHealth), func(ctx context.Context, request wire.Request) (any, error) {
+		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
+			return nil, err
+		}
+		health, err := runtime.Health(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return Response{OK: true, RuntimeHealth: &RuntimeHealth{
+			Build: health.Build, Protocol: health.Protocol, PID: health.PID,
+			State: health.State, Draining: health.Draining, Busy: health.Busy,
+		}}, nil
+	})
 	server.RegisterConcurrent(wire.Op(OpStatus), func(_ context.Context, request wire.Request) (any, error) {
 		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
 			return nil, err
