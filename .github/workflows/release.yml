@@ -189,8 +189,11 @@ jobs:
           for binary in ccs ccs-proxy; do
             lipo "$unpack/$binary" -verify_arch arm64 x86_64
             codesign --verify --strict --verbose=2 "$unpack/$binary"
-            actual_team="$(codesign -dvv "$unpack/$binary" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+            signature="$(codesign -dvv "$unpack/$binary" 2>&1)"
+            actual_team="$(sed -n 's/^TeamIdentifier=//p' <<<"$signature")"
+            actual_identifier="$(sed -n 's/^Identifier=//p' <<<"$signature")"
             test "$actual_team" = "$TEAM_ID"
+            test "$actual_identifier" = "$binary"
           done
           "$unpack/ccs" --version | grep -Fq "$GITHUB_REF_NAME"
           "$unpack/ccs-proxy" --version

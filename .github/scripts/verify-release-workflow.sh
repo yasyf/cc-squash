@@ -27,6 +27,7 @@ for required in \
   'name: Record the exact release asset manifest' \
   'name: Stage and verify the complete draft release' \
   'name: Smoke-test the exact downloaded release' \
+  'test "$actual_identifier" = "$binary"' \
   "actions/stage-draft-release@${stage_pin}" \
   "actions/publish-draft-release@${draft_publish_pin}" \
   "release-id: \${{ steps.draft.outputs['release-id'] }}" \
