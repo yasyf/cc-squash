@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ccs_proxy::build_version::BUILD_VERSION;
 use ccs_proxy::demux::SessionToken;
 use ccs_proxy::seam::run_seam;
 use ccs_proxy::{router, AppState};
@@ -90,7 +91,7 @@ async fn registers_then_applies_mint_kill_and_shutdown() {
     assert_eq!(reg["protocol"], 1);
     assert_eq!(reg["port"], 54321);
     assert_eq!(reg["mcp_port"], 54322);
-    assert_eq!(reg["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(reg["version"], BUILD_VERSION);
     assert_eq!(
         reg["pid"].as_u64().expect("pid is a number"),
         u64::from(std::process::id()),

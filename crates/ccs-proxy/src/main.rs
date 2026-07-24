@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ccs_proxy::seam::run_seam;
-use ccs_proxy::{mcp_router, router, AppState};
+use ccs_proxy::{build_version::BUILD_VERSION, mcp_router, router, AppState};
 use ccs_refs::RefStore;
 use clap::Parser;
 use tokio::net::{TcpListener, UnixStream};
@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 /// Command-line arguments for the supervised proxy child. The user-facing CLI is
 /// the Go `ccs` binary; the proxy only parses its spawn args.
 #[derive(Parser, Debug)]
-#[command(name = "ccs-proxy", version)]
+#[command(name = "ccs-proxy", version = BUILD_VERSION)]
 struct Args {
     /// Path to the Go control-plane epoch-1 seam socket. When present the
     /// proxy connects, registers, and applies control frames; when absent it
@@ -34,6 +34,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -43,8 +45,6 @@ async fn main() -> anyhow::Result<()> {
 
     warn_if_unset("ENABLE_TOOL_SEARCH");
     warn_if_unset("DISABLE_AUTO_COMPACT");
-
-    let args = Args::parse();
 
     // Bind directly and read back the assignment — no separate probe socket, so
     // no TOCTOU window between choosing a port and listening on it.

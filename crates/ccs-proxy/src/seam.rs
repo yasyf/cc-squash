@@ -22,6 +22,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::Notify;
 
 use crate::app::AppState;
+use crate::build_version::BUILD_VERSION;
 use crate::config::RelayConfig;
 use crate::demux::{SessionCtx, SessionToken};
 
@@ -62,7 +63,7 @@ impl Register {
             protocol: PROTOCOL_VERSION,
             port,
             mcp_port,
-            version: env!("CARGO_PKG_VERSION"),
+            version: BUILD_VERSION,
             pid: std::process::id(),
         }
     }
@@ -310,7 +311,7 @@ mod tests {
         assert_eq!(json["protocol"], PROTOCOL_VERSION);
         assert_eq!(json["port"], 8080);
         assert_eq!(json["mcp_port"], 9090);
-        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["version"], BUILD_VERSION);
         assert_eq!(json["pid"], std::process::id());
     }
 

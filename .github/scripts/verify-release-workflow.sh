@@ -5,7 +5,7 @@ workflow=.github/workflows/release.yml
 action_pin=19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
 stage_pin=e4c3108e693681df1a3c666bae80e890bc44cf3e
 draft_publish_pin=54e3e194bda69896894a82c17fcdb2822beefab5
-tap_publish_pin=9ca67392d45d66b6ae01e262383c8f3138d56f5e
+tap_publish_pin=9525763796fce4d1042cf3393d9479f791908eaa
 
 if grep -Eq 'yasyf/homebrew-tap/.+@(v[0-9]+|main)' "$workflow"; then
   echo "homebrew-tap release actions must use an exact commit" >&2
@@ -27,6 +27,9 @@ for required in \
   'name: Record the exact release asset manifest' \
   'name: Stage and verify the complete draft release' \
   'name: Smoke-test the exact downloaded release' \
+  'export CCS_BUILD_VERSION="${VERSION#v}"' \
+  '.github/scripts/verify-release-archive.sh "$VERSION" "$archive"' \
+  '.github/scripts/verify-release-archive.sh "$GITHUB_REF_NAME" "$DOWNLOADED/$archive"' \
   'test "$actual_identifier" = "$binary"' \
   "grep -Eq '^CodeDirectory .*flags=.*runtime'" \
   'com.apple.security.get-task-allow' \

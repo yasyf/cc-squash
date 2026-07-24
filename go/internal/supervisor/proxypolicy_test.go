@@ -267,7 +267,7 @@ func TestSupervisorTickConvergesOnMatchedVersion(t *testing.T) {
 	}{
 		{
 			id:              "matched dev version is steady state",
-			registered:      proxyDevVersion,
+			registered:      ProxyVersion(),
 			myVersion:       ProxyVersion(),
 			wantReplaceTick: false,
 		},

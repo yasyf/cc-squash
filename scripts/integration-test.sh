@@ -9,6 +9,26 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+release_tag="v0.0.0-contract.1"
+release_version="${release_tag#v}"
+release_dir="$(mktemp -d /tmp/ccs-version-contract.XXXXXX)"
+cleanup() {
+  rm -rf "$release_dir"
+}
+trap cleanup EXIT
+
+echo "==> release archive version contract"
+CGO_ENABLED=0 go -C "$repo_root/go" build \
+  -ldflags "-s -w -X github.com/yasyf/cc-squash/go/internal/version.Version=$release_tag" \
+  -o "$release_dir/ccs" ./cmd/ccs
+CCS_BUILD_VERSION="$release_version" cargo build -p ccs-proxy \
+  --manifest-path "$repo_root/crates/Cargo.toml" \
+  --target-dir "$repo_root/target/version-contract"
+cp "$repo_root/target/version-contract/debug/ccs-proxy" "$release_dir/ccs-proxy"
+tar -czf "$release_dir/release.tar.gz" -C "$release_dir" ccs ccs-proxy
+"$repo_root/.github/scripts/verify-release-archive.sh" \
+  "$release_tag" "$release_dir/release.tar.gz"
+
 echo "==> cargo build -p ccs-proxy"
 cargo build -p ccs-proxy --manifest-path "$repo_root/crates/Cargo.toml"
 

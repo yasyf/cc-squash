@@ -13,6 +13,7 @@
 //! through unchanged (build plan §5/§9).
 
 pub mod app;
+pub mod build_version;
 pub mod config;
 pub mod demux;
 pub mod forward;

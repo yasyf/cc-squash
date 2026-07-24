@@ -55,6 +55,7 @@ jobs:
       - name: Build universal binaries (Go ccs + Rust ccs-proxy, arm64 + amd64 via lipo)
         run: |
           VERSION="${GITHUB_REF_NAME}"
+          export CCS_BUILD_VERSION="${VERSION#v}"
           COMMIT="$(git rev-parse --short HEAD)"
           LDFLAGS="-s -w -X github.com/yasyf/cc-squash/go/internal/version.Version=${VERSION} -X github.com/yasyf/cc-squash/go/internal/version.Commit=${COMMIT}"
           mkdir -p dist/bin
@@ -81,13 +82,10 @@ jobs:
           bash "$MACOS_CODESIGN_SCRIPT" dist/bin/ccs darwin_universal
           bash "$MACOS_CODESIGN_SCRIPT" dist/bin/ccs-proxy darwin_universal
 
-          # Smoke-test the native slices. No version grep for ccs-proxy: clap
-          # prints the Cargo workspace version (0.1.0), decoupled from the git tag.
-          dist/bin/ccs --version | grep -q "${VERSION}"
-          dist/bin/ccs-proxy --version
-
           # One tarball, both binaries at the tar root (the formula installs both).
-          tar -czf "dist/cc-squash-${VERSION}-darwin-universal.tar.gz" -C dist/bin ccs ccs-proxy
+          archive="dist/cc-squash-${VERSION}-darwin-universal.tar.gz"
+          tar -czf "$archive" -C dist/bin ccs ccs-proxy
+          .github/scripts/verify-release-archive.sh "$VERSION" "$archive"
 
       - name: Checksum the release assets
         run: |
@@ -177,10 +175,7 @@ jobs:
             shasum -a 256 -c SHA256SUMS.txt
           )
 
-          contents="$RUNNER_TEMP/archive-contents"
-          printf '%s\n' ccs ccs-proxy > "$RUNNER_TEMP/expected-archive-contents"
-          tar -tzf "$DOWNLOADED/$archive" | sort > "$contents"
-          diff -u "$RUNNER_TEMP/expected-archive-contents" "$contents"
+          .github/scripts/verify-release-archive.sh "$GITHUB_REF_NAME" "$DOWNLOADED/$archive"
 
           unpack="$RUNNER_TEMP/downloaded-release-smoke"
           rm -rf "$unpack"
@@ -210,9 +205,6 @@ jobs:
               fi
             done
           done
-          "$unpack/ccs" --version | grep -Fq "$GITHUB_REF_NAME"
-          "$unpack/ccs-proxy" --version
-
           smoke_home="$(mktemp -d /tmp/ccs-release-smoke.XXXXXX)"
           cleanup_smoke() {
             HOME="$smoke_home" PATH="$unpack:$PATH" "$unpack/ccs" stop >/dev/null 2>&1 || true
@@ -275,7 +267,7 @@ jobs:
       # intentionally last so a tap-only failure can rerun without rebuilding
       # timestamp-signed release assets that are already public.
       - name: Publish the formula to the tap
-        uses: yasyf/homebrew-tap/.github/actions/publish@9ca67392d45d66b6ae01e262383c8f3138d56f5e
+        uses: yasyf/homebrew-tap/.github/actions/publish@9525763796fce4d1042cf3393d9479f791908eaa
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: tap-staging
