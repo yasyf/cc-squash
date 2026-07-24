@@ -284,8 +284,9 @@ func (s *Server) runtime() (*dkdaemon.Runtime, *serverPublication, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	s.registerHandlers(wireServer)
-	return runtime, dkdaemon.NewPublicationSlot[*Server](runtime), nil
+	publication := dkdaemon.NewPublicationSlot[*Server](runtime)
+	registerHandlers(wireServer, publication)
+	return runtime, publication, nil
 }
 
 func (s *Server) activate(activation dkdaemon.Activation) error {
@@ -378,39 +379,59 @@ func clearRetiredProxyState() error {
 	return errors.Join(errs...)
 }
 
-func (s *Server) registerHandlers(server *wire.Server) {
+func registerHandlers(server *wire.Server, publication *serverPublication) {
 	server.Register(wire.HandlerSpec{Op: wire.Op(OpStatus), Concurrent: true, Handler: func(_ context.Context, request wire.Request) (any, error) {
 		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
 			return nil, err
 		}
-		snapshot := s.snapshot()
+		product, err := publication.Value(request.Publication)
+		if err != nil {
+			return nil, err
+		}
+		snapshot := product.snapshot()
 		return Response{OK: true, Status: &snapshot}, nil
 	}})
 	server.Register(wire.HandlerSpec{Op: wire.Op(OpMint), Concurrent: true, Handler: func(ctx context.Context, request wire.Request) (any, error) {
 		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
 			return nil, err
 		}
-		return s.handleMint(ctx), nil
+		product, err := publication.Value(request.Publication)
+		if err != nil {
+			return nil, err
+		}
+		return product.handleMint(ctx), nil
 	}})
 	server.Register(wire.HandlerSpec{Op: wire.Op(OpKill), Concurrent: true, Handler: func(_ context.Context, request wire.Request) (any, error) {
 		var message ToggleRequest
 		if err := decodeBusinessRequest(request, &message); err != nil {
 			return nil, err
 		}
-		return s.handleKill(message.On), nil
+		product, err := publication.Value(request.Publication)
+		if err != nil {
+			return nil, err
+		}
+		return product.handleKill(message.On), nil
 	}})
 	server.Register(wire.HandlerSpec{Op: wire.Op(OpShadow), Concurrent: true, Handler: func(_ context.Context, request wire.Request) (any, error) {
 		var message ToggleRequest
 		if err := decodeBusinessRequest(request, &message); err != nil {
 			return nil, err
 		}
-		return s.handleShadow(message.On), nil
+		product, err := publication.Value(request.Publication)
+		if err != nil {
+			return nil, err
+		}
+		return product.handleShadow(message.On), nil
 	}})
 	server.Register(wire.HandlerSpec{Op: wire.Op(OpGc), Concurrent: true, Handler: func(_ context.Context, request wire.Request) (any, error) {
 		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
 			return nil, err
 		}
-		return s.handleGc(), nil
+		product, err := publication.Value(request.Publication)
+		if err != nil {
+			return nil, err
+		}
+		return product.handleGc(), nil
 	}})
 }
 

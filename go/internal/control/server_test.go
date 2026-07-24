@@ -471,6 +471,50 @@ func TestServerProtocolRoundTrips(t *testing.T) {
 	})
 }
 
+func TestHandlersResolveTheAdmittedPublication(t *testing.T) {
+	shortHome(t)
+	configured, err := NewServer()
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	configured.log = quietLogger(t)
+	runtime, publication, err := configured.runtime()
+	if err != nil {
+		t.Fatalf("runtime: %v", err)
+	}
+	activation, err := runtime.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	published := &Server{
+		tokens:    map[Token]struct{}{Token("published-session"): {}},
+		proxyPort: 49152,
+		proxyPID:  4242,
+	}
+	staged, err := publication.Stage(activation, published)
+	if err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	if err := activation.CommitReady(staged); err != nil {
+		t.Fatalf("CommitReady: %v", err)
+	}
+	client := NewClient()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = shutdownRuntime(runtime)
+	})
+	response, err := client.Status(t.Context())
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if response.Status == nil {
+		t.Fatal("status snapshot missing")
+	}
+	if response.Status.ProxyPort != published.proxyPort || response.Status.ProxyPID != published.proxyPID || response.Status.Sessions != 1 {
+		t.Fatalf("status = %+v, want admitted publication %+v", *response.Status, published.snapshot())
+	}
+}
+
 func TestRuntimeHealthRejectedBeforePublication(t *testing.T) {
 	shortHome(t)
 	server, err := NewServer()

@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-24
+
+### Changed
+- Pin daemonkit v0.17.2 for exact admitted-publication resolution.
+
+### Fixed
+- Resolve every business wire callback through the publication admitted with
+  that request, instead of retaining the server assembled before activation.
+
 ## [0.6.2] - 2026-07-23
 
 ### Fixed
@@ -26,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hard-cut service convergence to daemonkit v0.10.0 with an exact canonical
   program and a fresh replacement-fenced controller-state epoch.
 
-[Unreleased]: https://github.com/yasyf/cc-squash/commits/main
+[Unreleased]: https://github.com/yasyf/cc-squash/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/yasyf/cc-squash/compare/v0.8.0...v0.9.0
 [0.6.2]: https://github.com/yasyf/cc-squash/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/yasyf/cc-squash/compare/v0.6.0...v0.6.1
