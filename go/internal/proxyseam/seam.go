@@ -123,12 +123,13 @@ func (s *Server) Start(ctx context.Context, onRegister func(Register)) {
 			s.log.Printf("proxyseam: accept: %v", err)
 			continue
 		}
+		s.trackConn(conn)
 		done, err := s.intake.Admit()
 		if err != nil {
+			s.untrackConn(conn)
 			_ = conn.Close()
 			return
 		}
-		s.trackConn(conn)
 		s.serveConn(ctx, conn, onRegister)
 		s.untrackConn(conn)
 		done()
