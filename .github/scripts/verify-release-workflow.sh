@@ -28,8 +28,8 @@ for required in \
   'name: Stage and verify the complete draft release' \
   'name: Smoke-test the exact downloaded release' \
   'export CCS_BUILD_VERSION="${VERSION#v}"' \
-  '.github/scripts/verify-release-archive.sh "$VERSION" "$archive"' \
-  '.github/scripts/verify-release-archive.sh "$GITHUB_REF_NAME" "$DOWNLOADED/$archive"' \
+  '.github/scripts/verify-release-archive.sh "$VERSION" "$COMMIT" "$archive"' \
+  '.github/scripts/verify-release-archive.sh "$GITHUB_REF_NAME" "$commit" "$DOWNLOADED/$archive"' \
   'test "$actual_identifier" = "$binary"' \
   "grep -Eq '^CodeDirectory .*flags=.*runtime'" \
   'com.apple.security.get-task-allow' \

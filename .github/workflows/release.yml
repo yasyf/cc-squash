@@ -85,7 +85,7 @@ jobs:
           # One tarball, both binaries at the tar root (the formula installs both).
           archive="dist/cc-squash-${VERSION}-darwin-universal.tar.gz"
           tar -czf "$archive" -C dist/bin ccs ccs-proxy
-          .github/scripts/verify-release-archive.sh "$VERSION" "$archive"
+          .github/scripts/verify-release-archive.sh "$VERSION" "$COMMIT" "$archive"
 
       - name: Checksum the release assets
         run: |
@@ -175,7 +175,8 @@ jobs:
             shasum -a 256 -c SHA256SUMS.txt
           )
 
-          .github/scripts/verify-release-archive.sh "$GITHUB_REF_NAME" "$DOWNLOADED/$archive"
+          commit="$(git rev-parse --short HEAD)"
+          .github/scripts/verify-release-archive.sh "$GITHUB_REF_NAME" "$commit" "$DOWNLOADED/$archive"
 
           unpack="$RUNNER_TEMP/downloaded-release-smoke"
           rm -rf "$unpack"
