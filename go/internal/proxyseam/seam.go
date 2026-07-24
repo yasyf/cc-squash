@@ -12,19 +12,33 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
+	"github.com/yasyf/daemonkit/drain"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/wire"
 )
 
 // ErrProxyNotConnected is returned by the Server's send methods when no proxy
 // child has connected yet. It is a fail-open signal — the caller logs and
 // continues rather than treating a missing data plane as fatal.
 var ErrProxyNotConnected = errors.New("proxyseam: no proxy child connected")
+
+var errProxyAlreadyServing = errors.New("proxyseam: another proxy listener is serving")
+
+type session struct {
+	conn    net.Conn
+	peer    wire.Peer
+	writeMu sync.Mutex
+}
 
 // Server is the Go end of the proxy-v1.sock seam. It accepts one
 // proxy child connection at a time, and writes control frames to whichever
@@ -33,29 +47,61 @@ var ErrProxyNotConnected = errors.New("proxyseam: no proxy child connected")
 type Server struct {
 	log *log.Logger
 
-	ln net.Listener
+	ln     net.Listener
+	lock   *os.File
+	intake drain.Intake
 
-	mu   sync.Mutex
-	conn net.Conn
+	mu        sync.Mutex
+	expected  proc.Record
+	session   *session
+	accepted  map[net.Conn]struct{}
+	closeErr  error
+	closeOnce sync.Once
 }
 
 // NewServer binds proxy-v1.sock, removing any stale socket file first, and returns
 // a Server ready to accept the proxy child. Diagnostics go to logger.
-func NewServer(logger *log.Logger) (*Server, error) {
+func NewServer(ctx context.Context, logger *log.Logger) (*Server, error) {
 	socket := paths.ProxySocketPath()
-	if err := os.MkdirAll(paths.StateDir(), 0o700); err != nil {
-		return nil, err
+	entrant := proc.SingleEntrant{
+		Socket: socket,
+		Evict: func() (bool, error) {
+			conn, err := net.DialTimeout("unix", socket, 100*time.Millisecond)
+			if err == nil {
+				_ = conn.Close()
+				return false, errProxyAlreadyServing
+			}
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) {
+				return true, nil
+			}
+			return false, fmt.Errorf("proxyseam: probe listener: %w", err)
+		},
 	}
-	_ = os.Remove(socket) // clear a stale socket from a prior daemon before binding
-	ln, err := net.Listen("unix", socket)
+	ln, lock, err := entrant.Listen(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(socket, 0o600); err != nil {
-		_ = ln.Close()
-		return nil, err
+	return &Server{log: logger, ln: ln, lock: lock, accepted: make(map[net.Conn]struct{})}, nil
+}
+
+// ExpectProcess publishes the exact daemonkit-owned child identity allowed to
+// establish the next seam session. It is called from ProcessSpec.Recorded,
+// before daemonkit releases the child to exec.
+func (s *Server) ExpectProcess(record proc.Record) error {
+	if err := record.Validate(); err != nil {
+		return fmt.Errorf("proxyseam: expected process: %w", err)
 	}
-	return &Server{log: logger, ln: ln}, nil
+	s.mu.Lock()
+	s.expected = record
+	current := s.session
+	if current != nil && !current.peer.MatchesProcess(record) {
+		s.session = nil
+	}
+	s.mu.Unlock()
+	if current != nil && !current.peer.MatchesProcess(record) {
+		_ = current.conn.Close()
+	}
+	return nil
 }
 
 // Start accepts proxy child connections until ctx is cancelled or the listener
@@ -66,7 +112,7 @@ func NewServer(logger *log.Logger) (*Server, error) {
 func (s *Server) Start(ctx context.Context, onRegister func(Register)) {
 	go func() {
 		<-ctx.Done()
-		_ = s.ln.Close()
+		_ = s.Close()
 	}()
 	for {
 		conn, err := s.ln.Accept()
@@ -77,18 +123,33 @@ func (s *Server) Start(ctx context.Context, onRegister func(Register)) {
 			s.log.Printf("proxyseam: accept: %v", err)
 			continue
 		}
+		done, err := s.intake.Admit()
+		if err != nil {
+			_ = conn.Close()
+			return
+		}
+		s.trackConn(conn)
 		s.serveConn(ctx, conn, onRegister)
+		s.untrackConn(conn)
+		done()
 	}
 }
 
-// Close closes the listener and any live child connection.
+// Close drains new accepts, closes the listener and authenticated session,
+// settles admitted work, and releases the single-entrant listener lock.
 func (s *Server) Close() error {
-	s.clearConn()
-	err := s.ln.Close()
-	if errors.Is(err, net.ErrClosed) {
-		return nil
-	}
-	return err
+	s.closeOnce.Do(func() {
+		s.intake.Close()
+		listenerErr := s.ln.Close()
+		if errors.Is(listenerErr, net.ErrClosed) {
+			listenerErr = nil
+		}
+		s.closeConnections()
+		settleErr := s.intake.Settle(context.Background())
+		lockErr := s.lock.Close()
+		s.closeErr = errors.Join(listenerErr, settleErr, lockErr)
+	})
+	return s.closeErr
 }
 
 // Connected reports whether a proxy child connection is currently live — the
@@ -97,12 +158,29 @@ func (s *Server) Close() error {
 func (s *Server) Connected() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.conn != nil
+	return s.session != nil && s.session.peer.MatchesProcess(s.expected)
 }
 
 // serveConn admits a child only after its exact epoch-1 register frame. Rust
 // sends no later frames, so any subsequent input closes the session.
 func (s *Server) serveConn(ctx context.Context, conn net.Conn, onRegister func(Register)) {
+	unix, ok := conn.(*net.UnixConn)
+	if !ok {
+		s.log.Printf("proxyseam: reject non-unix peer")
+		_ = conn.Close()
+		return
+	}
+	peer, err := wire.PeerFromConn(unix)
+	if err != nil {
+		s.log.Printf("proxyseam: reject unidentified peer: %v", err)
+		_ = conn.Close()
+		return
+	}
+	if peer.UID != os.Geteuid() || !s.expectedMatches(peer) {
+		s.log.Printf("proxyseam: reject unauthorized peer pid=%d uid=%d", peer.PID, peer.UID)
+		_ = conn.Close()
+		return
+	}
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -130,8 +208,15 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, onRegister func(R
 		s.log.Printf("proxyseam: first frame is %T, want Register", message)
 		return
 	}
-	s.setConn(conn)
-	defer s.clearConn()
+	if register.PID != peer.PID {
+		s.log.Printf("proxyseam: reject register pid=%d from peer pid=%d", register.PID, peer.PID)
+		return
+	}
+	if !s.setConn(conn, peer) {
+		s.log.Printf("proxyseam: reject superseded peer pid=%d", peer.PID)
+		return
+	}
+	defer s.clearConn(conn)
 	s.log.Printf(
 		"proxyseam: proxy registered (protocol=%d port=%d mcp_port=%d version=%s pid=%d)",
 		register.Protocol, register.Port, register.MCPPort, register.Version, register.PID,
@@ -190,28 +275,77 @@ func (s *Server) send(msg any) error {
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.conn == nil {
+	current := s.session
+	if current == nil || !current.peer.MatchesProcess(s.expected) {
+		s.mu.Unlock()
 		return ErrProxyNotConnected
 	}
-	_, err = s.conn.Write(frame)
+	s.mu.Unlock()
+	current.writeMu.Lock()
+	defer current.writeMu.Unlock()
+	s.mu.Lock()
+	live := s.session == current && current.peer.MatchesProcess(s.expected)
+	s.mu.Unlock()
+	if !live {
+		return ErrProxyNotConnected
+	}
+	_, err = current.conn.Write(frame)
 	return err
 }
 
-func (s *Server) setConn(conn net.Conn) {
+func (s *Server) expectedMatches(peer wire.Peer) bool {
 	s.mu.Lock()
-	s.conn = conn
+	defer s.mu.Unlock()
+	return peer.MatchesProcess(s.expected)
+}
+
+func (s *Server) trackConn(conn net.Conn) {
+	s.mu.Lock()
+	s.accepted[conn] = struct{}{}
 	s.mu.Unlock()
+}
+
+func (s *Server) untrackConn(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.accepted, conn)
+	s.mu.Unlock()
+}
+
+func (s *Server) closeConnections() {
+	s.mu.Lock()
+	connections := make([]net.Conn, 0, len(s.accepted))
+	for conn := range s.accepted {
+		connections = append(connections, conn)
+	}
+	s.session = nil
+	s.mu.Unlock()
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
+}
+
+func (s *Server) setConn(conn net.Conn, peer wire.Peer) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !peer.MatchesProcess(s.expected) {
+		return false
+	}
+	s.session = &session{conn: conn, peer: peer}
+	return true
 }
 
 // clearConn drops the connection from the write side and closes it. Safe to
 // call twice (serveConn's defer and Close): the second call sees a nil conn.
-func (s *Server) clearConn() {
+func (s *Server) clearConn(expected net.Conn) {
 	s.mu.Lock()
-	conn := s.conn
-	s.conn = nil
+	current := s.session
+	if current != nil && (expected == nil || current.conn == expected) {
+		s.session = nil
+	} else {
+		current = nil
+	}
 	s.mu.Unlock()
-	if conn != nil {
-		_ = conn.Close()
+	if current != nil {
+		_ = current.conn.Close()
 	}
 }

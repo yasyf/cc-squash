@@ -36,6 +36,18 @@ func testDaemonRole(t *testing.T) daemonrole.Classifier {
 	return daemonrole.Classifier{RoleID: DaemonRoleID, RolePath: filepath.Clean(executable)}
 }
 
+func testProcessRecord(t *testing.T) proc.Record {
+	t.Helper()
+	identity, err := proc.Probe(os.Getpid())
+	if err != nil {
+		t.Fatalf("probe test process: %v", err)
+	}
+	return proc.Record{
+		RecoveryClass: proc.RecoveryTask, PID: identity.PID, StartTime: identity.StartTime,
+		Comm: identity.Comm, Boot: identity.Boot, Generation: "test-generation",
+	}
+}
+
 // fakeProxy is a stand-in for the Rust ccs-proxy child: it dials proxy-v1.sock once
 // it exists, sends one register frame, and then drains control frames the daemon
 // pushes (recording the mint tokens). It connects through the server's explicit
@@ -228,12 +240,16 @@ func newServerWithProxy(t *testing.T, f *fakeProxy) *Server {
 	}
 	srv.log = quietLogger(t)
 	if f != nil {
+		f.pid = os.Getpid()
 		// Register at the daemon's own version so the supervisor reads the proxy as
 		// steady-state (co-released => same version) and never tries to replace it.
 		if f.version == "" {
 			f.version = version.String()
 		}
-		srv.spawnProxy = func() error {
+		srv.spawnProxy = func(recorded func(proc.Record) error) error {
+			if err := recorded(testProcessRecord(t)); err != nil {
+				return err
+			}
 			go func() {
 				if err := f.connect(t); err != nil {
 					t.Errorf("fake proxy connect: %v", err)
@@ -422,7 +438,7 @@ func TestServerProtocolRoundTrips(t *testing.T) {
 		if resp.Status == nil {
 			t.Fatal("status snapshot missing")
 		}
-		if resp.Status.ProxyPort != 50600 || resp.Status.ProxyPID != 7 {
+		if resp.Status.ProxyPort != 50600 || resp.Status.ProxyPID != f.pid {
 			t.Fatalf("status proxy = port %d pid %d", resp.Status.ProxyPort, resp.Status.ProxyPID)
 		}
 		if resp.Status.Sessions != 1 {
@@ -484,7 +500,7 @@ func TestRuntimeHealthAvailableBeforePublication(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	server.log = quietLogger(t)
-	server.spawnProxy = func() error { return nil }
+	server.spawnProxy = func(func(proc.Record) error) error { return nil }
 	readiness := &gatedRuntimeReadiness{entered: make(chan struct{}), release: make(chan error, 1)}
 	server.readiness = readiness
 	startServerSocket(t, server)
@@ -568,7 +584,7 @@ func TestServerSeamFailOpen(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	srv.log = quietLogger(t)
-	srv.spawnProxy = func() error { return nil }
+	srv.spawnProxy = func(func(proc.Record) error) error { return nil }
 	srv.mintTimeout = 200 * time.Millisecond
 	startServer(t, srv)
 
@@ -607,7 +623,7 @@ func TestServerSameReleaseDoesNotReplaceLivePeer(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	second.log = quietLogger(t)
-	second.spawnProxy = func() error { return nil }
+	second.spawnProxy = func(func(proc.Record) error) error { return nil }
 	if err := second.Run(context.Background()); err != nil {
 		t.Fatalf("same-release contender: %v", err)
 	}
@@ -665,7 +681,7 @@ func TestActivationAcknowledgesRetiredProxyReceiptAfterDerivedStateCleanup(t *te
 		t.Fatalf("NewServer: %v", err)
 	}
 	server.log = quietLogger(t)
-	server.spawnProxy = func() error { return nil }
+	server.spawnProxy = func(func(proc.Record) error) error { return nil }
 	startServer(t, server)
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -717,8 +733,8 @@ func TestServerStatusFileWritten(t *testing.T) {
 	for {
 		snap, err := ReadStatus()
 		if err == nil && snap.ProxyPort == 50900 {
-			if snap.ProxyPID != 13 {
-				t.Fatalf("status-v1.json pid = %d, want 13", snap.ProxyPID)
+			if snap.ProxyPID != f.pid {
+				t.Fatalf("status-v1.json pid = %d, want %d", snap.ProxyPID, f.pid)
 			}
 			break
 		}

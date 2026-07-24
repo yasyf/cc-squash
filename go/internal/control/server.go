@@ -58,9 +58,9 @@ type Server struct {
 	pool    *dksupervise.Pool
 	reaper  *proc.Reaper
 
-	// spawnProxy overrides the detached ccs-proxy launch in tests; production
-	// delegates launch, process limits, and reaping to daemonkit.
-	spawnProxy func() error
+	// spawnProxy overrides the detached ccs-proxy launch in tests; the override
+	// must publish its exact process record before connecting to the seam.
+	spawnProxy func(func(proc.Record) error) error
 
 	// mintTimeout bounds OpMint's wait for a cold-started proxy to register; zero
 	// means mintReadyTimeout. Tests shrink it to pin the fail-open path fast.
@@ -215,7 +215,7 @@ func (s *Server) activate(activation dkdaemon.Activation, workers *runtimeWorker
 		cfg = json.RawMessage("{}")
 	}
 	s.relayConfig = cfg
-	seam, err := proxyseam.NewServer(s.log)
+	seam, err := proxyseam.NewServer(activation.Startup, s.log)
 	if err != nil {
 		return err
 	}
@@ -468,7 +468,7 @@ func (p *proxySpawner) EnsureRunning(ctx context.Context) error {
 		return nil
 	}
 	if p.server.spawnProxy != nil {
-		if err := p.server.spawnProxy(); err != nil {
+		if err := p.server.spawnProxy(p.server.seam.ExpectProcess); err != nil {
 			return fmt.Errorf("spawn proxy test child: %w", err)
 		}
 		return p.awaitReady(ctx)
@@ -491,6 +491,9 @@ func (p *proxySpawner) EnsureRunning(ctx context.Context) error {
 			"--refs-db", paths.RefsDbPath(),
 		},
 		Stdout: logFile, Stderr: logFile, ReadinessTimeout: p.Timeout(),
+		Recorded: func(_ context.Context, record proc.Record) error {
+			return p.server.seam.ExpectProcess(record)
+		},
 		Ready: func(readyCtx context.Context, _ proc.Record) error {
 			return p.awaitReady(readyCtx)
 		},

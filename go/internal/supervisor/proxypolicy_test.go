@@ -35,9 +35,19 @@ func shortHome(t *testing.T) {
 func liveSeam(t *testing.T) (policy *ProxyPolicy, connectChild func(version string) net.Conn, repushed *atomic.Int32) {
 	t.Helper()
 	shortHome(t)
-	seam, err := proxyseam.NewServer(log.New(io.Discard, "", 0))
+	seam, err := proxyseam.NewServer(t.Context(), log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatalf("new seam: %v", err)
+	}
+	identity, err := proc.Probe(os.Getpid())
+	if err != nil {
+		t.Fatalf("probe test process: %v", err)
+	}
+	if err := seam.ExpectProcess(proc.Record{
+		RecoveryClass: proc.RecoveryTask, PID: identity.PID, StartTime: identity.StartTime,
+		Comm: identity.Comm, Boot: identity.Boot, Generation: "test-generation",
+	}); err != nil {
+		t.Fatalf("expect test process: %v", err)
 	}
 	t.Cleanup(func() { _ = seam.Close() })
 

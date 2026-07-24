@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // shortHome isolates the state dir under a short /tmp path: macOS caps a unix
@@ -31,9 +34,12 @@ func shortHome(t *testing.T) {
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	shortHome(t)
-	srv, err := NewServer(log.New(io.Discard, "", 0))
+	srv, err := NewServer(t.Context(), log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatalf("new server: %v", err)
+	}
+	if err := srv.ExpectProcess(currentProcessRecord(t)); err != nil {
+		t.Fatalf("expect process: %v", err)
 	}
 	t.Cleanup(func() { _ = srv.Close() })
 	return srv
@@ -65,7 +71,26 @@ func registerChild(t *testing.T, conn net.Conn, register Register) {
 func defaultRegister() Register {
 	return Register{
 		Type: MsgRegister, Protocol: ProtocolVersion, Port: 50516, MCPPort: 50517,
-		Version: "0.1.0", PID: 4242,
+		Version: "0.1.0", PID: os.Getpid(),
+	}
+}
+
+func currentProcessRecord(t *testing.T) proc.Record {
+	t.Helper()
+	identity, err := proc.Probe(os.Getpid())
+	if err != nil {
+		t.Fatalf("probe current process: %v", err)
+	}
+	return proc.Record{
+		RecoveryClass: proc.RecoveryTask, PID: identity.PID, StartTime: identity.StartTime,
+		Comm: identity.Comm, Boot: identity.Boot, Generation: "test-generation",
+	}
+}
+
+func foreignProcessRecord() proc.Record {
+	return proc.Record{
+		RecoveryClass: proc.RecoveryTask, PID: os.Getpid() + 100000,
+		StartTime: "foreign-start", Boot: "foreign-boot", Generation: "foreign-generation",
 	}
 }
 
@@ -143,7 +168,7 @@ func TestServerRejectsNonV1Register(t *testing.T) {
 	go srv.Start(ctx, func(register Register) { registered <- register })
 
 	conn := dialChild(t)
-	_, err := conn.Write([]byte(`{"type":"register","protocol":0,"port":50516,"mcp_port":50517,"version":"0.1.0","pid":4242}` + "\n"))
+	_, err := conn.Write([]byte(fmt.Sprintf(`{"type":"register","protocol":0,"port":50516,"mcp_port":50517,"version":"0.1.0","pid":%d}`+"\n", os.Getpid())))
 	if err != nil {
 		t.Fatalf("write stale register: %v", err)
 	}
@@ -160,6 +185,132 @@ func TestServerRejectsNonV1Register(t *testing.T) {
 	case got := <-registered:
 		t.Fatalf("stale proxy registered: %+v", got)
 	default:
+	}
+}
+
+func TestServerRejectsUnpublishedProcess(t *testing.T) {
+	srv := newTestServer(t)
+	if err := srv.ExpectProcess(foreignProcessRecord()); err != nil {
+		t.Fatalf("expect foreign process: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	registered := make(chan Register, 1)
+	go srv.Start(ctx, func(register Register) { registered <- register })
+
+	conn := dialChild(t)
+	registerChild(t, conn, defaultRegister())
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("unpublished process connection remained open")
+	}
+	if srv.Connected() {
+		t.Fatal("unpublished process became live")
+	}
+	select {
+	case got := <-registered:
+		t.Fatalf("unpublished process registered: %+v", got)
+	default:
+	}
+}
+
+func TestServerRejectsRegisterPIDMismatch(t *testing.T) {
+	srv := newTestServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	registered := make(chan Register, 1)
+	go srv.Start(ctx, func(register Register) { registered <- register })
+
+	conn := dialChild(t)
+	register := defaultRegister()
+	register.PID++
+	registerChild(t, conn, register)
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("pid-mismatched connection remained open")
+	}
+	if srv.Connected() {
+		t.Fatal("pid-mismatched process became live")
+	}
+	select {
+	case got := <-registered:
+		t.Fatalf("pid-mismatched process registered: %+v", got)
+	default:
+	}
+}
+
+func TestExpectProcessFencesLiveSession(t *testing.T) {
+	srv := newTestServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx, func(Register) {})
+
+	conn := dialChild(t)
+	registerChild(t, conn, defaultRegister())
+	if err := waitConnected(srv); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.ExpectProcess(foreignProcessRecord()); err != nil {
+		t.Fatalf("replace expected process: %v", err)
+	}
+	if err := waitDisconnected(srv); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("superseded process connection remained open")
+	}
+}
+
+func TestServerSingleEntrantRefusesLiveListener(t *testing.T) {
+	_ = newTestServer(t)
+	second, err := NewServer(t.Context(), log.New(io.Discard, "", 0))
+	if second != nil {
+		_ = second.Close()
+		t.Fatal("second live listener was acquired")
+	}
+	if !errors.Is(err, errProxyAlreadyServing) {
+		t.Fatalf("second listener error = %v, want %v", err, errProxyAlreadyServing)
+	}
+}
+
+func TestCloseSettlesSilentAcceptedConnection(t *testing.T) {
+	srv := newTestServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		srv.Start(ctx, func(Register) {})
+		close(done)
+	}()
+
+	_ = dialChild(t)
+	deadline := time.Now().Add(time.Second)
+	for {
+		srv.mu.Lock()
+		accepted := len(srv.accepted) == 1
+		srv.mu.Unlock()
+		if accepted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("silent connection was not admitted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("close did not settle silent admitted connection")
 	}
 }
 
@@ -272,7 +423,7 @@ func waitConn(srv *Server, want bool, onTimeout error) error {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		srv.mu.Lock()
-		connected := srv.conn != nil
+		connected := srv.session != nil
 		srv.mu.Unlock()
 		if connected == want {
 			return nil
