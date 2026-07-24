@@ -17,6 +17,8 @@ var (
 
 const defaultSpawnTimeout = 10 * time.Second
 
+const defaultKillTimeout = 3 * time.Second
+
 // ReconcileKind identifies a child lifecycle transition.
 type ReconcileKind uint8
 

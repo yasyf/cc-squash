@@ -107,8 +107,8 @@ func (p *ProxyPolicy) Retreat(_ context.Context, reason string) {
 }
 
 // Shutdown asks the proxy to step down over the seam.
-func (p *ProxyPolicy) Shutdown(context.Context) error {
-	return p.seam.SendShutdown()
+func (p *ProxyPolicy) Shutdown(ctx context.Context) error {
+	return p.seam.SendShutdown(ctx)
 }
 
 // WaitGone reports whether the retiring proxy released its seam within d
@@ -137,7 +137,9 @@ func (p *ProxyPolicy) Kill() (int, error) {
 	if p.stop == nil {
 		return 0, ErrChildUnavailable
 	}
-	return p.stop(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), defaultKillTimeout)
+	defer cancel()
+	return p.stop(ctx)
 }
 
 // Reconcile re-establishes desired state across a transition:

@@ -33,10 +33,12 @@ var ErrProxyNotConnected = errors.New("proxyseam: no proxy child connected")
 
 var errProxyAlreadyServing = errors.New("proxyseam: another proxy listener is serving")
 
+const writeTimeout = 2 * time.Second
+
 type session struct {
-	conn    net.Conn
-	peer    wire.Peer
-	writeMu sync.Mutex
+	conn      net.Conn
+	peer      wire.Peer
+	writeGate chan struct{}
 }
 
 // Server is the Go end of the proxy-v1.sock seam. It accepts one
@@ -248,38 +250,38 @@ func (s *Server) SendMint(token string, config json.RawMessage) error {
 	if len(config) == 0 {
 		config = json.RawMessage("{}")
 	}
-	return s.send(Mint{Type: MsgMint, Protocol: ProtocolVersion, Token: token, Config: config})
+	return s.send(context.Background(), Mint{Type: MsgMint, Protocol: ProtocolVersion, Token: token, Config: config})
 }
 
 // SendEvict tells the proxy to drop the session bound to token.
 func (s *Server) SendEvict(token string) error {
-	return s.send(Evict{Type: MsgEvict, Protocol: ProtocolVersion, Token: token})
+	return s.send(context.Background(), Evict{Type: MsgEvict, Protocol: ProtocolVersion, Token: token})
 }
 
 // SendShadow toggles the proxy's shadow mode.
 func (s *Server) SendShadow(on bool) error {
-	return s.send(Shadow{Type: MsgShadow, Protocol: ProtocolVersion, On: on})
+	return s.send(context.Background(), Shadow{Type: MsgShadow, Protocol: ProtocolVersion, On: on})
 }
 
 // SendKill toggles the proxy's kill switch.
 func (s *Server) SendKill(on bool) error {
-	return s.send(Kill{Type: MsgKill, Protocol: ProtocolVersion, On: on})
+	return s.send(context.Background(), Kill{Type: MsgKill, Protocol: ProtocolVersion, On: on})
 }
 
 // SendGc tells the proxy to sweep its ref store down to the reachable set.
 func (s *Server) SendGc() error {
-	return s.send(Gc{Type: MsgGc, Protocol: ProtocolVersion})
+	return s.send(context.Background(), Gc{Type: MsgGc, Protocol: ProtocolVersion})
 }
 
 // SendShutdown tells the proxy to step down.
-func (s *Server) SendShutdown() error {
-	return s.send(Shutdown{Type: MsgShutdown, Protocol: ProtocolVersion})
+func (s *Server) SendShutdown(ctx context.Context) error {
+	return s.send(ctx, Shutdown{Type: MsgShutdown, Protocol: ProtocolVersion})
 }
 
 // send marshals a frame and writes it to the connected child under the write
 // lock. With no child connected it returns ErrProxyNotConnected — the fail-open
 // signal the caller logs and continues past.
-func (s *Server) send(msg any) error {
+func (s *Server) send(ctx context.Context, msg any) error {
 	frame, err := Encode(msg)
 	if err != nil {
 		return err
@@ -291,16 +293,41 @@ func (s *Server) send(msg any) error {
 		return ErrProxyNotConnected
 	}
 	s.mu.Unlock()
-	current.writeMu.Lock()
-	defer current.writeMu.Unlock()
+	writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
+	defer cancel()
+	select {
+	case <-writeCtx.Done():
+		return writeCtx.Err()
+	case <-current.writeGate:
+	}
+	defer func() { current.writeGate <- struct{}{} }()
 	s.mu.Lock()
 	live := s.session == current && matchesIdentity(current.peer, s.expected)
 	s.mu.Unlock()
 	if !live {
 		return ErrProxyNotConnected
 	}
+	deadline := time.Now().Add(writeTimeout)
+	if callerDeadline, ok := writeCtx.Deadline(); ok && callerDeadline.Before(deadline) {
+		deadline = callerDeadline
+	}
+	if err := current.conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	interruptDone := make(chan struct{})
+	stopInterrupt := context.AfterFunc(writeCtx, func() {
+		_ = current.conn.SetWriteDeadline(time.Now())
+		close(interruptDone)
+	})
 	_, err = current.conn.Write(frame)
-	return err
+	if !stopInterrupt() {
+		<-interruptDone
+	}
+	clearErr := current.conn.SetWriteDeadline(time.Time{})
+	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		err = errors.Join(err, context.DeadlineExceeded)
+	}
+	return errors.Join(err, clearErr, writeCtx.Err())
 }
 
 func (s *Server) expectedMatches(peer wire.Peer) bool {
@@ -340,7 +367,9 @@ func (s *Server) setConn(conn net.Conn, peer wire.Peer) bool {
 	if !matchesIdentity(peer, s.expected) {
 		return false
 	}
-	s.session = &session{conn: conn, peer: peer}
+	writeGate := make(chan struct{}, 1)
+	writeGate <- struct{}{}
+	s.session = &session{conn: conn, peer: peer, writeGate: writeGate}
 	return true
 }
 

@@ -43,6 +43,8 @@ const (
 	releaseTeamID            = "SXKCTF23Q2"
 	releaseSigningIdentifier = "ccs"
 	shutdownTimeout          = 30 * time.Second
+	productShutdownTimeout   = 10 * time.Second
+	productResultTimeout     = time.Second
 )
 
 // Server is the cc-squash product control plane. Daemonkit owns its listener,
@@ -52,12 +54,15 @@ type Server struct {
 	proxySock string
 	log       *log.Logger
 
-	seam          *proxyseam.Server
-	sup           *supervisor.Supervisor
-	policy        *supervisor.ProxyPolicy
-	spawner       *proxySpawner
-	children      *proc.Manager
-	productCancel context.CancelFunc
+	seam             *proxyseam.Server
+	sup              *supervisor.Supervisor
+	policy           *supervisor.ProxyPolicy
+	spawner          *proxySpawner
+	children         *proc.Manager
+	productCtx       context.Context
+	productCancel    context.CancelFunc
+	supervisorCancel context.CancelFunc
+	supervisorDone   chan struct{}
 
 	// spawnProxy overrides the detached ccs-proxy launch in tests; the override
 	// must publish its exact process record before connecting to the seam.
@@ -127,10 +132,17 @@ func (s *Server) Run(ctx context.Context) error {
 	productDone := make(chan error, 1)
 	go func() {
 		<-activation.Context().Done()
-		productDone <- errors.Join(s.closeProduct(), settlement.Complete())
+		closeCtx, cancel := context.WithTimeout(context.Background(), productShutdownTimeout)
+		defer cancel()
+		if err := s.closeProduct(closeCtx); err != nil {
+			productDone <- err
+			return
+		}
+		productDone <- settlement.Complete()
 	}()
 	fail := func(cause error) error {
-		return errors.Join(cause, shutdownRuntime(runtime), <-productDone)
+		runtimeErr := shutdownRuntime(runtime)
+		return errors.Join(cause, runtimeErr, productResult(runtimeErr, productDone))
 	}
 	if err := s.activate(activation); err != nil {
 		return fail(err)
@@ -159,11 +171,30 @@ func (s *Server) Run(ctx context.Context) error {
 	}()
 	waitErr := runtime.Wait(context.Background())
 	close(watchDone)
-	productErr := <-productDone
+	productErr := productResult(waitErr, productDone)
 	if ctx.Err() != nil && errors.Is(waitErr, ctx.Err()) {
 		waitErr = nil
 	}
 	return errors.Join(waitErr, productErr)
+}
+
+func productResult(runtimeErr error, done <-chan error) error {
+	if errors.Is(runtimeErr, dkdaemon.ErrShutdownIncomplete) {
+		select {
+		case err := <-done:
+			return err
+		default:
+			return nil
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), productResultTimeout)
+	defer cancel()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("cc-squash: collect product settlement: %w", ctx.Err())
+	}
 }
 
 func shutdownRuntime(runtime *dkdaemon.Runtime) error {
@@ -281,8 +312,12 @@ func (s *Server) activate(activation dkdaemon.Activation) error {
 		return err
 	}
 	s.seam = seam
-	workerCtx, productCancel := context.WithCancel(context.Background())
+	productCtx, productCancel := context.WithCancel(context.Background())
+	supervisorCtx, supervisorCancel := context.WithCancel(productCtx)
+	s.productCtx = productCtx
 	s.productCancel = productCancel
+	s.supervisorCancel = supervisorCancel
+	s.supervisorDone = make(chan struct{})
 	spawner := &proxySpawner{server: s, children: s.children}
 	s.spawner = spawner
 	s.policy = supervisor.NewProxyPolicy(seam, s.repushTokens, spawner.Stop, s.log)
@@ -290,34 +325,47 @@ func (s *Server) activate(activation dkdaemon.Activation) error {
 	s.wg.Add(2)
 	go func() {
 		defer s.wg.Done()
-		seam.Start(workerCtx, s.onRegister)
+		seam.Start(productCtx, s.onRegister)
 	}()
 	go func() {
 		defer s.wg.Done()
-		s.bringUp(workerCtx)
+		defer close(s.supervisorDone)
+		s.bringUp(supervisorCtx)
 	}()
 	return nil
 }
 
-func (s *Server) closeProduct() error {
-	s.shutdownProxy()
-	var childErr error
-	if s.spawner != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), proxyShutdownGrace)
-		_, childErr = s.spawner.Stop(ctx)
-		cancel()
-		if errors.Is(childErr, supervisor.ErrChildUnavailable) {
-			childErr = nil
+func (s *Server) closeProduct(ctx context.Context) error {
+	if s.supervisorCancel != nil {
+		s.supervisorCancel()
+	}
+	var supervisorErr error
+	if s.supervisorDone != nil {
+		select {
+		case <-s.supervisorDone:
+		case <-ctx.Done():
+			supervisorErr = fmt.Errorf("cc-squash: join proxy supervisor: %w", ctx.Err())
 		}
 	}
+	s.shutdownProxy(ctx)
 	if s.productCancel != nil {
 		s.productCancel()
 	}
+	var closeErr error
 	if s.seam != nil {
-		_ = s.seam.Close()
+		closeErr = s.seam.Close()
 	}
-	s.wg.Wait()
-	return childErr
+	joined := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+		return errors.Join(supervisorErr, closeErr)
+	case <-ctx.Done():
+		return errors.Join(supervisorErr, closeErr, fmt.Errorf("cc-squash: join product runtime: %w", ctx.Err()))
+	}
 }
 
 func clearRetiredProxyState() error {
@@ -386,30 +434,20 @@ func runtimeStateFromDaemon(state dkdaemon.State) (RuntimeState, error) {
 	}
 }
 
-// shutdownProxy gracefully stops the supervised proxy on an intentional daemon
-// shutdown: it sends the seam shutdown frame and waits (bounded) for the child to
-// step down, so `ccs stop` / SIGTERM takes the proxy down with the daemon.
-//
-// Worker intake is already closed, so supervision cannot admit a replacement
-// while the proxy steps down. The seam remains live until resource teardown:
-// an explicit shutdown frame takes the proxy down, while a bare seam drop after
-// a daemon crash still leaves it serving so live `ccs url` tokens survive until
-// the daemon respawns.
-func (s *Server) shutdownProxy() {
+// shutdownProxy makes one bounded graceful step-down request after supervision
+// has stopped. Daemonkit remains the sole exact child kill/reap authority.
+func (s *Server) shutdownProxy(ctx context.Context) {
 	if s.policy == nil {
 		return
 	}
-	if err := s.policy.Shutdown(context.Background()); err != nil {
+	graceCtx, cancel := context.WithTimeout(ctx, proxyShutdownGrace)
+	defer cancel()
+	if err := s.policy.Shutdown(graceCtx); err != nil {
 		if errors.Is(err, proxyseam.ErrProxyNotConnected) {
 			return // no proxy connected; nothing to step down
 		}
 		s.log.Printf("shutdown proxy: %v", err)
 		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), proxyShutdownGrace)
-	defer cancel()
-	if !s.policy.WaitGone(ctx, proxyShutdownGrace) {
-		s.log.Printf("proxy did not step down within %s; closing seam", proxyShutdownGrace)
 	}
 }
 
@@ -471,9 +509,10 @@ type proxySpawner struct {
 	children *proc.Manager
 	timeout  time.Duration
 
-	mu      sync.Mutex
-	process *proc.PreparedChild
-	receipt proc.ProcessReceipt
+	mu           sync.Mutex
+	process      *proc.PreparedChild
+	receipt      proc.ProcessReceipt
+	outputCancel context.CancelFunc
 }
 
 func (p *proxySpawner) EnsureRunning(ctx context.Context) error {
@@ -532,16 +571,22 @@ func (p *proxySpawner) EnsureRunning(ctx context.Context) error {
 		_ = logFile.Close()
 		return errors.Join(err, stopPreparedChild(process))
 	}
-	p.server.captureProxyOutput(stdout, stderr, logFile)
+	outputCtx, outputCancel := context.WithCancel(p.server.productCtx)
+	p.server.captureProxyOutput(outputCtx, stdout, stderr, logFile)
 	if err := process.Start(ctx); err != nil {
+		outputCancel()
 		return errors.Join(err, stopPreparedChild(process))
 	}
 	p.mu.Lock()
 	p.process = process
 	p.receipt = receipt
+	p.outputCancel = outputCancel
 	p.mu.Unlock()
 	if err := p.awaitReady(ctx); err != nil {
-		return errors.Join(err, stopPreparedChild(process))
+		outputCancel()
+		stopErr := stopPreparedChild(process)
+		p.clear(process)
+		return errors.Join(err, stopErr)
 	}
 	return nil
 }
@@ -555,24 +600,34 @@ func stopPreparedChild(process *proc.PreparedChild) error {
 func (p *proxySpawner) Stop(ctx context.Context) (int, error) {
 	p.mu.Lock()
 	process := p.process
+	receipt := p.receipt
+	outputCancel := p.outputCancel
 	p.mu.Unlock()
 	if process == nil {
 		return 0, supervisor.ErrChildUnavailable
 	}
-	pid := p.receipt.ProcessIdentity().PID
+	pid := receipt.ProcessIdentity().PID
+	if outputCancel != nil {
+		outputCancel()
+	}
 	if err := process.Stop(ctx); err != nil {
 		return 0, err
 	}
+	p.clear(process)
+	return pid, nil
+}
+
+func (p *proxySpawner) clear(process *proc.PreparedChild) {
 	p.mu.Lock()
 	if p.process == process {
 		p.process = nil
 		p.receipt = proc.ProcessReceipt{}
+		p.outputCancel = nil
 	}
 	p.mu.Unlock()
-	return pid, nil
 }
 
-func (s *Server) captureProxyOutput(stdout, stderr io.ReadCloser, logFile *os.File) {
+func (s *Server) captureProxyOutput(ctx context.Context, stdout, stderr io.ReadCloser, logFile *os.File) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -589,7 +644,18 @@ func (s *Server) captureProxyOutput(stdout, stderr io.ReadCloser, logFile *os.Fi
 			defer stderr.Close()
 			_, _ = io.Copy(logFile, stderr)
 		}()
-		copies.Wait()
+		copied := make(chan struct{})
+		go func() {
+			copies.Wait()
+			close(copied)
+		}()
+		select {
+		case <-ctx.Done():
+			_ = stdout.Close()
+			_ = stderr.Close()
+			<-copied
+		case <-copied:
+		}
 	}()
 }
 

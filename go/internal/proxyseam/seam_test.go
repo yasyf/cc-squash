@@ -16,6 +16,7 @@ import (
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/wire"
 )
 
 // shortHome isolates the state dir under a short /tmp path: macOS caps a unix
@@ -204,7 +205,13 @@ func TestServerRejectsUnpublishedProcess(t *testing.T) {
 	go srv.Start(ctx, func(register Register) { registered <- register })
 
 	conn := dialChild(t)
-	registerChild(t, conn, defaultRegister())
+	frame, err := Encode(defaultRegister())
+	if err != nil {
+		t.Fatalf("encode register: %v", err)
+	}
+	// The peer-identity check may close the socket before this write races in.
+	// Either outcome is valid; admission below is the invariant under test.
+	_, _ = conn.Write(frame)
 	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("deadline: %v", err)
 	}
@@ -409,6 +416,54 @@ func TestServerCancellationClosesConnectedChild(t *testing.T) {
 	}
 	if _, err := conn.Read(make([]byte, 1)); err == nil {
 		t.Fatal("connected child remained readable after cancellation")
+	}
+}
+
+func TestSendShutdownDeadlineWhileWriteGateHeld(t *testing.T) {
+	identity := currentProcessRecord(t)
+	serverConn, childConn := net.Pipe()
+	defer serverConn.Close()
+	defer childConn.Close()
+	srv := &Server{
+		expected: identity,
+		session: &session{
+			conn: serverConn,
+			peer: wire.Peer{
+				PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+				Executable: identity.Executable,
+			},
+			writeGate: make(chan struct{}, 1),
+		},
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if err := srv.SendShutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SendShutdown = %v, want deadline", err)
+	}
+}
+
+func TestSendShutdownDeadlineInterruptsBlockedWrite(t *testing.T) {
+	identity := currentProcessRecord(t)
+	serverConn, childConn := net.Pipe()
+	defer serverConn.Close()
+	defer childConn.Close()
+	writeGate := make(chan struct{}, 1)
+	writeGate <- struct{}{}
+	srv := &Server{
+		expected: identity,
+		session: &session{
+			conn: serverConn,
+			peer: wire.Peer{
+				PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+				Executable: identity.Executable,
+			},
+			writeGate: writeGate,
+		},
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if err := srv.SendShutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SendShutdown = %v, want deadline", err)
 	}
 }
 

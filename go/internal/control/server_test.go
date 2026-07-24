@@ -17,6 +17,7 @@ import (
 	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
 	"github.com/yasyf/cc-squash/go/internal/version"
+	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
@@ -803,5 +804,58 @@ func TestServerShutdownStepsDownProxy(t *testing.T) {
 	case <-seen:
 	case <-time.After(3 * time.Second):
 		t.Fatal("proxy never received a Shutdown frame on intentional daemon shutdown — it would orphan")
+	}
+}
+
+func TestCaptureProxyOutputClosesTransferredReadersOnCancellation(t *testing.T) {
+	server := &Server{}
+	stdout, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	defer stdoutWriter.Close()
+	stderr, stderrWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	defer stderrWriter.Close()
+	logFile, err := os.CreateTemp(t.TempDir(), "proxy.log")
+	if err != nil {
+		t.Fatalf("proxy log: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	server.captureProxyOutput(ctx, stdout, stderr, logFile)
+	cancel()
+	joined := make(chan struct{})
+	go func() {
+		server.wg.Wait()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("capture output did not join after cancellation")
+	}
+}
+
+func TestProductResultDoesNotWaitAfterIncompleteShutdown(t *testing.T) {
+	done := make(chan error)
+	started := time.Now()
+	if err := productResult(dkdaemon.ErrShutdownIncomplete, done); err != nil {
+		t.Fatalf("product result: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("product result waited %s after incomplete shutdown", elapsed)
+	}
+}
+
+func TestCloseProductJoinIsBounded(t *testing.T) {
+	server := &Server{}
+	server.wg.Add(1)
+	defer server.wg.Done()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if err := server.closeProduct(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("closeProduct = %v, want deadline", err)
 	}
 }
