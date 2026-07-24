@@ -292,7 +292,8 @@ func (h *harness) run(args ...string) string {
 	cmd.Env = h.env
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		h.t.Fatalf("ccs %v: %v\nstdout:\n%s\nstderr:\n%s", args, err, stdout.String(), stderr.String())
+		daemonLog, _ := os.ReadFile(filepath.Join(h.home, ".cc-squash", "daemon.log"))
+		h.t.Fatalf("ccs %v: %v\nstdout:\n%s\nstderr:\n%s\ndaemon.log:\n%s", args, err, stdout.String(), stderr.String(), daemonLog)
 	}
 	return stdout.String()
 }

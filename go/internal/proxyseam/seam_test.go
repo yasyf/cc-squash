@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -81,9 +82,13 @@ func currentProcessRecord(t *testing.T) proc.Identity {
 	if err != nil {
 		t.Fatalf("probe current process: %v", err)
 	}
-	identity.Executable, err = os.Executable()
+	executable, err := os.Executable()
 	if err != nil {
 		t.Fatalf("current executable: %v", err)
+	}
+	identity.Executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		t.Fatalf("canonical current executable: %v", err)
 	}
 	return identity
 }

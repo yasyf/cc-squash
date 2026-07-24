@@ -103,8 +103,8 @@ func NewServer(ctx context.Context, logger *log.Logger) (*Server, error) {
 }
 
 // ExpectProcess publishes the exact daemonkit-owned child identity allowed to
-// establish the next seam session. It is called from ProcessSpec.Recorded,
-// before daemonkit releases the child to exec.
+// establish the next seam session. The caller combines the prepared wrapper's
+// PID/start/boot identity with the receipt's canonical target executable.
 func (s *Server) ExpectProcess(identity proc.Identity) error {
 	if _, err := proc.NewRecordDigest(identity); err != nil {
 		return fmt.Errorf("proxyseam: expected process: %w", err)
@@ -346,7 +346,8 @@ func (s *Server) setConn(conn net.Conn, peer wire.Peer) bool {
 
 func matchesIdentity(peer wire.Peer, identity proc.Identity) bool {
 	return peer.PID == identity.PID && peer.StartTime != "" && peer.StartTime == identity.StartTime &&
-		peer.Boot != "" && peer.Boot == identity.Boot
+		peer.Boot != "" && peer.Boot == identity.Boot &&
+		peer.Executable != "" && peer.Executable == identity.Executable
 }
 
 // clearConn drops the connection from the write side and closes it. Safe to

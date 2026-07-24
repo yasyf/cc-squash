@@ -524,7 +524,9 @@ func (p *proxySpawner) EnsureRunning(ctx context.Context) error {
 		_ = logFile.Close()
 		return errors.Join(err, stopPreparedChild(process))
 	}
-	if err := p.server.seam.ExpectProcess(receipt.ProcessIdentity()); err != nil {
+	expected := receipt.ProcessIdentity()
+	expected.Executable = receipt.ExpectedExecutable()
+	if err := p.server.seam.ExpectProcess(expected); err != nil {
 		_ = stdout.Close()
 		_ = stderr.Close()
 		_ = logFile.Close()

@@ -15,10 +15,22 @@ const proxyBinaryName = "ccs-proxy"
 func ProxyBinaryPath() (string, error) {
 	if exe, err := os.Executable(); err == nil {
 		if sibling := filepath.Join(filepath.Dir(exe), proxyBinaryName); isExecutableFile(sibling) {
-			return sibling, nil
+			return canonicalExecutable(sibling)
 		}
 	}
-	return exec.LookPath(proxyBinaryName)
+	path, err := exec.LookPath(proxyBinaryName)
+	if err != nil {
+		return "", err
+	}
+	return canonicalExecutable(path)
+}
+
+func canonicalExecutable(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(absolute)
 }
 
 func isExecutableFile(path string) bool {

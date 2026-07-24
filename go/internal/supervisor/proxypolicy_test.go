@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -43,9 +44,13 @@ func liveSeam(t *testing.T) (policy *ProxyPolicy, connectChild func(version stri
 	if err != nil {
 		t.Fatalf("probe test process: %v", err)
 	}
-	identity.Executable, err = os.Executable()
+	executable, err := os.Executable()
 	if err != nil {
 		t.Fatalf("test executable: %v", err)
+	}
+	identity.Executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		t.Fatalf("canonical test executable: %v", err)
 	}
 	if err := seam.ExpectProcess(identity); err != nil {
 		t.Fatalf("expect test process: %v", err)
