@@ -194,9 +194,47 @@ jobs:
             actual_identifier="$(sed -n 's/^Identifier=//p' <<<"$signature")"
             test "$actual_team" = "$TEAM_ID"
             test "$actual_identifier" = "$binary"
+            grep -Eq '^CodeDirectory .*flags=.*runtime' <<<"$signature"
+            entitlements="$RUNNER_TEMP/${binary}-entitlements.plist"
+            codesign -d --entitlements :- "$unpack/$binary" > "$entitlements" 2>/dev/null || true
+            for forbidden in \
+              com.apple.security.cs.disable-library-validation \
+              com.apple.security.cs.allow-dyld-environment-variables \
+              com.apple.security.cs.allow-unsigned-executable-memory \
+              com.apple.security.cs.allow-jit \
+              com.apple.security.cs.disable-executable-page-protection \
+              com.apple.security.get-task-allow; do
+              if grep -Fq "$forbidden" "$entitlements"; then
+                echo "::error::$binary carries forbidden entitlement $forbidden"
+                exit 1
+              fi
+            done
           done
           "$unpack/ccs" --version | grep -Fq "$GITHUB_REF_NAME"
           "$unpack/ccs-proxy" --version
+
+          smoke_home="$(mktemp -d /tmp/ccs-release-smoke.XXXXXX)"
+          cleanup_smoke() {
+            HOME="$smoke_home" PATH="$unpack:$PATH" "$unpack/ccs" stop >/dev/null 2>&1 || true
+            pkill -9 -f "$unpack/ccs-proxy" >/dev/null 2>&1 || true
+            rm -rf "$smoke_home"
+          }
+          trap cleanup_smoke EXIT
+          mkdir -p "$smoke_home/.cc-squash"
+          printf 'schema_version = 1\n' > "$smoke_home/.cc-squash/config.toml"
+          url="$(HOME="$smoke_home" PATH="$unpack:$PATH" "$unpack/ccs" url)"
+          [[ "$url" =~ ^http://127\.0\.0\.1:[0-9]+/s/[^/]+$ ]]
+          status="$(HOME="$smoke_home" PATH="$unpack:$PATH" "$unpack/ccs" status --json)"
+          proxy_pid="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["proxy_pid"])' <<<"$status")"
+          test "$proxy_pid" -gt 1
+          HOME="$smoke_home" PATH="$unpack:$PATH" "$unpack/ccs" stop
+          test ! -S "$smoke_home/.cc-squash/daemon.sock"
+          if kill -0 "$proxy_pid" 2>/dev/null; then
+            echo "::error::signed ccs stop left proxy pid $proxy_pid alive"
+            exit 1
+          fi
+          trap - EXIT
+          rm -rf "$smoke_home"
 
       - name: Publish the verified release
         uses: yasyf/homebrew-tap/.github/actions/publish-draft-release@54e3e194bda69896894a82c17fcdb2822beefab5

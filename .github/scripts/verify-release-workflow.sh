@@ -28,6 +28,9 @@ for required in \
   'name: Stage and verify the complete draft release' \
   'name: Smoke-test the exact downloaded release' \
   'test "$actual_identifier" = "$binary"' \
+  "grep -Eq '^CodeDirectory .*flags=.*runtime'" \
+  'com.apple.security.get-task-allow' \
+  '"$unpack/ccs" stop' \
   "actions/stage-draft-release@${stage_pin}" \
   "actions/publish-draft-release@${draft_publish_pin}" \
   "release-id: \${{ steps.draft.outputs['release-id'] }}" \
