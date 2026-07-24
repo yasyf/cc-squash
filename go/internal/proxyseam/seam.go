@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
-	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 )
@@ -47,12 +46,11 @@ type session struct {
 type Server struct {
 	log *log.Logger
 
-	ln     net.Listener
-	lock   *os.File
-	intake drain.Intake
+	ln   net.Listener
+	lock *proc.FileLockHandle
 
 	mu        sync.Mutex
-	expected  proc.Record
+	expected  proc.Identity
 	session   *session
 	accepted  map[net.Conn]struct{}
 	closeErr  error
@@ -63,22 +61,42 @@ type Server struct {
 // a Server ready to accept the proxy child. Diagnostics go to logger.
 func NewServer(ctx context.Context, logger *log.Logger) (*Server, error) {
 	socket := paths.ProxySocketPath()
-	entrant := proc.SingleEntrant{
-		Socket: socket,
-		Evict: func() (bool, error) {
-			conn, err := net.DialTimeout("unix", socket, 100*time.Millisecond)
-			if err == nil {
-				_ = conn.Close()
-				return false, errProxyAlreadyServing
-			}
-			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) {
-				return true, nil
-			}
-			return false, fmt.Errorf("proxyseam: probe listener: %w", err)
-		},
+	lock, err := (proc.FileLockSpec{
+		Path: socket + ".lock", Mode: proc.FileLockExclusive, Deadline: time.Second,
+	}).TryAcquire()
+	if errors.Is(err, proc.ErrLockBusy) {
+		return nil, errProxyAlreadyServing
 	}
-	ln, lock, err := entrant.Listen(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	conn, probeErr := net.DialTimeout("unix", socket, 100*time.Millisecond)
+	if probeErr == nil {
+		_ = conn.Close()
+		_ = lock.Close()
+		return nil, errProxyAlreadyServing
+	}
+	if !errors.Is(probeErr, os.ErrNotExist) && !errors.Is(probeErr, syscall.ENOENT) &&
+		!errors.Is(probeErr, syscall.ECONNREFUSED) {
+		_ = lock.Close()
+		return nil, fmt.Errorf("proxyseam: probe listener: %w", probeErr)
+	}
+	if err := os.Remove(socket); err != nil && !errors.Is(err, os.ErrNotExist) {
+		_ = lock.Close()
+		return nil, fmt.Errorf("proxyseam: remove stale listener: %w", err)
+	}
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	if err := os.Chmod(socket, 0o600); err != nil {
+		_ = ln.Close()
+		_ = lock.Close()
 		return nil, err
 	}
 	return &Server{log: logger, ln: ln, lock: lock, accepted: make(map[net.Conn]struct{})}, nil
@@ -87,18 +105,18 @@ func NewServer(ctx context.Context, logger *log.Logger) (*Server, error) {
 // ExpectProcess publishes the exact daemonkit-owned child identity allowed to
 // establish the next seam session. It is called from ProcessSpec.Recorded,
 // before daemonkit releases the child to exec.
-func (s *Server) ExpectProcess(record proc.Record) error {
-	if err := record.Validate(); err != nil {
+func (s *Server) ExpectProcess(identity proc.Identity) error {
+	if _, err := proc.NewRecordDigest(identity); err != nil {
 		return fmt.Errorf("proxyseam: expected process: %w", err)
 	}
 	s.mu.Lock()
-	s.expected = record
+	s.expected = identity
 	current := s.session
-	if current != nil && !current.peer.MatchesProcess(record) {
+	if current != nil && !matchesIdentity(current.peer, identity) {
 		s.session = nil
 	}
 	s.mu.Unlock()
-	if current != nil && !current.peer.MatchesProcess(record) {
+	if current != nil && !matchesIdentity(current.peer, identity) {
 		_ = current.conn.Close()
 	}
 	return nil
@@ -124,15 +142,8 @@ func (s *Server) Start(ctx context.Context, onRegister func(Register)) {
 			continue
 		}
 		s.trackConn(conn)
-		done, err := s.intake.Admit()
-		if err != nil {
-			s.untrackConn(conn)
-			_ = conn.Close()
-			return
-		}
 		s.serveConn(ctx, conn, onRegister)
 		s.untrackConn(conn)
-		done()
 	}
 }
 
@@ -140,15 +151,13 @@ func (s *Server) Start(ctx context.Context, onRegister func(Register)) {
 // settles admitted work, and releases the single-entrant listener lock.
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
-		s.intake.Close()
 		listenerErr := s.ln.Close()
 		if errors.Is(listenerErr, net.ErrClosed) {
 			listenerErr = nil
 		}
 		s.closeConnections()
-		settleErr := s.intake.Settle(context.Background())
 		lockErr := s.lock.Close()
-		s.closeErr = errors.Join(listenerErr, settleErr, lockErr)
+		s.closeErr = errors.Join(listenerErr, lockErr)
 	})
 	return s.closeErr
 }
@@ -159,7 +168,7 @@ func (s *Server) Close() error {
 func (s *Server) Connected() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.session != nil && s.session.peer.MatchesProcess(s.expected)
+	return s.session != nil && matchesIdentity(s.session.peer, s.expected)
 }
 
 // serveConn admits a child only after its exact epoch-1 register frame. Rust
@@ -277,7 +286,7 @@ func (s *Server) send(msg any) error {
 	}
 	s.mu.Lock()
 	current := s.session
-	if current == nil || !current.peer.MatchesProcess(s.expected) {
+	if current == nil || !matchesIdentity(current.peer, s.expected) {
 		s.mu.Unlock()
 		return ErrProxyNotConnected
 	}
@@ -285,7 +294,7 @@ func (s *Server) send(msg any) error {
 	current.writeMu.Lock()
 	defer current.writeMu.Unlock()
 	s.mu.Lock()
-	live := s.session == current && current.peer.MatchesProcess(s.expected)
+	live := s.session == current && matchesIdentity(current.peer, s.expected)
 	s.mu.Unlock()
 	if !live {
 		return ErrProxyNotConnected
@@ -297,7 +306,7 @@ func (s *Server) send(msg any) error {
 func (s *Server) expectedMatches(peer wire.Peer) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return peer.MatchesProcess(s.expected)
+	return matchesIdentity(peer, s.expected)
 }
 
 func (s *Server) trackConn(conn net.Conn) {
@@ -328,11 +337,16 @@ func (s *Server) closeConnections() {
 func (s *Server) setConn(conn net.Conn, peer wire.Peer) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !peer.MatchesProcess(s.expected) {
+	if !matchesIdentity(peer, s.expected) {
 		return false
 	}
 	s.session = &session{conn: conn, peer: peer}
 	return true
+}
+
+func matchesIdentity(peer wire.Peer, identity proc.Identity) bool {
+	return peer.PID == identity.PID && peer.StartTime != "" && peer.StartTime == identity.StartTime &&
+		peer.Boot != "" && peer.Boot == identity.Boot
 }
 
 // clearConn drops the connection from the write side and closes it. Safe to

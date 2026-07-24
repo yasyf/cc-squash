@@ -8,6 +8,15 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 )
 
+var (
+	// ErrSkipSpawn means product policy intentionally declined one spawn attempt.
+	ErrSkipSpawn = errors.New("supervisor: skip spawn")
+	// ErrChildUnavailable means no exact product child remains under management.
+	ErrChildUnavailable = errors.New("supervisor: child unavailable")
+)
+
+const defaultSpawnTimeout = 10 * time.Second
+
 // ReconcileKind identifies a child lifecycle transition.
 type ReconcileKind uint8
 
@@ -132,7 +141,7 @@ func (s *Supervisor) revive(ctx context.Context) {
 		return
 	}
 	if err := s.Spawn.EnsureRunning(ctx); err != nil {
-		if errors.Is(err, proc.ErrSkipSpawn) {
+		if errors.Is(err, ErrSkipSpawn) {
 			return
 		}
 		s.noteSpawnFailure()
@@ -185,7 +194,7 @@ func (s *Supervisor) Replace(ctx context.Context, force bool) (deferred bool) {
 		return false
 	}
 	if err := s.Spawn.EnsureRunning(ctx); err != nil {
-		if !errors.Is(err, proc.ErrSkipSpawn) {
+		if !errors.Is(err, ErrSkipSpawn) {
 			s.noteSpawnFailure()
 		}
 		return false
@@ -199,7 +208,7 @@ func (s *Supervisor) Replace(ctx context.Context, force bool) (deferred bool) {
 
 func (s *Supervisor) reapWedged(ctx context.Context) bool {
 	_, err := s.Policy.Kill()
-	if errors.Is(err, proc.ErrChildUnavailable) {
+	if errors.Is(err, ErrChildUnavailable) {
 		return true
 	}
 	if err != nil {
@@ -253,5 +262,5 @@ func (s *Supervisor) goneWait() time.Duration {
 	if timeout := s.Spawn.Timeout(); timeout > 0 {
 		return timeout
 	}
-	return proc.DefaultSpawnTimeout
+	return defaultSpawnTimeout
 }

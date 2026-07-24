@@ -45,7 +45,6 @@ a session URL. Bare ` + "`ccs`" + ` shows the daemon status.`,
 		newDoctorCmd(),
 		newServiceCmd(),
 		newDaemonCmd(),
-		newStopRuntimeCmd(),
 	)
 	return root
 }

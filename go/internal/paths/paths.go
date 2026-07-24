@@ -64,11 +64,14 @@ func LocksDir() string {
 	return daemon.LockDir()
 }
 
-// ProcessStorePath is daemonkit's durable process identity and receipt ledger.
-func ProcessStorePath() string { return path("processes.db") }
+// WorkerProcessStorePath is daemonkit's disposable-worker identity ledger.
+func WorkerProcessStorePath() string { return path("worker-processes-v1.db") }
+
+// ChildProcessStorePath is daemonkit's product-child identity ledger.
+func ChildProcessStorePath() string { return path("child-processes-v1.db") }
 
 // ServiceStatePath is daemonkit's exact desired LaunchAgent set.
-func ServiceStatePath() string { return path("services-v2.db") }
+func ServiceStatePath() string { return path("services-v1.db") }
 
 // ServiceProcessStorePath is daemonkit's service-worker identity and receipt ledger.
 func ServiceProcessStorePath() string { return path("service-processes-v1.db") }

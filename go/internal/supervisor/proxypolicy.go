@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 // waitGonePoll is how often WaitGone re-checks the seam while a retiring proxy
@@ -136,7 +135,7 @@ func (p *ProxyPolicy) WaitGone(ctx context.Context, d time.Duration) bool {
 // process owner. The captured pid is observation only and never kill authority.
 func (p *ProxyPolicy) Kill() (int, error) {
 	if p.stop == nil {
-		return 0, proc.ErrChildUnavailable
+		return 0, ErrChildUnavailable
 	}
 	return p.stop(context.Background())
 }

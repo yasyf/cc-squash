@@ -3,21 +3,21 @@ package control
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"os"
-	"path/filepath"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
 	"github.com/yasyf/cc-squash/go/internal/version"
-	"github.com/yasyf/daemonkit/daemonrole"
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -27,25 +27,17 @@ func quietLogger(t *testing.T) *log.Logger {
 	return log.New(io.Discard, "", 0)
 }
 
-func testDaemonRole(t *testing.T) daemonrole.Classifier {
-	t.Helper()
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatalf("resolve test executable: %v", err)
-	}
-	return daemonrole.Classifier{RoleID: DaemonRoleID, RolePath: filepath.Clean(executable)}
-}
-
-func testProcessRecord(t *testing.T) proc.Record {
+func testProcessRecord(t *testing.T) proc.Identity {
 	t.Helper()
 	identity, err := proc.Probe(os.Getpid())
 	if err != nil {
 		t.Fatalf("probe test process: %v", err)
 	}
-	return proc.Record{
-		RecoveryClass: proc.RecoveryTask, PID: identity.PID, StartTime: identity.StartTime,
-		Comm: identity.Comm, Boot: identity.Boot, Generation: "test-generation",
+	identity.Executable, err = os.Executable()
+	if err != nil {
+		t.Fatalf("test executable: %v", err)
 	}
+	return identity
 }
 
 // fakeProxy is a stand-in for the Rust ccs-proxy child: it dials proxy-v1.sock once
@@ -234,7 +226,7 @@ func waitSocketUp(socket string, d time.Duration) bool {
 func newServerWithProxy(t *testing.T, f *fakeProxy) *Server {
 	t.Helper()
 	shortHome(t)
-	srv, err := NewServer(testDaemonRole(t))
+	srv, err := NewServer()
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -246,7 +238,7 @@ func newServerWithProxy(t *testing.T, f *fakeProxy) *Server {
 		if f.version == "" {
 			f.version = version.String()
 		}
-		srv.spawnProxy = func(recorded func(proc.Record) error) error {
+		srv.spawnProxy = func(recorded func(proc.Identity) error) error {
 			if err := recorded(testProcessRecord(t)); err != nil {
 				return err
 			}
@@ -418,7 +410,7 @@ func TestServerProtocolRoundTrips(t *testing.T) {
 		}
 		if health.RuntimeBuild != version.String() || health.RuntimeProtocol != int(wire.ProtocolVersion) ||
 			health.PID <= 1 || health.ProcessGeneration == "" || !health.Ready ||
-			health.State != "healthy" || health.Draining || health.Busy {
+			health.State != "healthy" || health.Draining || !health.Busy {
 			t.Fatalf("health = %+v", health)
 		}
 	})
@@ -473,56 +465,39 @@ func TestServerProtocolRoundTrips(t *testing.T) {
 	})
 }
 
-type gatedRuntimeReadiness struct {
-	entered   chan struct{}
-	release   chan error
-	published atomic.Bool
-}
-
-func (r *gatedRuntimeReadiness) BeforeReady(ctx context.Context) error {
-	close(r.entered)
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-r.release:
-		return err
-	}
-}
-
-func (r *gatedRuntimeReadiness) AfterReady(err error) { r.published.Store(err == nil) }
-
-func (r *gatedRuntimeReadiness) Published() bool { return r.published.Load() }
-
-func TestRuntimeHealthAvailableBeforePublication(t *testing.T) {
+func TestRuntimeHealthRejectedBeforePublication(t *testing.T) {
 	shortHome(t)
-	server, err := NewServer(testDaemonRole(t))
+	server, err := NewServer()
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 	server.log = quietLogger(t)
-	server.spawnProxy = func(func(proc.Record) error) error { return nil }
-	readiness := &gatedRuntimeReadiness{entered: make(chan struct{}), release: make(chan error, 1)}
-	server.readiness = readiness
+	server.spawnProxy = func(func(proc.Identity) error) error { return nil }
+	entered := make(chan struct{})
+	release := make(chan error, 1)
+	server.beforePublication = func(ctx context.Context) error {
+		close(entered)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-release:
+			return err
+		}
+	}
 	startServerSocket(t, server)
 	select {
-	case <-readiness.entered:
+	case <-entered:
 	case <-time.After(time.Second):
 		t.Fatal("runtime readiness did not start")
 	}
 
 	client := NewClient()
 	t.Cleanup(func() { _ = client.Close() })
-	starting, err := client.RuntimeHealth(t.Context())
-	if err != nil {
-		t.Fatalf("pre-ready runtime health: %v", err)
-	}
-	if starting.RuntimeBuild != version.String() || starting.RuntimeProtocol != int(wire.ProtocolVersion) ||
-		starting.PID <= 1 || starting.ProcessGeneration == "" || starting.Ready ||
-		starting.State != "healthy" || starting.Draining || starting.Busy {
-		t.Fatalf("pre-ready runtime health = %+v", starting)
+	if _, err := client.RuntimeHealth(t.Context()); err == nil || !strings.Contains(err.Error(), "wire: runtime is starting") {
+		t.Fatalf("pre-ready runtime health error = %v", err)
 	}
 
-	readiness.release <- nil
+	release <- nil
 	if err := client.WaitReady(t.Context(), time.Second); err != nil {
 		t.Fatalf("WaitReady after publication: %v", err)
 	}
@@ -530,8 +505,8 @@ func TestRuntimeHealthAvailableBeforePublication(t *testing.T) {
 	if err != nil {
 		t.Fatalf("published runtime health: %v", err)
 	}
-	if !ready.Ready || ready.ProcessGeneration != starting.ProcessGeneration {
-		t.Fatalf("published runtime health = %+v, starting = %+v", ready, starting)
+	if !ready.Ready {
+		t.Fatalf("published runtime health = %+v", ready)
 	}
 }
 
@@ -579,12 +554,12 @@ func TestServerSeamFailOpen(t *testing.T) {
 	// A daemon whose proxy NEVER registers: spawnProxy returns nil without
 	// connecting, so the seam stays empty.
 	shortHome(t)
-	srv, err := NewServer(testDaemonRole(t))
+	srv, err := NewServer()
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 	srv.log = quietLogger(t)
-	srv.spawnProxy = func(func(proc.Record) error) error { return nil }
+	srv.spawnProxy = func(func(proc.Identity) error) error { return nil }
 	srv.mintTimeout = 200 * time.Millisecond
 	startServer(t, srv)
 
@@ -618,12 +593,12 @@ func TestServerSameReleaseDoesNotReplaceLivePeer(t *testing.T) {
 	first := newServerWithProxy(t, f)
 	startServer(t, first)
 
-	second, err := NewServer(testDaemonRole(t))
+	second, err := NewServer()
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 	second.log = quietLogger(t)
-	second.spawnProxy = func(func(proc.Record) error) error { return nil }
+	second.spawnProxy = func(func(proc.Identity) error) error { return nil }
 	if err := second.Run(context.Background()); err != nil {
 		t.Fatalf("same-release contender: %v", err)
 	}
@@ -638,15 +613,21 @@ func TestServerRejectsWrongWireBuildBeforeDispatch(t *testing.T) {
 	server := newServerWithProxy(t, &fakeProxy{port: 50810, pid: 12})
 	startServer(t, server)
 	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(server.socket), WireBuild: "cc-squash.control.wrong",
+		Dial: wire.UnixDialer(server.socket), WireBuild: "cc-squash.control.wrong", Role: trust.UnprotectedRole,
 	})
 	if err != nil {
-		t.Fatalf("wrong business build handshake: %v", err)
+		if !errors.Is(err, wire.ErrBuildMismatch) {
+			t.Fatalf("wrong business build handshake: %v", err)
+		}
+		return
 	}
 	defer client.Close()
 	result, err := client.Call(t.Context(), wire.Op(OpStatus), "", []byte(`{}`))
 	if err != nil {
-		t.Fatalf("wrong business build call: %v", err)
+		if !errors.Is(err, wire.ErrBuildMismatch) {
+			t.Fatalf("wrong business build call: %v", err)
+		}
+		return
 	}
 	if result.Outcome != wire.Rejected || result.Response.Reason != wire.ErrBuildMismatch.Error() {
 		t.Fatalf("wrong business build result = %#v", result)
@@ -668,20 +649,20 @@ func TestActivationAcknowledgesRetiredProxyReceiptAfterDerivedStateCleanup(t *te
 	if err != nil {
 		t.Fatalf("boot identity: %v", err)
 	}
-	store := &proc.FileStore{Path: paths.ProcessStorePath()}
+	store := &proc.FileStore{Path: paths.ChildProcessStorePath()}
 	if err := store.Add(t.Context(), proc.Record{
-		RecoveryClass: proc.RecoveryTask,
-		PID:           2_000_000_000, StartTime: "retired", Boot: boot, Comm: "ccs-proxy",
-		Generation: "retired-generation",
+		RecoveryID: proc.RecoveryTaskID,
+		PID:        2_000_000_000, StartTime: "retired", Boot: boot, Comm: "ccs-proxy",
+		Executable: "/retired/ccs-proxy", Generation: proc.OwnerGeneration{1},
 	}); err != nil {
 		t.Fatalf("seed retired proxy record: %v", err)
 	}
-	server, err := NewServer(testDaemonRole(t))
+	server, err := NewServer()
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 	server.log = quietLogger(t)
-	server.spawnProxy = func(func(proc.Record) error) error { return nil }
+	server.spawnProxy = func(func(proc.Identity) error) error { return nil }
 	startServer(t, server)
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -700,25 +681,6 @@ func TestActivationAcknowledgesRetiredProxyReceiptAfterDerivedStateCleanup(t *te
 	}
 	if _, err := os.Stat(paths.PortFilePath()); !os.IsNotExist(err) {
 		t.Fatalf("retired port still present: %v", err)
-	}
-	var page proc.ReapReceiptPage
-	for {
-		page, err = store.LoadReapReceipts(
-			t.Context(), proc.RecoveryTask, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit,
-		)
-		if err != nil {
-			t.Fatalf("read receipt ledger: %v", err)
-		}
-		if page.Floor.Sequence == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("receipt acknowledgement did not commit: %+v", page)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if len(page.Receipts) != 0 || page.Floor.Sequence != 1 {
-		t.Fatalf("receipt page after activation = %+v", page)
 	}
 }
 

@@ -13,6 +13,8 @@ func TestDerivedPaths(t *testing.T) {
 		"refs":              RefsDbPath(),
 		"status":            StatusPath(),
 		"mcp config":        MCPConfigPath(),
+		"worker processes":  WorkerProcessStorePath(),
+		"child processes":   ChildProcessStorePath(),
 		"services":          ServiceStatePath(),
 		"service processes": ServiceProcessStorePath(),
 	} {
@@ -25,7 +27,9 @@ func TestDerivedPaths(t *testing.T) {
 		filepath.Base(RefsDbPath()) != "refs-v1.db" ||
 		filepath.Base(StatusPath()) != "status-v1.json" ||
 		filepath.Base(MCPConfigPath()) != "mcp-v1.json" ||
-		filepath.Base(ServiceStatePath()) != "services-v2.db" ||
+		filepath.Base(WorkerProcessStorePath()) != "worker-processes-v1.db" ||
+		filepath.Base(ChildProcessStorePath()) != "child-processes-v1.db" ||
+		filepath.Base(ServiceStatePath()) != "services-v1.db" ||
 		filepath.Base(ServiceProcessStorePath()) != "service-processes-v1.db" {
 		t.Fatal("derived paths are not the exact epoch names")
 	}

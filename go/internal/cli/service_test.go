@@ -7,14 +7,13 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/control"
-	"github.com/yasyf/cc-squash/go/internal/version"
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/wire"
 )
 
 type recordingServiceController struct {
 	desired [][]service.Agent
-	stops   []service.StopControlSpec
+	stops   []service.StopRuntimeRequest
 	steps   *[]string
 }
 
@@ -28,13 +27,13 @@ func (c *recordingServiceController) Converge(_ context.Context, agents []servic
 
 func (c *recordingServiceController) StopRuntime(
 	_ context.Context,
-	spec service.StopControlSpec,
-) (wire.StopResult, error) {
+	spec service.StopRuntimeRequest,
+) (service.StopReceipt, error) {
 	if c.steps != nil {
 		*c.steps = append(*c.steps, "stop")
 	}
 	c.stops = append(c.stops, spec)
-	return wire.StopResult{Stopped: true}, nil
+	return service.StopReceipt{}, nil
 }
 
 func (*recordingServiceController) Close(context.Context) error { return nil }
@@ -148,10 +147,11 @@ func TestEnsureDaemonCurrentStopsOlderRuntimeBeforeConvergingSuccessor(t *testin
 		t.Fatalf("stop specs = %+v", controller.stops)
 	}
 	spec := controller.stops[0]
-	if spec.Executable == "" || !slices.Equal(spec.Args, []string{stopRuntimeCommand}) ||
-		spec.Role != control.StopControlRoleID || spec.RuntimeBuild != version.String() ||
-		spec.RuntimeProtocol != int(wire.ProtocolVersion) || spec.TargetProcessGeneration != "older-runtime" ||
-		spec.Intent != wire.StopIntentUpgrade {
+	if spec.OperationID != "cc-squash.stop-runtime.v1:older-runtime" ||
+		spec.ControlRole != control.StopControlRoleID || spec.ExpectedRuntimeBuild != "0.0.1" ||
+		spec.RuntimeClientConfig.Client.Role != control.StopControlRoleID ||
+		spec.RuntimeClientConfig.Client.WireBuild != control.WireBuild ||
+		spec.RuntimeClientConfig.Client.Dial == nil || spec.RuntimeClientConfig.NoProgressTimeout != serviceCloseTimeout {
 		t.Fatalf("stop spec = %+v", spec)
 	}
 }

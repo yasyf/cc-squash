@@ -8,13 +8,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/yasyf/daemonkit/daemonrole"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
@@ -24,8 +22,11 @@ import (
 // DaemonRoleID is the exact service label shared by launch and peer trust.
 const DaemonRoleID = "com.yasyf.cc-squash.daemon"
 
-// StopControlRoleID is the exact receipt role authorized to settle the daemon.
-const StopControlRoleID = "com.yasyf.cc-squash.stop-control"
+// StopControlRoleID is the exact signed role authorized to settle the daemon.
+const StopControlRoleID trust.PeerRole = "com.yasyf.cc-squash.stop-control"
+
+// LifecycleRoleID is the exact signed role authorized for runtime settlement and readiness.
+const LifecycleRoleID trust.PeerRole = "com.yasyf.cc-squash.lifecycle"
 
 // ErrDaemonUnavailable means the control socket could not be reached.
 var ErrDaemonUnavailable = errors.New("cc-squash daemon not running")
@@ -48,24 +49,6 @@ func NewClient() *Client {
 
 func newClient(socket, wireBuild, runtimeBuild string) *Client {
 	return &Client{socket: socket, wireBuild: wireBuild, runtimeBuild: runtimeBuild}
-}
-
-// DaemonRole resolves the stable ccs executable alias shared by launch and
-// protected-session classification.
-func DaemonRole() (daemonrole.Classifier, error) {
-	rolePath, err := exec.LookPath("ccs")
-	if err != nil {
-		return daemonrole.Classifier{}, fmt.Errorf("resolve ccs role alias: %w", err)
-	}
-	rolePath, err = filepath.Abs(rolePath)
-	if err != nil {
-		return daemonrole.Classifier{}, fmt.Errorf("resolve absolute ccs role alias: %w", err)
-	}
-	role := daemonrole.Classifier{RoleID: DaemonRoleID, RolePath: filepath.Clean(rolePath)}
-	if err := role.Validate(); err != nil {
-		return daemonrole.Classifier{}, err
-	}
-	return role, nil
 }
 
 // Close settles the persistent business session.
@@ -234,7 +217,7 @@ func (c *Client) businessSession(ctx context.Context) (*wire.Client, error) {
 		return c.business, nil
 	}
 	session, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(c.socket), WireBuild: c.wireBuild,
+		Dial: wire.UnixDialer(c.socket), WireBuild: c.wireBuild, Role: trust.UnprotectedRole,
 	})
 	if err != nil {
 		if unavailable(err) {

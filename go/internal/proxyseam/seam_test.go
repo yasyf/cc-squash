@@ -75,22 +75,22 @@ func defaultRegister() Register {
 	}
 }
 
-func currentProcessRecord(t *testing.T) proc.Record {
+func currentProcessRecord(t *testing.T) proc.Identity {
 	t.Helper()
 	identity, err := proc.Probe(os.Getpid())
 	if err != nil {
 		t.Fatalf("probe current process: %v", err)
 	}
-	return proc.Record{
-		RecoveryClass: proc.RecoveryTask, PID: identity.PID, StartTime: identity.StartTime,
-		Comm: identity.Comm, Boot: identity.Boot, Generation: "test-generation",
+	identity.Executable, err = os.Executable()
+	if err != nil {
+		t.Fatalf("current executable: %v", err)
 	}
+	return identity
 }
 
-func foreignProcessRecord() proc.Record {
-	return proc.Record{
-		RecoveryClass: proc.RecoveryTask, PID: os.Getpid() + 100000,
-		StartTime: "foreign-start", Boot: "foreign-boot", Generation: "foreign-generation",
+func foreignProcessRecord() proc.Identity {
+	return proc.Identity{
+		PID: os.Getpid() + 100000, StartTime: "foreign-start", Boot: "foreign-boot", Executable: "/foreign/proxy",
 	}
 }
 

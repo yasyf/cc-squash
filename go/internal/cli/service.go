@@ -10,7 +10,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-squash/go/internal/control"
 	"github.com/yasyf/cc-squash/go/internal/paths"
-	"github.com/yasyf/cc-squash/go/internal/version"
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/wire"
 )
@@ -18,12 +17,11 @@ import (
 const (
 	serviceWorkerLimit  = 1
 	serviceCloseTimeout = 30 * time.Second
-	stopRuntimeCommand  = "__stop-runtime"
 )
 
 type serviceController interface {
 	Converge(context.Context, []service.Agent) error
-	StopRuntime(context.Context, service.StopControlSpec) (wire.StopResult, error)
+	StopRuntime(context.Context, service.StopRuntimeRequest) (service.StopReceipt, error)
 	Close(context.Context) error
 }
 
@@ -138,34 +136,22 @@ func convergeDaemonService(ctx context.Context, client daemonRuntimeClient, curr
 	})
 }
 
-func daemonStopSpec(health control.RuntimeHealth) (service.StopControlSpec, error) {
-	executable, err := service.CanonicalExecutable()
-	if err != nil {
-		return service.StopControlSpec{}, err
+func daemonStopSpec(health control.RuntimeHealth) (service.StopRuntimeRequest, error) {
+	if health.ProcessGeneration == "" || health.RuntimeBuild == "" {
+		return service.StopRuntimeRequest{}, errors.New("daemon runtime identity is incomplete")
 	}
-	intent := wire.StopIntentRestart
-	if health.RuntimeBuild != version.String() {
-		intent = wire.StopIntentUpgrade
-	}
-	return service.StopControlSpec{
-		Executable: executable, Args: []string{stopRuntimeCommand},
-		Role: control.StopControlRoleID, RuntimeBuild: version.String(),
-		RuntimeProtocol: int(wire.ProtocolVersion), TargetProcessGeneration: health.ProcessGeneration,
-		Intent: intent,
-	}, nil
-}
-
-func newStopRuntimeCmd() *cobra.Command {
-	return &cobra.Command{
-		Use: stopRuntimeCommand, Hidden: true, Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			_, err := service.RunStopControlChild(cmd.Context(), service.StopControlClientConfig{
+	return service.StopRuntimeRequest{
+		OperationID:          "cc-squash.stop-runtime.v1:" + health.ProcessGeneration,
+		ExpectedRuntimeBuild: health.RuntimeBuild,
+		ControlRole:          control.StopControlRoleID,
+		RuntimeClientConfig: wire.RuntimeClientConfig{
+			Client: wire.ClientConfig{
 				Dial: wire.UnixDialer(paths.SocketPath()), WireBuild: control.WireBuild,
-				RuntimeProtocol: int(wire.ProtocolVersion),
-			})
-			return err
+				Role: control.StopControlRoleID,
+			},
+			NoProgressTimeout: serviceCloseTimeout,
 		},
-	}
+	}, nil
 }
 
 func removeDaemonService(ctx context.Context, timeout time.Duration) error {

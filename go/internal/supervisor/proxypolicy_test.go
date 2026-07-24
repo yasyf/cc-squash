@@ -43,10 +43,11 @@ func liveSeam(t *testing.T) (policy *ProxyPolicy, connectChild func(version stri
 	if err != nil {
 		t.Fatalf("probe test process: %v", err)
 	}
-	if err := seam.ExpectProcess(proc.Record{
-		RecoveryClass: proc.RecoveryTask, PID: identity.PID, StartTime: identity.StartTime,
-		Comm: identity.Comm, Boot: identity.Boot, Generation: "test-generation",
-	}); err != nil {
+	identity.Executable, err = os.Executable()
+	if err != nil {
+		t.Fatalf("test executable: %v", err)
+	}
+	if err := seam.ExpectProcess(identity); err != nil {
 		t.Fatalf("expect test process: %v", err)
 	}
 	t.Cleanup(func() { _ = seam.Close() })
@@ -154,7 +155,7 @@ func TestProxyPolicyReconcileChildDiedClearsIdentity(t *testing.T) {
 	if v := policy.Probe(); v.Reachable {
 		t.Fatalf("probe reachable after ChildDied: %+v", v)
 	}
-	if _, err := policy.Kill(); err != proc.ErrChildUnavailable {
+	if _, err := policy.Kill(); err != ErrChildUnavailable {
 		t.Fatalf("Kill after ChildDied = %v, want ErrChildUnavailable", err)
 	}
 }
@@ -163,7 +164,7 @@ func TestProxyPolicyKillNoPid(t *testing.T) {
 	policy, _, _ := liveSeam(t)
 	// No child ever registered: Kill refuses with ErrChildUnavailable so the supervisor
 	// reads it as "nothing to kill, socket free".
-	if _, err := policy.Kill(); err != proc.ErrChildUnavailable {
+	if _, err := policy.Kill(); err != ErrChildUnavailable {
 		t.Fatalf("Kill with no captured pid = %v, want ErrChildUnavailable", err)
 	}
 }
