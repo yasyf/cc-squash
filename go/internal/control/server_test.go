@@ -537,7 +537,7 @@ func TestRuntimeHealthRejectedBeforePublication(t *testing.T) {
 	startServerSocket(t, server)
 	select {
 	case <-entered:
-	case <-time.After(time.Second):
+	case <-time.After(runtimeStartupTimeout):
 		t.Fatal("runtime readiness did not start")
 	}
 
@@ -548,7 +548,7 @@ func TestRuntimeHealthRejectedBeforePublication(t *testing.T) {
 	}
 
 	release <- nil
-	if err := client.WaitReady(t.Context(), time.Second); err != nil {
+	if err := client.WaitReady(t.Context(), runtimeStartupTimeout); err != nil {
 		t.Fatalf("WaitReady after publication: %v", err)
 	}
 	ready, err := client.RuntimeHealth(t.Context())

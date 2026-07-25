@@ -127,7 +127,7 @@ func TestWaitReadyObservesExactRelease(t *testing.T) {
 	startServerSocket(t, server)
 	client := NewClient()
 	t.Cleanup(func() { _ = client.Close() })
-	if err := client.WaitReady(t.Context(), time.Second); err != nil {
+	if err := client.WaitReady(t.Context(), runtimeStartupTimeout); err != nil {
 		t.Fatalf("WaitReady: %v", err)
 	}
 }
