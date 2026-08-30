@@ -6,55 +6,41 @@ import (
 	"log"
 	"net"
 	"os"
-	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
-	"github.com/yasyf/daemonkit/proc"
 )
 
-// shortHome isolates the state dir under a short /tmp path: macOS caps a unix
-// socket path at 104 bytes, and the default t.TempDir() overflows it once
-// paths.ProxySocketPath() appends ~/.cc-squash/proxy-v1.sock.
-func shortHome(t *testing.T) {
+// socketPair is the kernel pair a daemonkit ChannelHandoff spawn establishes:
+// the parent end the seam serves, and the end the child inherits at fd 3.
+func socketPair(t *testing.T) (parent, child net.Conn) {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "ccs-home")
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 	if err != nil {
-		t.Fatalf("temp home: %v", err)
+		t.Fatalf("socketpair: %v", err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	t.Setenv("HOME", dir)
+	ends := make([]net.Conn, 2)
+	for i, fd := range fds {
+		file := os.NewFile(uintptr(fd), "seam")
+		conn, err := net.FileConn(file)
+		_ = file.Close()
+		if err != nil {
+			t.Fatalf("file conn: %v", err)
+		}
+		ends[i] = conn
+	}
+	return ends[0], ends[1]
 }
 
-// liveSeam binds a real proxyseam.Server, starts its accept loop wired to the
-// policy's NoteRegistered, and returns the policy plus a function that connects a
-// fake child and registers it. repushed counts how many times the policy fired
-// the re-push callback.
+// liveSeam builds a real proxyseam.Server and returns the policy over it plus a
+// function that spawns a fake child on its own handoff pair and registers it.
+// repushed counts how many times the policy fired the re-push callback.
 func liveSeam(t *testing.T) (policy *ProxyPolicy, connectChild func(version string) net.Conn, repushed *atomic.Int32) {
 	t.Helper()
-	shortHome(t)
-	seam, err := proxyseam.NewServer(t.Context(), log.New(io.Discard, "", 0))
-	if err != nil {
-		t.Fatalf("new seam: %v", err)
-	}
-	identity, err := proc.Probe(os.Getpid())
-	if err != nil {
-		t.Fatalf("probe test process: %v", err)
-	}
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatalf("test executable: %v", err)
-	}
-	identity.Executable, err = filepath.EvalSymlinks(executable)
-	if err != nil {
-		t.Fatalf("canonical test executable: %v", err)
-	}
-	if err := seam.ExpectProcess(identity); err != nil {
-		t.Fatalf("expect test process: %v", err)
-	}
+	seam := proxyseam.NewServer(log.New(io.Discard, "", 0))
 	t.Cleanup(func() { _ = seam.Close() })
 
 	var pushes atomic.Int32
@@ -62,22 +48,22 @@ func liveSeam(t *testing.T) (policy *ProxyPolicy, connectChild func(version stri
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go seam.Start(ctx, policy.NoteRegistered)
 
 	connectChild = func(version string) net.Conn {
-		conn, derr := net.DialTimeout("unix", paths.ProxySocketPath(), time.Second)
-		if derr != nil {
-			t.Fatalf("child dial: %v", derr)
-		}
-		t.Cleanup(func() { _ = conn.Close() })
-		frame, _ := proxyseam.Encode(proxyseam.Register{
+		parent, child := socketPair(t)
+		t.Cleanup(func() { _ = child.Close() })
+		go seam.Serve(ctx, parent, policy.NoteRegistered)
+		frame, err := proxyseam.Encode(proxyseam.Register{
 			Type: proxyseam.MsgRegister, Protocol: proxyseam.ProtocolVersion,
 			Port: 50515, MCPPort: 50516, Version: version, PID: os.Getpid(),
 		})
-		if _, werr := conn.Write(frame); werr != nil {
-			t.Fatalf("child register: %v", werr)
+		if err != nil {
+			t.Fatalf("encode register: %v", err)
 		}
-		return conn
+		if _, err := child.Write(frame); err != nil {
+			t.Fatalf("child register: %v", err)
+		}
+		return child
 	}
 	return policy, connectChild, &pushes
 }
@@ -98,7 +84,6 @@ func waitRegistered(t *testing.T, policy *ProxyPolicy) {
 func TestProxyPolicyProbeAndPeerAlive(t *testing.T) {
 	policy, connectChild, _ := liveSeam(t)
 
-	// Before any child connects: unreachable, no peer.
 	if v := policy.Probe(); v.Reachable {
 		t.Fatalf("probe reachable before register: %+v", v)
 	}
@@ -114,10 +99,9 @@ func TestProxyPolicyProbeAndPeerAlive(t *testing.T) {
 		t.Fatalf("probe after register = %+v", v)
 	}
 	if !policy.PeerAlive() {
-		t.Fatal("PeerAlive false with a live child connection")
+		t.Fatal("PeerAlive false with a live child channel")
 	}
 
-	// Drop the child: the seam connection clears, so Probe goes unreachable.
 	_ = conn.Close()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && policy.Probe().Reachable {
@@ -156,7 +140,6 @@ func TestProxyPolicyReconcileChildDiedClearsIdentity(t *testing.T) {
 	waitRegistered(t, policy)
 
 	policy.Reconcile(context.Background(), ReconcileEvent{Kind: ChildDied})
-	// Identity cleared: Probe reports unreachable and Kill has no pid to target.
 	if v := policy.Probe(); v.Reachable {
 		t.Fatalf("probe reachable after ChildDied: %+v", v)
 	}
@@ -165,12 +148,10 @@ func TestProxyPolicyReconcileChildDiedClearsIdentity(t *testing.T) {
 	}
 }
 
-func TestProxyPolicyKillNoPid(t *testing.T) {
+func TestProxyPolicyKillNoChild(t *testing.T) {
 	policy, _, _ := liveSeam(t)
-	// No child ever registered: Kill refuses with ErrChildUnavailable so the supervisor
-	// reads it as "nothing to kill, socket free".
 	if _, err := policy.Kill(); err != ErrChildUnavailable {
-		t.Fatalf("Kill with no captured pid = %v, want ErrChildUnavailable", err)
+		t.Fatalf("Kill with no spawned child = %v, want ErrChildUnavailable", err)
 	}
 }
 
@@ -191,12 +172,10 @@ func TestProxyPolicyWaitGone(t *testing.T) {
 	conn := connectChild("v9.9.9")
 	waitRegistered(t, policy)
 
-	// Still connected: WaitGone times out (the child has not left).
 	if policy.WaitGone(context.Background(), 100*time.Millisecond) {
 		t.Fatal("WaitGone reported gone while the child was live")
 	}
 
-	// Drop it: WaitGone observes the cleared seam within the window.
 	_ = conn.Close()
 	if !policy.WaitGone(context.Background(), 2*time.Second) {
 		t.Fatal("WaitGone did not observe the dropped child")
@@ -211,7 +190,6 @@ func TestProxyPolicyShutdownSendsOverSeam(t *testing.T) {
 	if err := policy.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
-	// The child receives a shutdown frame over the seam.
 	buf := make([]byte, 256)
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, err := conn.Read(buf)
@@ -229,41 +207,34 @@ func TestProxyPolicyShutdownSendsOverSeam(t *testing.T) {
 
 // readShutdown reports whether a Shutdown frame reached the child within d. A
 // real Tick that decides to Replace calls Policy.Shutdown, which sends exactly
-// this frame; a steady-state Tick sends nothing, so the read times out. This is
-// the observable that tells a converged supervisor from one that re-replaces.
+// this frame; a steady-state Tick sends nothing, so the read times out.
 func readShutdown(t *testing.T, child net.Conn, d time.Duration) bool {
 	t.Helper()
 	buf := make([]byte, 256)
 	_ = child.SetReadDeadline(time.Now().Add(d))
-	switch n, err := child.Read(buf); {
-	case err != nil:
-		return false // timed out: no frame sent
-	default:
-		msg, derr := proxyseam.Decode(buf[:n-1])
-		if derr != nil {
-			t.Fatalf("decode frame the child received: %v", derr)
-		}
-		if _, ok := msg.(proxyseam.Shutdown); !ok {
-			t.Fatalf("child received %T, want Shutdown", msg)
-		}
-		return true
+	n, err := child.Read(buf)
+	if err != nil {
+		return false
 	}
+	msg, derr := proxyseam.Decode(buf[:n-1])
+	if derr != nil {
+		t.Fatalf("decode frame the child received: %v", derr)
+	}
+	if _, ok := msg.(proxyseam.Shutdown); !ok {
+		t.Fatalf("child received %T, want Shutdown", msg)
+	}
+	return true
 }
 
 // TestSupervisorTickConvergesOnMatchedVersion drives a real Supervisor.Tick
-// against a real registering proxy — the path the unit suite previously skipped
-// (it only drove Tick against stub Probes that never matched a registered
-// version against MyVersion). It pins the exact defect that flapped the proxy:
-// a Tick whose MyVersion matches the proxy's registered version must NOT replace
-// it, while a skewed MyVersion must. The match case uses ProxyVersion() and the
-// proxy's real dev report, so it regression-guards the version-skew loop end to
-// end.
+// against a real registering proxy: a Tick whose MyVersion matches the proxy's
+// registered version must NOT replace it, while a skewed MyVersion must.
 func TestSupervisorTickConvergesOnMatchedVersion(t *testing.T) {
 	cases := []struct {
 		id              string
-		registered      string // version the proxy registers with
-		myVersion       string // version the supervisor runs at
-		wantReplaceTick bool   // a Tick should send a Shutdown (replace) iff true
+		registered      string
+		myVersion       string
+		wantReplaceTick bool
 	}{
 		{
 			id:              "matched dev version is steady state",
@@ -284,14 +255,7 @@ func TestSupervisorTickConvergesOnMatchedVersion(t *testing.T) {
 			child := connectChild(c.registered)
 			waitRegistered(t, policy)
 
-			// A no-op spawn keeps a replace from exec'ing a real binary.
-			// The supervisor still drives the full Tick -> isSkew -> (Replace ->
-			// Shutdown) decision over the real seam.
 			spawn := &fakeSpawner{}
-			// goneWait/spawn-timeout cap the replace legs to the test's timescale: on
-			// the replace path the child drops its seam right after the Shutdown (the
-			// proxy stepping down), so WaitGone returns promptly rather than running to
-			// a production-length deadline.
 			sup := BuildSupervisor(spawn, policy, c.myVersion)
 			sup.GoneWait = time.Second
 
@@ -300,7 +264,7 @@ func TestSupervisorTickConvergesOnMatchedVersion(t *testing.T) {
 
 			got := readShutdown(t, child, 500*time.Millisecond)
 			if got {
-				_ = child.Close() // the proxy steps down: release the seam so WaitGone returns
+				_ = child.Close()
 			}
 			select {
 			case <-done:

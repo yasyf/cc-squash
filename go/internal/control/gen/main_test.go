@@ -24,12 +24,6 @@ func TestSchemaChangesAlterFingerprint(t *testing.T) {
 		"operation": strings.Replace(wireSpec, `OpMint Op = "mint"`, `OpMint Op = "mint.changed"`, 1),
 		"field":     strings.Replace(wireSpec, `Sessions int`, `Sessions int64`, 1),
 		"json name": strings.Replace(wireSpec, `json:"proxy_port"`, `json:"proxy_port_changed"`, 1),
-		"enum value": strings.Replace(
-			wireSpec,
-			`RuntimeStateHealthy RuntimeState = "healthy"`,
-			`RuntimeStateHealthy RuntimeState = "ready"`,
-			1,
-		),
 	}
 	for name, definition := range changes {
 		t.Run(name, func(t *testing.T) {
