@@ -7,83 +7,79 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"sync"
-	"syscall"
 	"time"
 
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
-
-	"github.com/yasyf/cc-squash/go/internal/paths"
-	"github.com/yasyf/cc-squash/go/internal/version"
+	"github.com/yasyf/daemonkit"
 )
 
-// DaemonRoleID is the exact service label shared by launch and peer trust.
-const DaemonRoleID = "com.yasyf.cc-squash.daemon"
+// ErrDaemonUnavailable means no daemon is listening on the control socket.
+var ErrDaemonUnavailable = daemonkit.ErrAbsent
 
-// StopControlRoleID is the exact signed role authorized to settle the daemon.
-const StopControlRoleID trust.PeerRole = "com.yasyf.cc-squash.stop-control"
+// closeTimeout bounds releasing a business session on Close.
+const closeTimeout = 2 * time.Second
 
-// LifecycleRoleID is the exact signed role authorized for runtime settlement and readiness.
-const LifecycleRoleID trust.PeerRole = "com.yasyf.cc-squash.lifecycle"
-
-// ErrDaemonUnavailable means the control socket could not be reached.
-var ErrDaemonUnavailable = errors.New("cc-squash daemon not running")
-
-// Client maintains one exact persistent business session. Failed business
-// calls are never replayed.
+// Client reaches one cc-squash daemon: the business lane for product ops, the
+// trust-gated control lane for health, and daemonkit's own convergence verbs.
 type Client struct {
-	socket       string
-	wireBuild    string
-	runtimeBuild string
-
-	mu       sync.Mutex
-	business *wire.Client
+	daemon   daemonkit.Daemon
+	client   *daemonkit.Client
+	business *daemonkit.Business
 }
 
-// NewClient returns a lazy persistent client for the current exact builds.
-func NewClient() *Client {
-	return newClient(paths.SocketPath(), WireBuild, version.String())
+// NewClient opens a lazy client for the daemon this build converges on. It
+// performs no I/O beyond resolving the executable Ensure places.
+func NewClient() (*Client, error) {
+	spec, err := Spec()
+	if err != nil {
+		return nil, err
+	}
+	client, err := daemonkit.Open(spec)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{daemon: spec, client: client, business: client.Business()}, nil
 }
 
-func newClient(socket, wireBuild, runtimeBuild string) *Client {
-	return &Client{socket: socket, wireBuild: wireBuild, runtimeBuild: runtimeBuild}
-}
-
-// Close settles the persistent business session.
+// Close releases the business session.
 func (c *Client) Close() error {
-	c.mu.Lock()
-	business := c.business
-	c.business = nil
-	c.mu.Unlock()
-	if business != nil {
-		return business.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+	defer cancel()
+	return c.business.Close(ctx)
+}
+
+// Health reports the pinned incumbent over the trust-gated control lane.
+func (c *Client) Health(ctx context.Context) (daemonkit.Health, error) {
+	control, err := c.client.Control(ctx)
+	if err != nil {
+		return daemonkit.Health{}, err
+	}
+	defer func() { _ = control.Close(ctx) }()
+	return control.Health(ctx)
+}
+
+// Ensure makes the daemon be the exact build of this executable, ready and
+// serving, cold-starting one when none runs.
+func (c *Client) Ensure(ctx context.Context) error {
+	if _, err := c.client.Ensure(ctx); err != nil {
+		return fmt.Errorf("ensure daemon: %w", err)
 	}
 	return nil
 }
 
-// Current reports whether the exact current healthy non-draining runtime is
-// serving the product business protocol.
-func (c *Client) Current(ctx context.Context) bool {
-	health, err := c.RuntimeHealth(ctx)
-	return err == nil && c.current(health)
-}
-
-// RuntimeHealth returns the daemon's exact product-visible runtime state over
-// the ordinary business session.
-func (c *Client) RuntimeHealth(ctx context.Context) (RuntimeHealth, error) {
-	response, err := c.call(ctx, OpRuntimeHealth, EmptyRequest{}, 2*time.Second)
+// Stop leaves nothing serving at this daemon's label and no LaunchAgent behind
+// it. It stops through a Daemon stating no Program, daemonkit's own contract:
+// Stop renders no LaunchAgent and places nothing.
+func (c *Client) Stop(ctx context.Context) error {
+	stopping := c.daemon
+	stopping.Program = daemonkit.Program{}
+	client, err := daemonkit.Open(stopping)
 	if err != nil {
-		return RuntimeHealth{}, err
+		return err
 	}
-	if !response.OK || response.RuntimeHealth == nil {
-		return RuntimeHealth{}, errors.New("runtime.health returned no health snapshot")
+	if err := client.Stop(ctx); err != nil {
+		return fmt.Errorf("stop daemon: %w", err)
 	}
-	if err := validateRuntimeHealth(*response.RuntimeHealth); err != nil {
-		return RuntimeHealth{}, err
-	}
-	return *response.RuntimeHealth, nil
+	return nil
 }
 
 // Status fetches the daemon's full status snapshot.
@@ -111,72 +107,6 @@ func (c *Client) Gc(ctx context.Context) (Response, error) {
 	return c.call(ctx, OpGc, EmptyRequest{}, 3*time.Second)
 }
 
-// WaitGone waits until no product business endpoint owns the socket.
-func (c *Client) WaitGone(ctx context.Context, timeout time.Duration) error {
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		_, err := c.RuntimeHealth(waitCtx)
-		if errors.Is(err, ErrDaemonUnavailable) {
-			return nil
-		}
-		select {
-		case <-waitCtx.Done():
-			return fmt.Errorf("wait for daemon socket release (last error: %v): %w", err, waitCtx.Err())
-		case <-ticker.C:
-		}
-	}
-}
-
-// WaitReady waits for the exact current healthy non-draining product runtime.
-func (c *Client) WaitReady(ctx context.Context, timeout time.Duration) error {
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	var last RuntimeHealth
-	var lastErr error
-	for {
-		last, lastErr = c.RuntimeHealth(waitCtx)
-		if lastErr == nil && c.current(last) {
-			return nil
-		}
-		select {
-		case <-waitCtx.Done():
-			return fmt.Errorf("wait for current daemon runtime (last=%+v err=%v): %w", last, lastErr, waitCtx.Err())
-		case <-ticker.C:
-		}
-	}
-}
-
-func (c *Client) current(health RuntimeHealth) bool {
-	return health.RuntimeBuild == c.runtimeBuild && health.RuntimeProtocol == int(wire.ProtocolVersion) &&
-		health.Ready && health.State == RuntimeStateHealthy && !health.Draining
-}
-
-func validateRuntimeHealth(health RuntimeHealth) error {
-	if health.RuntimeBuild == "" {
-		return errors.New("runtime.health build is empty")
-	}
-	if health.RuntimeProtocol <= 0 {
-		return errors.New("runtime.health protocol is invalid")
-	}
-	if health.PID <= 1 {
-		return errors.New("runtime.health PID is invalid")
-	}
-	if health.ProcessGeneration == "" {
-		return errors.New("runtime.health generation is empty")
-	}
-	switch health.State {
-	case RuntimeStateHealthy, RuntimeStateDegraded, RuntimeStateFailed:
-		return nil
-	default:
-		return fmt.Errorf("runtime.health state %q is invalid", health.State)
-	}
-}
-
 func (c *Client) call(ctx context.Context, op Op, request any, timeout time.Duration) (Response, error) {
 	payload, err := json.Marshal(request)
 	if err != nil {
@@ -184,58 +114,28 @@ func (c *Client) call(ctx context.Context, op Op, request any, timeout time.Dura
 	}
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	session, err := c.businessSession(callCtx)
+	reply, err := c.business.Call(callCtx, string(op), payload)
 	if err != nil {
 		return Response{}, err
-	}
-	result, err := session.Call(callCtx, wire.Op(op), "", payload)
-	if err != nil {
-		c.retireBusiness(session, err)
-		return Response{}, err
-	}
-	if result.Outcome != wire.Delivered {
-		reason := result.Response.Reason
-		if reason == "" {
-			reason = result.Outcome.String()
-		}
-		return Response{}, fmt.Errorf("%s request rejected before dispatch: %s", op, reason)
-	}
-	if result.Response.Err != "" {
-		return Response{}, errors.New(result.Response.Err)
 	}
 	var response Response
-	if err := decodeStrict(result.Response.Payload, &response); err != nil {
+	if err := decodeStrict(reply.Body, &response); err != nil {
 		return Response{}, fmt.Errorf("decode %s response: %w", op, err)
 	}
 	return response, nil
 }
 
-func (c *Client) businessSession(ctx context.Context) (*wire.Client, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.business != nil {
-		return c.business, nil
+// ReportedBuild is the release the daemon published in its health detail, and
+// whether it reported one at all.
+func ReportedBuild(health daemonkit.Health) (string, bool) {
+	if len(health.Detail) == 0 {
+		return "", false
 	}
-	session, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(c.socket), WireBuild: c.wireBuild, Role: trust.UnprotectedRole,
-	})
-	if err != nil {
-		if unavailable(err) {
-			return nil, ErrDaemonUnavailable
-		}
-		return nil, err
+	var reported HealthDetail
+	if err := decodeStrict(health.Detail, &reported); err != nil {
+		return "", false
 	}
-	c.business = session
-	return session, nil
-}
-
-func (c *Client) retireBusiness(session *wire.Client, cause error) {
-	c.mu.Lock()
-	if c.business == session {
-		c.business = nil
-	}
-	c.mu.Unlock()
-	_ = session.Abort(cause)
+	return reported.RuntimeBuild, reported.RuntimeBuild != ""
 }
 
 func decodeStrict(payload []byte, target any) error {
@@ -248,8 +148,4 @@ func decodeStrict(payload []byte, target any) error {
 		return errors.New("trailing JSON payload")
 	}
 	return nil
-}
-
-func unavailable(err error) bool {
-	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED)
 }

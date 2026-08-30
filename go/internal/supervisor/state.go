@@ -4,9 +4,29 @@ import (
 	"context"
 	"errors"
 	"time"
-
-	"github.com/yasyf/daemonkit/proc"
 )
+
+// Backoff is the exponential retry schedule a failing spawn is retried on:
+// Base doubled per consecutive failure, clamped at Cap.
+type Backoff struct {
+	Base time.Duration
+	Cap  time.Duration
+}
+
+// After is how long to wait before retry number failures (1-based).
+func (b Backoff) After(failures int) time.Duration {
+	if failures < 1 {
+		return 0
+	}
+	wait := b.Base
+	for range failures - 1 {
+		wait *= 2
+		if wait >= b.Cap {
+			return b.Cap
+		}
+	}
+	return wait
+}
 
 var (
 	// ErrSkipSpawn means product policy intentionally declined one spawn attempt.
@@ -66,7 +86,7 @@ type Supervisor struct {
 	Policy        Policy
 	GoneWait      time.Duration
 	HazardWindow  time.Duration
-	SpawnBackoff  proc.Backoff
+	SpawnBackoff  Backoff
 	ReviveBreaker int
 
 	failures     int

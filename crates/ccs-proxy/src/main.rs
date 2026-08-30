@@ -1,6 +1,7 @@
 //! ccs-proxy binary entrypoint: parse spawn args, bind, serve until signalled.
 //! The library crate (`ccs_proxy`) holds the relay itself.
 
+use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,12 +17,6 @@ use tokio::sync::Notify;
 #[derive(Parser, Debug)]
 #[command(name = "ccs-proxy", version = BUILD_VERSION)]
 struct Args {
-    /// Path to the Go control-plane epoch-1 seam socket. When present the
-    /// proxy connects, registers, and applies control frames; when absent it
-    /// serves standalone (no-seam dev mode).
-    #[arg(long)]
-    socket: Option<String>,
-
     /// TCP port to listen on (127.0.0.1). 0 lets the OS assign a free port.
     #[arg(long, default_value_t = 0)]
     port: u16,
@@ -41,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     warn_if_unset("ENABLE_TOOL_SEARCH");
@@ -69,25 +65,21 @@ async fn main() -> anyhow::Result<()> {
     // notify, so the control plane can step the proxy down over the socket.
     let shutdown = Arc::new(Notify::new());
 
-    // Connect the control-plane seam if a socket was given; fail open to
-    // standalone if it is absent or the connect fails.
-    if let Some(socket) = args.socket.as_deref() {
-        match UnixStream::connect(socket).await {
-            Ok(stream) => {
-                tokio::spawn(run_seam(
-                    stream,
-                    state.clone(),
-                    shutdown.clone(),
-                    addr.port(),
-                    mcp_addr.port(),
-                ));
-            }
-            Err(e) => {
-                tracing::warn!(socket, error = %e, "seam connect failed; serving standalone");
-            }
+    // Claim the control-plane seam on the inherited fd 3; fail open to standalone
+    // when the spawn established no channel (dev mode).
+    match seam_channel() {
+        Ok(stream) => {
+            tokio::spawn(run_seam(
+                stream,
+                state.clone(),
+                shutdown.clone(),
+                addr.port(),
+                mcp_addr.port(),
+            ));
         }
-    } else {
-        tracing::info!("no --socket; serving standalone (no-seam dev mode)");
+        Err(e) => {
+            tracing::warn!(error = %e, "no seam channel on fd 3; serving standalone");
+        }
     }
 
     // The MCP server runs as its own task on its own listener, isolated from the
@@ -129,6 +121,17 @@ async fn shutdown_signal(seam: Arc<Notify>) {
         _ = terminate => {},
         _ = seam.notified() => {},
     }
+}
+
+/// The parent end of the seam is handed over as fd 3 by the Go control plane's
+/// daemonkit `ChannelHandoff` spawn, already connected: there is no path to dial
+/// and none to squat.
+fn seam_channel() -> anyhow::Result<UnixStream> {
+    // SAFETY: fd 3 is the handoff descriptor daemonkit dup2'd before exec, taken
+    // exactly once here and owned by the returned stream from now on.
+    let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(3) };
+    std_stream.set_nonblocking(true)?;
+    Ok(UnixStream::from_std(std_stream)?)
 }
 
 fn warn_if_unset(var: &str) {

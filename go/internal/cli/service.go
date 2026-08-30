@@ -2,169 +2,49 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-squash/go/internal/control"
-	"github.com/yasyf/cc-squash/go/internal/paths"
-	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 )
 
-const (
-	serviceWorkerLimit  = 1
-	serviceCloseTimeout = 30 * time.Second
-)
-
-type serviceController interface {
-	Converge(context.Context, []service.Agent) error
-	StopRuntime(context.Context, service.StopRuntimeRequest) (service.StopReceipt, error)
-	Close(context.Context) error
+// daemonLauncher is the daemonkit convergence surface the service commands
+// drive; tests substitute it for one that records the calls.
+type daemonLauncher interface {
+	Ensure(context.Context) error
+	Stop(context.Context) error
+	Health(context.Context) (daemonkit.Health, error)
+	Close() error
 }
 
-type daemonRuntimeClient interface {
-	Current(context.Context) bool
-	RuntimeHealth(context.Context) (control.RuntimeHealth, error)
-	WaitReady(context.Context, time.Duration) error
-	WaitGone(context.Context, time.Duration) error
-}
+var openDaemonLauncher = func() (daemonLauncher, error) { return control.NewClient() }
 
-var openServiceController = func(ctx context.Context) (serviceController, error) {
-	return service.NewController(ctx, service.ControllerConfig{
-		StatePath:   paths.ServiceStatePath(),
-		ProcessPath: paths.ServiceProcessStorePath(),
-		WorkerLimit: serviceWorkerLimit,
-	})
-}
-
-// ccsAgent is cc-squash's daemon LaunchAgent / brew-services descriptor: the
-// generic launchctl + Homebrew lifecycle (daemonkit/service) configured with
-// cc-squash's label, formula, daemon args, log path, HOME, and PATH.
-func ccsAgent() (service.Agent, error) {
-	program, err := service.CanonicalExecutable()
-	if err != nil {
-		return service.Agent{}, err
-	}
-	return service.Agent{
-		Label:         control.DaemonRoleID,
-		Program:       program,
-		Args:          []string{"daemon"},
-		LogPath:       paths.LogPath(),
-		Env:           map[string]string{"HOME": os.Getenv("HOME"), "PATH": os.Getenv("PATH")},
-		RestartPolicy: service.RestartAlways,
-	}, nil
-}
-
-func withServiceController(
-	ctx context.Context,
-	run func(serviceController) error,
-) (err error) {
-	controller, err := openServiceController(ctx)
+func withDaemonLauncher(ctx context.Context, timeout time.Duration, run func(context.Context, daemonLauncher) error) error {
+	launcher, err := openDaemonLauncher()
 	if err != nil {
 		return err
 	}
-	defer func() {
-		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serviceCloseTimeout)
-		defer cancel()
-		err = errors.Join(err, controller.Close(closeCtx))
-	}()
-	return run(controller)
+	defer launcher.Close()
+	boundedCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return run(boundedCtx, launcher)
 }
 
-func convergeService(ctx context.Context, agents []service.Agent) error {
-	return withServiceController(ctx, func(controller serviceController) error {
-		return controller.Converge(ctx, agents)
-	})
-}
-
+// ensureDaemonCurrent makes the exact build of this executable serve, ready,
+// cold-starting one when none runs and evicting a different incumbent.
 func ensureDaemonCurrent(ctx context.Context, timeout time.Duration) error {
-	client := control.NewClient()
-	defer client.Close()
-	return ensureDaemonCurrentWith(ctx, timeout, client)
-}
-
-func ensureDaemonCurrentWith(ctx context.Context, timeout time.Duration, client daemonRuntimeClient) error {
-	current := client.Current(ctx)
-	if current {
-		return nil
-	}
-	if err := convergeDaemonService(ctx, client, current); err != nil {
-		return err
-	}
-	return client.WaitReady(ctx, timeout)
-}
-
-func installDaemonService(ctx context.Context, timeout time.Duration) error {
-	client := control.NewClient()
-	defer client.Close()
-	return installDaemonServiceWith(ctx, timeout, client)
-}
-
-func installDaemonServiceWith(ctx context.Context, timeout time.Duration, client daemonRuntimeClient) error {
-	if err := convergeDaemonService(ctx, client, client.Current(ctx)); err != nil {
-		return err
-	}
-	return client.WaitReady(ctx, timeout)
-}
-
-func convergeDaemonService(ctx context.Context, client daemonRuntimeClient, current bool) error {
-	agent, err := ccsAgent()
-	if err != nil {
-		return err
-	}
-	var observed *control.RuntimeHealth
-	if !current {
-		health, err := client.RuntimeHealth(ctx)
-		if err == nil {
-			observed = &health
-		}
-	}
-	return withServiceController(ctx, func(controller serviceController) error {
-		if observed != nil {
-			spec, err := daemonStopSpec(*observed)
-			if err != nil {
-				return err
-			}
-			if _, err := controller.StopRuntime(ctx, spec); err != nil {
-				return err
-			}
-		}
-		return controller.Converge(ctx, []service.Agent{agent})
+	return withDaemonLauncher(ctx, timeout, func(ctx context.Context, launcher daemonLauncher) error {
+		return launcher.Ensure(ctx)
 	})
 }
 
-func daemonStopSpec(health control.RuntimeHealth) (service.StopRuntimeRequest, error) {
-	if health.ProcessGeneration == "" || health.RuntimeBuild == "" {
-		return service.StopRuntimeRequest{}, errors.New("daemon runtime identity is incomplete")
-	}
-	return service.StopRuntimeRequest{
-		OperationID:          "cc-squash.stop-runtime.v1:" + health.ProcessGeneration,
-		ExpectedRuntimeBuild: health.RuntimeBuild,
-		ControlRole:          control.StopControlRoleID,
-		RuntimeClientConfig: wire.RuntimeClientConfig{
-			Client: wire.ClientConfig{
-				Dial: wire.UnixDialer(paths.SocketPath()), WireBuild: control.WireBuild,
-				Role: control.StopControlRoleID,
-			},
-			NoProgressTimeout: serviceCloseTimeout,
-		},
-	}, nil
-}
-
+// removeDaemonService drains the incumbent and removes its LaunchAgent.
 func removeDaemonService(ctx context.Context, timeout time.Duration) error {
-	client := control.NewClient()
-	defer client.Close()
-	return removeDaemonServiceWith(ctx, timeout, client)
-}
-
-func removeDaemonServiceWith(ctx context.Context, timeout time.Duration, client daemonRuntimeClient) error {
-	if err := convergeService(ctx, nil); err != nil {
-		return err
-	}
-	return client.WaitGone(ctx, timeout)
+	return withDaemonLauncher(ctx, timeout, func(ctx context.Context, launcher daemonLauncher) error {
+		return launcher.Stop(ctx)
+	})
 }
 
 func newServiceCmd() *cobra.Command {
@@ -178,7 +58,7 @@ func newServiceCmd() *cobra.Command {
 			Short: "Install and start the user LaunchAgent",
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
-				if err := installDaemonService(cmd.Context(), proxyEnsureTimeout); err != nil {
+				if err := ensureDaemonCurrent(cmd.Context(), proxyEnsureTimeout); err != nil {
 					return err
 				}
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Installed and started the daemon.")
@@ -203,17 +83,45 @@ func newServiceCmd() *cobra.Command {
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				out := cmd.OutOrStdout()
-				client := control.NewClient()
-				defer client.Close()
-				if health, err := client.RuntimeHealth(cmd.Context()); err == nil {
-					_, _ = fmt.Fprintf(out, "Daemon: running (%s, %s)\n", health.RuntimeBuild, health.State)
-				} else {
-					_, _ = fmt.Fprintln(out, "Daemon: not responding")
+				err := withDaemonLauncher(cmd.Context(), healthTimeout, func(ctx context.Context, launcher daemonLauncher) error {
+					health, err := launcher.Health(ctx)
+					if err != nil {
+						_, _ = fmt.Fprintln(out, "Daemon: not responding")
+						return nil
+					}
+					build, _ := control.ReportedBuild(health)
+					_, _ = fmt.Fprintf(out, "Daemon: running (%s, %s)\n", build, phaseName(health.Phase))
+					return nil
+				})
+				if err != nil {
+					return err
 				}
-				_, _ = fmt.Fprintf(out, "Socket: %s\n", paths.SocketPath())
+				socket, err := control.SocketPath()
+				if err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(out, "Socket: %s\n", socket)
 				return nil
 			},
 		},
 	)
 	return cmd
+}
+
+// healthTimeout bounds one control-lane health read.
+const healthTimeout = 5 * time.Second
+
+func phaseName(phase daemonkit.Phase) string {
+	switch phase {
+	case daemonkit.PhaseStarting:
+		return "starting"
+	case daemonkit.PhaseReady:
+		return "ready"
+	case daemonkit.PhaseDraining:
+		return "draining"
+	case daemonkit.PhaseFailed:
+		return "failed"
+	default:
+		return "unknown"
+	}
 }

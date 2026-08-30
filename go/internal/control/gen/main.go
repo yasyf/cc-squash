@@ -133,7 +133,6 @@ const StatusSchemaVersion = 1
 type Op string
 
 const (
-	OpRuntimeHealth Op = "cc-squash.runtime.health"
 	OpStatus Op = "status"
 	OpMint Op = "mint"
 	OpKill Op = "kill"
@@ -147,23 +146,8 @@ type ToggleRequest struct {
 	On bool ` + "`json:\"on\"`" + `
 }
 
-type RuntimeState string
-
-const (
-	RuntimeStateHealthy RuntimeState = "healthy"
-	RuntimeStateDegraded RuntimeState = "degraded"
-	RuntimeStateFailed RuntimeState = "failed"
-)
-
-type RuntimeHealth struct {
+type HealthDetail struct {
 	RuntimeBuild string ` + "`json:\"runtime_build\"`" + `
-	RuntimeProtocol int ` + "`json:\"runtime_protocol\"`" + `
-	PID int ` + "`json:\"pid\"`" + `
-	ProcessGeneration string ` + "`json:\"process_generation\"`" + `
-	Ready bool ` + "`json:\"ready\"`" + `
-	State RuntimeState ` + "`json:\"state\"`" + `
-	Draining bool ` + "`json:\"draining\"`" + `
-	Busy bool ` + "`json:\"busy\"`" + `
 }
 
 type StatusSnapshot struct {
@@ -184,7 +168,6 @@ type Response struct {
 	Port int ` + "`json:\"port,omitempty\"`" + `
 	MCPPort int ` + "`json:\"mcp_port,omitempty\"`" + `
 	Token string ` + "`json:\"token,omitempty\"`" + `
-	RuntimeHealth *RuntimeHealth ` + "`json:\"runtime_health,omitempty\"`" + `
 	Status *StatusSnapshot ` + "`json:\"status,omitempty\"`" + `
 	Kill bool ` + "`json:\"kill,omitempty\"`" + `
 	Shadow bool ` + "`json:\"shadow,omitempty\"`" + `

@@ -1,15 +1,15 @@
-//! The Rust client end of the `proxy-v1.sock` seam. The Go control plane binds
-//! it; this proxy is spawned with `--socket=<path>` and
-//! connects as the client. After connecting it sends a single [`Register`] frame
-//! announcing its bound TCP port, version, and pid; thereafter the control plane
-//! streams [`Control`] frames (mint/evict/shadow/kill/shutdown) one line-delimited
-//! JSON object at a time.
+//! The Rust child end of the proxy seam. The Go control plane spawns this proxy
+//! over a daemonkit `ChannelHandoff` and hands it the connected socketpair end at
+//! fd 3. On that channel the proxy sends a single [`Register`] frame announcing
+//! its bound TCP port, version, and pid; thereafter the control plane streams
+//! [`Control`] frames (mint/evict/shadow/kill/shutdown) one line-delimited JSON
+//! object at a time.
 //!
 //! The read loop is the sole writer to the control surface on [`AppState`]:
 //! `sessions`, `kill`, `shadow`, and `config`. Everything is fail-open — an
-//! absent socket, a connect failure, a dropped stream, or a malformed line is
-//! logged and the relay keeps serving standalone. The seam dropping is never
-//! fatal, so this module carries no panics on its path.
+//! absent channel, a dropped stream, or a malformed line is logged and the relay
+//! keeps serving standalone. The seam dropping is never fatal, so this module
+//! carries no panics on its path.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::HashSet;

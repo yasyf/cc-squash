@@ -48,11 +48,14 @@ diagnostic goes to stderr, so ` + "`ANTHROPIC_BASE_URL=$(ccs url)`" + ` captures
 // whole reply so a caller can read both the relay port/token and the rmcp
 // retrieve server's MCP port off one round-trip.
 func resolveMint(ctx context.Context) (control.Response, error) {
-	c := control.NewClient()
-	defer c.Close()
 	if err := ensureDaemonCurrent(ctx, proxyEnsureTimeout); err != nil {
 		return control.Response{}, err
 	}
+	c, err := control.NewClient()
+	if err != nil {
+		return control.Response{}, err
+	}
+	defer c.Close()
 	resp, err := c.Mint(ctx)
 	if err != nil {
 		return control.Response{}, err

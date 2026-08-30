@@ -6,8 +6,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/yasyf/daemonkit/wire"
 )
 
 func TestExactRequestShapes(t *testing.T) {
@@ -33,10 +31,6 @@ func TestExactRequestShapes(t *testing.T) {
 func TestResponseRoundTrip(t *testing.T) {
 	want := Response{
 		OK: true, Port: 50515, Token: "tok-abc",
-		RuntimeHealth: &RuntimeHealth{
-			RuntimeBuild: "1.2.3", RuntimeProtocol: int(wire.ProtocolVersion), PID: 42,
-			ProcessGeneration: "process-generation", Ready: true, State: RuntimeStateHealthy,
-		},
 		Status: &StatusSnapshot{
 			SchemaVersion: StatusSchemaVersion,
 			Version:       "1.2.3", GeneratedAt: time.Unix(1_700_000_000, 0).UTC(),
@@ -55,11 +49,7 @@ func TestResponseRoundTrip(t *testing.T) {
 	if got.Status == nil || *got.Status != *want.Status {
 		t.Fatalf("status mismatch: got %+v, want %+v", got.Status, want.Status)
 	}
-	if got.RuntimeHealth == nil || *got.RuntimeHealth != *want.RuntimeHealth {
-		t.Fatalf("runtime health mismatch: got %+v, want %+v", got.RuntimeHealth, want.RuntimeHealth)
-	}
 	got.Status, want.Status = nil, nil
-	got.RuntimeHealth, want.RuntimeHealth = nil, nil
 	if got != want {
 		t.Fatalf("response mismatch: got %+v, want %+v", got, want)
 	}
@@ -72,6 +62,20 @@ func TestResponseOmitsEmptyStatus(t *testing.T) {
 	}
 	if want := `{"ok":true}`; string(data) != want {
 		t.Fatalf("got %s, want %s", data, want)
+	}
+}
+
+func TestHealthDetailRoundTrip(t *testing.T) {
+	data, err := json.Marshal(HealthDetail{RuntimeBuild: "1.2.3"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got HealthDetail
+	if err := decodeStrict(data, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.RuntimeBuild != "1.2.3" {
+		t.Fatalf("health detail = %+v", got)
 	}
 }
 

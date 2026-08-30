@@ -3,15 +3,18 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io/fs"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/control"
+	"github.com/yasyf/cc-squash/go/internal/paths"
 )
 
 func TestStatusJSONReadsPublishedSnapshot(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	want := control.StatusSnapshot{
 		SchemaVersion: control.StatusSchemaVersion,
 		Version:       "9.9.9",
@@ -44,7 +47,6 @@ func TestStatusJSONReadsPublishedSnapshot(t *testing.T) {
 }
 
 func TestStatusPlainTableRendersFields(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	if err := control.WriteStatus(control.StatusSnapshot{
 		SchemaVersion: control.StatusSchemaVersion,
 		Version:       "1.2.3", ProxyPort: 50600, ProxyPID: 7, Sessions: 2, Shadow: true,
@@ -68,7 +70,7 @@ func TestStatusPlainTableRendersFields(t *testing.T) {
 }
 
 func TestStatusNotRunningIsNotAnError(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	unpublishStatus(t)
 	cmd := newStatusCmd()
 	var stdout, stderr bytes.Buffer
 	cmd.SetOut(&stdout)
@@ -82,5 +84,15 @@ func TestStatusNotRunningIsNotAnError(t *testing.T) {
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("expected no stdout when the daemon is down, got %q", stdout.String())
+	}
+}
+
+// unpublishStatus removes the published snapshot so the not-running branch is
+// reached. The state directory resolves through the passwd database, so HOME
+// cannot relocate it and every status test shares the one real path.
+func unpublishStatus(t *testing.T) {
+	t.Helper()
+	if err := os.Remove(paths.StatusPath()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("unpublish status: %v", err)
 	}
 }

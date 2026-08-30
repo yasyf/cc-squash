@@ -10,7 +10,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-squash/go/internal/control"
-	"github.com/yasyf/cc-squash/go/internal/paths"
 )
 
 func newStatusCmd() *cobra.Command {
@@ -60,7 +59,11 @@ func renderStatus(cmd *cobra.Command, snap control.StatusSnapshot) error {
 	_, _ = fmt.Fprintf(tw, "SESSIONS\t%d\n", snap.Sessions)
 	_, _ = fmt.Fprintf(tw, "KILL\t%s\n", onOff(snap.Kill))
 	_, _ = fmt.Fprintf(tw, "SHADOW\t%s\n", onOff(snap.Shadow))
-	_, _ = fmt.Fprintf(tw, "SOCKET\t%s\n", paths.SocketPath())
+	socket, err := control.SocketPath()
+	if err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(tw, "SOCKET\t%s\n", socket)
 	_, _ = fmt.Fprintf(tw, "UPDATED\t%s\n", snap.GeneratedAt.Local().Format(time.Kitchen))
 	return tw.Flush()
 }

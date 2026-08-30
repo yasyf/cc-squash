@@ -1,175 +1,154 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/control"
-	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 )
 
-type recordingServiceController struct {
-	desired [][]service.Agent
-	stops   []service.StopRuntimeRequest
-	steps   *[]string
+type recordingLauncher struct {
+	steps    []string
+	health   daemonkit.Health
+	healthOK bool
+	closed   int
+	deadline bool
 }
 
-func (c *recordingServiceController) Converge(_ context.Context, agents []service.Agent) error {
-	if c.steps != nil {
-		*c.steps = append(*c.steps, "converge")
-	}
-	c.desired = append(c.desired, append([]service.Agent(nil), agents...))
+func (l *recordingLauncher) Ensure(ctx context.Context) error {
+	l.note(ctx, "ensure")
 	return nil
 }
 
-func (c *recordingServiceController) StopRuntime(
-	_ context.Context,
-	spec service.StopRuntimeRequest,
-) (service.StopReceipt, error) {
-	if c.steps != nil {
-		*c.steps = append(*c.steps, "stop")
-	}
-	c.stops = append(c.stops, spec)
-	return service.StopReceipt{}, nil
-}
-
-func (*recordingServiceController) Close(context.Context) error { return nil }
-
-type runtimeClientStub struct {
-	current         bool
-	health          control.RuntimeHealth
-	healthAvailable bool
-	waitReady       int
-	waitGone        int
-	steps           *[]string
-}
-
-func (c *runtimeClientStub) Current(context.Context) bool { return c.current }
-
-func (c *runtimeClientStub) RuntimeHealth(context.Context) (control.RuntimeHealth, error) {
-	if !c.healthAvailable {
-		return control.RuntimeHealth{}, control.ErrDaemonUnavailable
-	}
-	return c.health, nil
-}
-
-func (c *runtimeClientStub) WaitReady(context.Context, time.Duration) error {
-	if c.steps != nil {
-		*c.steps = append(*c.steps, "ready")
-	}
-	c.waitReady++
+func (l *recordingLauncher) Stop(ctx context.Context) error {
+	l.note(ctx, "stop")
 	return nil
 }
 
-func (c *runtimeClientStub) WaitGone(context.Context, time.Duration) error {
-	c.waitGone++
+func (l *recordingLauncher) Health(ctx context.Context) (daemonkit.Health, error) {
+	l.note(ctx, "health")
+	if !l.healthOK {
+		return daemonkit.Health{}, control.ErrDaemonUnavailable
+	}
+	return l.health, nil
+}
+
+func (l *recordingLauncher) Close() error {
+	l.closed++
 	return nil
 }
 
-func useRecordingServiceController(t *testing.T) *recordingServiceController {
+func (l *recordingLauncher) note(ctx context.Context, step string) {
+	if _, ok := ctx.Deadline(); ok {
+		l.deadline = true
+	}
+	l.steps = append(l.steps, step)
+}
+
+func useRecordingLauncher(t *testing.T) *recordingLauncher {
 	t.Helper()
-	controller := &recordingServiceController{}
-	previous := openServiceController
-	openServiceController = func(context.Context) (serviceController, error) { return controller, nil }
-	t.Cleanup(func() { openServiceController = previous })
-	return controller
+	launcher := &recordingLauncher{}
+	previous := openDaemonLauncher
+	openDaemonLauncher = func() (daemonLauncher, error) { return launcher, nil }
+	t.Cleanup(func() { openDaemonLauncher = previous })
+	return launcher
 }
 
-func TestEnsureDaemonCurrentUsesBusinessHealthBeforeServiceState(t *testing.T) {
-	client := &runtimeClientStub{current: true}
-	previous := openServiceController
-	openServiceController = func(context.Context) (serviceController, error) {
-		t.Fatal("healthy runtime unexpectedly opened service controller")
-		return nil, nil
-	}
-	t.Cleanup(func() { openServiceController = previous })
-
-	if err := ensureDaemonCurrentWith(t.Context(), time.Second, client); err != nil {
+func TestEnsureDaemonCurrentConvergesUnderADeadline(t *testing.T) {
+	launcher := useRecordingLauncher(t)
+	if err := ensureDaemonCurrent(t.Context(), time.Second); err != nil {
 		t.Fatalf("ensure current: %v", err)
 	}
-	if client.waitReady != 0 {
-		t.Fatalf("wait ready calls = %d, want 0", client.waitReady)
+	if !slices.Equal(launcher.steps, []string{"ensure"}) {
+		t.Fatalf("steps = %v, want [ensure]", launcher.steps)
+	}
+	if !launcher.deadline {
+		t.Fatal("ensure ran on a context carrying no deadline")
+	}
+	if launcher.closed != 1 {
+		t.Fatalf("closed = %d, want 1", launcher.closed)
 	}
 }
 
-func TestEnsureDaemonCurrentConvergesServiceThenWaitsForBusinessHealth(t *testing.T) {
-	t.Setenv("HOME", "/tmp/ccs-service-home")
-	controller := useRecordingServiceController(t)
-	client := &runtimeClientStub{}
-	program, err := service.CanonicalExecutable()
-	if err != nil {
-		t.Fatalf("canonical executable: %v", err)
-	}
-
-	if err := ensureDaemonCurrentWith(t.Context(), time.Second, client); err != nil {
-		t.Fatalf("ensure current: %v", err)
-	}
-	if len(controller.desired) != 1 || len(controller.desired[0]) != 1 ||
-		controller.desired[0][0].Label != control.DaemonRoleID ||
-		controller.desired[0][0].Program != program {
-		t.Fatalf("desired service state = %+v", controller.desired)
-	}
-	if _, err := controller.desired[0][0].Plist(); err != nil {
-		t.Fatalf("render desired service: %v", err)
-	}
-	if got := controller.desired[0][0].Env["HOME"]; got != "/tmp/ccs-service-home" {
-		t.Fatalf("service HOME = %q", got)
-	}
-	if client.waitReady != 1 {
-		t.Fatalf("wait ready calls = %d, want 1", client.waitReady)
-	}
-}
-
-func TestEnsureDaemonCurrentStopsOlderRuntimeBeforeConvergingSuccessor(t *testing.T) {
-	t.Setenv("HOME", "/tmp/ccs-service-home")
-	steps := []string{}
-	controller := useRecordingServiceController(t)
-	controller.steps = &steps
-	client := &runtimeClientStub{
-		healthAvailable: true,
-		health: control.RuntimeHealth{
-			RuntimeBuild: "0.0.1", RuntimeProtocol: int(wire.ProtocolVersion), PID: 42,
-			ProcessGeneration: "older-runtime", Ready: true, State: control.RuntimeStateHealthy,
-		},
-		steps: &steps,
-	}
-
-	if err := ensureDaemonCurrentWith(t.Context(), time.Second, client); err != nil {
-		t.Fatalf("ensure current: %v", err)
-	}
-	if !slices.Equal(steps, []string{"stop", "converge", "ready"}) {
-		t.Fatalf("replacement steps = %v", steps)
-	}
-	if len(controller.stops) != 1 {
-		t.Fatalf("stop specs = %+v", controller.stops)
-	}
-	spec := controller.stops[0]
-	if spec.OperationID != "cc-squash.stop-runtime.v1:older-runtime" ||
-		spec.ControlRole != control.StopControlRoleID || spec.ExpectedRuntimeBuild != "0.0.1" ||
-		spec.RuntimeClientConfig.Client.Role != control.StopControlRoleID ||
-		spec.RuntimeClientConfig.Client.WireBuild != control.WireBuild ||
-		spec.RuntimeClientConfig.Client.Dial == nil || spec.RuntimeClientConfig.NoProgressTimeout != serviceCloseTimeout {
-		t.Fatalf("stop spec = %+v", spec)
-	}
-}
-
-func TestInstallAndRemoveUseExactServiceStateBarriers(t *testing.T) {
-	controller := useRecordingServiceController(t)
-	client := &runtimeClientStub{}
-
-	if err := installDaemonServiceWith(t.Context(), time.Second, client); err != nil {
-		t.Fatalf("install: %v", err)
-	}
-	if err := removeDaemonServiceWith(t.Context(), time.Second, client); err != nil {
+func TestRemoveDaemonServiceStopsUnderADeadline(t *testing.T) {
+	launcher := useRecordingLauncher(t)
+	if err := removeDaemonService(t.Context(), time.Second); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
-	if len(controller.desired) != 2 || len(controller.desired[0]) != 1 || controller.desired[1] != nil {
-		t.Fatalf("desired transitions = %+v", controller.desired)
+	if !slices.Equal(launcher.steps, []string{"stop"}) {
+		t.Fatalf("steps = %v, want [stop]", launcher.steps)
 	}
-	if client.waitReady != 1 || client.waitGone != 1 {
-		t.Fatalf("barriers: ready=%d gone=%d", client.waitReady, client.waitGone)
+	if !launcher.deadline {
+		t.Fatal("stop ran on a context carrying no deadline")
 	}
+	if launcher.closed != 1 {
+		t.Fatalf("closed = %d, want 1", launcher.closed)
+	}
+}
+
+func TestOpenFailureSurfacesRatherThanConverging(t *testing.T) {
+	want := errors.New("no program")
+	previous := openDaemonLauncher
+	openDaemonLauncher = func() (daemonLauncher, error) { return nil, want }
+	t.Cleanup(func() { openDaemonLauncher = previous })
+	if err := ensureDaemonCurrent(t.Context(), time.Second); !errors.Is(err, want) {
+		t.Fatalf("ensure current err = %v, want %v", err, want)
+	}
+}
+
+func TestServiceStatusReportsTheReportedBuildAndPhase(t *testing.T) {
+	launcher := useRecordingLauncher(t)
+	launcher.healthOK = true
+	launcher.health = daemonkit.Health{
+		Phase:  daemonkit.PhaseReady,
+		Detail: []byte(`{"runtime_build":"1.2.3"}`),
+	}
+	out := runServiceStatus(t)
+	for _, want := range []string{"Daemon: running (1.2.3, ready)", "Socket:"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("service status output = %q, want %q", out, want)
+		}
+	}
+	if !slices.Equal(launcher.steps, []string{"health"}) {
+		t.Fatalf("steps = %v, want [health]", launcher.steps)
+	}
+}
+
+func TestServiceStatusReportsAnUnreachableDaemon(t *testing.T) {
+	useRecordingLauncher(t)
+	if out := runServiceStatus(t); !strings.Contains(out, "Daemon: not responding") {
+		t.Fatalf("service status output = %q", out)
+	}
+}
+
+func TestPhaseNamesAreExact(t *testing.T) {
+	for phase, want := range map[daemonkit.Phase]string{
+		daemonkit.PhaseStarting: "starting",
+		daemonkit.PhaseReady:    "ready",
+		daemonkit.PhaseDraining: "draining",
+		daemonkit.PhaseFailed:   "failed",
+	} {
+		if got := phaseName(phase); got != want {
+			t.Fatalf("phaseName(%d) = %q, want %q", phase, got, want)
+		}
+	}
+}
+
+func runServiceStatus(t *testing.T) string {
+	t.Helper()
+	root := NewRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"service", "status"})
+	if err := root.ExecuteContext(t.Context()); err != nil {
+		t.Fatalf("service status: %v", err)
+	}
+	return out.String()
 }

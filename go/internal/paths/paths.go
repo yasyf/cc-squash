@@ -19,19 +19,9 @@ func StateDir() string {
 	return daemon.StateDir()
 }
 
-// SocketPath is the daemon's control-plane unix socket.
-func SocketPath() string {
-	return daemon.SocketPath()
-}
-
 // PortFilePath is the file holding the daemon's listening port.
 func PortFilePath() string {
 	return path("daemon-v1.port")
-}
-
-// ProxySocketPath is the unix socket the Rust ccs-proxy data plane listens on.
-func ProxySocketPath() string {
-	return path("proxy-v1.sock")
 }
 
 // RefsDbPath is the SQLite database the Rust proxy opens for staged refs.
@@ -59,23 +49,6 @@ func ConfigPath() string {
 	return path("config.toml")
 }
 
-// LocksDir holds the daemon's lock files.
-func LocksDir() string {
-	return daemon.LockDir()
-}
-
-// WorkerProcessStorePath is daemonkit's disposable-worker identity ledger.
-func WorkerProcessStorePath() string { return path("worker-processes-v1.db") }
-
-// ChildProcessStorePath is daemonkit's product-child identity ledger.
-func ChildProcessStorePath() string { return path("child-processes-v1.db") }
-
-// ServiceStatePath is daemonkit's exact desired LaunchAgent set.
-func ServiceStatePath() string { return path("services-v1.db") }
-
-// ServiceProcessStorePath is daemonkit's service-worker identity and receipt ledger.
-func ServiceProcessStorePath() string { return path("service-processes-v1.db") }
-
 // BinDir holds binaries the daemon manages (the ccs-proxy child).
 func BinDir() string {
 	return path("bin")
@@ -85,6 +58,3 @@ func BinDir() string {
 func EnsureStateDir() error {
 	return daemon.EnsureStateDir()
 }
-
-// EnsureLockDir creates daemonkit's launch serialization directory.
-func EnsureLockDir() error { return daemon.EnsureLockDir() }

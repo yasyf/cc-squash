@@ -1,12 +1,13 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-squash/go/internal/control"
-	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/version"
+	"github.com/yasyf/daemonkit"
 )
 
 func newDoctorCmd() *cobra.Command {
@@ -17,21 +18,26 @@ func newDoctorCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			out := cmd.OutOrStdout()
 			_, _ = fmt.Fprintf(out, "ccs %s\n", version.String())
-			_, _ = fmt.Fprintf(out, "socket: %s\n", paths.SocketPath())
-			client := control.NewClient()
-			defer client.Close()
-			health, err := client.RuntimeHealth(cmd.Context())
-			switch {
-			case err != nil:
-				_, _ = fmt.Fprintf(out, "daemon: not responding (%v)\n", err)
-			case health.RuntimeBuild != version.String():
-				_, _ = fmt.Fprintf(out, "daemon: running, version skew (%s)\n", health.RuntimeBuild)
-			case health.Draining:
-				_, _ = fmt.Fprintf(out, "daemon: draining (%s)\n", health.RuntimeBuild)
-			default:
-				_, _ = fmt.Fprintf(out, "daemon: %s (%s)\n", health.State, health.RuntimeBuild)
+			socket, err := control.SocketPath()
+			if err != nil {
+				return err
 			}
-			return nil
+			_, _ = fmt.Fprintf(out, "socket: %s\n", socket)
+			return withDaemonLauncher(cmd.Context(), healthTimeout, func(ctx context.Context, launcher daemonLauncher) error {
+				health, err := launcher.Health(ctx)
+				build, _ := control.ReportedBuild(health)
+				switch {
+				case err != nil:
+					_, _ = fmt.Fprintf(out, "daemon: not responding (%v)\n", err)
+				case build != version.String():
+					_, _ = fmt.Fprintf(out, "daemon: running, version skew (%s)\n", build)
+				case health.Phase == daemonkit.PhaseDraining:
+					_, _ = fmt.Fprintf(out, "daemon: draining (%s)\n", build)
+				default:
+					_, _ = fmt.Fprintf(out, "daemon: %s (%s)\n", phaseName(health.Phase), build)
+				}
+				return nil
+			})
 		},
 	}
 }

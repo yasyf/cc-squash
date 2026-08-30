@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
+	"net"
 	"os"
 	"strconv"
 	"sync"
@@ -17,11 +17,7 @@ import (
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
 	"github.com/yasyf/cc-squash/go/internal/supervisor"
 	"github.com/yasyf/cc-squash/go/internal/version"
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 )
 
 // mintReadyTimeout bounds how long OpMint waits for a cold-started proxy to
@@ -30,59 +26,51 @@ const mintReadyTimeout = 3 * time.Second
 
 // proxyStartupGrace bounds how long bringUp waits for the first proxy to
 // register before starting the supervise loop anyway — long enough for a normal
-// bind+connect+register (sub-second), so the first tick never races a healthy
-// cold start into a spurious respawn.
+// spawn+register (sub-second), so the first tick never races a healthy cold
+// start into a spurious respawn.
 const proxyStartupGrace = 5 * time.Second
 
 // proxyShutdownGrace bounds how long an intentional daemon shutdown waits for the
 // supervised proxy to step down after the seam shutdown frame, before the daemon
-// returns and the seam Close drops the connection.
+// returns and the seam Close drops the channel.
 const proxyShutdownGrace = 3 * time.Second
 
-const (
-	releaseTeamID            = "SXKCTF23Q2"
-	releaseSigningIdentifier = "ccs"
-	shutdownTimeout          = 30 * time.Second
-	productShutdownTimeout   = 10 * time.Second
-	productResultTimeout     = time.Second
-)
+// spawnSetupTimeout bounds the record write, probe, and exec verification of one
+// proxy spawn — never the child's life.
+const spawnSetupTimeout = 10 * time.Second
 
-// Server is the cc-squash product control plane. Daemonkit owns its listener,
+// Server is the cc-squash product control plane. daemonkit owns its listener,
 // process runtime, transport, admission, process identities, and reaping.
 type Server struct {
-	socket    string
-	proxySock string
-	log       *log.Logger
+	log *log.Logger
 
 	seam             *proxyseam.Server
 	sup              *supervisor.Supervisor
 	policy           *supervisor.ProxyPolicy
 	spawner          *proxySpawner
-	children         *proc.Manager
+	owner            daemonkit.Ctx
 	productCtx       context.Context
 	productCancel    context.CancelFunc
 	supervisorCancel context.CancelFunc
 	supervisorDone   chan struct{}
 
-	// spawnProxy overrides the detached ccs-proxy launch in tests; the override
-	// must publish its exact process record before connecting to the seam.
-	spawnProxy func(func(proc.Identity) error) error
+	// spawnProxy overrides the detached ccs-proxy launch in tests. It returns the
+	// parent end of the child's handoff channel, which the seam then serves.
+	spawnProxy func(context.Context) (proxyChild, error)
 
 	// mintTimeout bounds OpMint's wait for a cold-started proxy to register; zero
 	// means mintReadyTimeout. Tests shrink it to pin the fail-open path fast.
 	mintTimeout time.Duration
-	// beforePublication is a test-only readiness barrier.
-	beforePublication func(context.Context) error
 
 	// relayConfig is the seam JSON parsed from config.toml once at daemon start
-	// and pushed verbatim with every mint. Set in serve before the accept loop or
-	// bring-up spawns, so the go-statements establish the happens-before and the
-	// mint/repush readers take no lock. A load error fails open to {} so a bad
-	// config never blocks minting.
+	// and pushed verbatim with every mint. Set in start before the supervisor
+	// goroutine spawns, so the go-statement establishes the happens-before and
+	// the mint/repush readers take no lock. A load error fails open to {} so a
+	// bad config never blocks minting.
 	relayConfig json.RawMessage
 
 	// wg tracks every daemon goroutine (the startup bring-up, the supervise loop,
-	// each connection handler); serve Waits on it before returning.
+	// each seam session); Drain waits on it.
 	wg sync.WaitGroup
 
 	// proxyReady is closed once the proxy registers, so OpMint can wait for a
@@ -99,208 +87,35 @@ type Server struct {
 	shadow    bool
 }
 
-type serverPublication = dkdaemon.PublicationSlot[*Server]
-
 // NewServer returns the control-plane daemon composition.
 func NewServer() (*Server, error) {
 	return &Server{
-		socket:     paths.SocketPath(),
-		proxySock:  paths.ProxySocketPath(),
 		log:        log.New(os.Stderr, "[cc-squash] ", log.LstdFlags),
 		proxyReady: make(chan struct{}),
 		tokens:     map[Token]struct{}{},
 	}, nil
 }
 
-// Run is the entry point for `ccs daemon`.
+// Run is the entry point for `ccs daemon`: daemonkit's whole lifecycle — flock,
+// owner record, bind, product start, ready, serve, drain.
 func (s *Server) Run(ctx context.Context) error {
-	runtime, publication, err := s.runtime()
+	spec, err := Spec()
 	if err != nil {
 		return err
 	}
-	activation, err := runtime.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	settlement, err := activation.ClaimProductSettlement()
-	if err != nil {
-		if activation.Context().Err() != nil {
-			return runtime.Wait(context.Background())
-		}
-		return errors.Join(err, shutdownRuntime(runtime))
-	}
-	productDone := make(chan error, 1)
-	go func() {
-		<-activation.Context().Done()
-		closeCtx, cancel := context.WithTimeout(context.Background(), productShutdownTimeout)
-		defer cancel()
-		if err := s.closeProduct(closeCtx); err != nil {
-			productDone <- err
-			return
-		}
-		productDone <- settlement.Complete()
-	}()
-	fail := func(cause error) error {
-		runtimeErr := shutdownRuntime(runtime)
-		return errors.Join(cause, runtimeErr, productResult(runtimeErr, productDone))
-	}
-	if err := s.activate(activation); err != nil {
-		return fail(err)
-	}
-	if s.beforePublication != nil {
-		if err := s.beforePublication(activation.Context()); err != nil {
-			return fail(err)
-		}
-	}
-	staged, err := publication.Stage(activation, s)
-	if err != nil {
-		return fail(err)
-	}
-	if err := activation.CommitReady(staged); err != nil {
-		return fail(err)
-	}
-	watchDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-			defer cancel()
-			_ = runtime.Shutdown(shutdownCtx)
-		case <-watchDone:
-		}
-	}()
-	waitErr := runtime.Wait(context.Background())
-	close(watchDone)
-	productErr := productResult(waitErr, productDone)
-	if ctx.Err() != nil && errors.Is(waitErr, ctx.Err()) {
-		waitErr = nil
-	}
-	return errors.Join(waitErr, productErr)
+	_, err = daemonkit.Serve(ctx, spec, s.start)
+	s.log.Printf("daemon stopped")
+	return err
 }
 
-func productResult(runtimeErr error, done <-chan error) error {
-	if errors.Is(runtimeErr, dkdaemon.ErrShutdownIncomplete) {
-		select {
-		case err := <-done:
-			return err
-		default:
-			return nil
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), productResultTimeout)
-	defer cancel()
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return fmt.Errorf("cc-squash: collect product settlement: %w", ctx.Err())
-	}
-}
-
-func shutdownRuntime(runtime *dkdaemon.Runtime) error {
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-	return errors.Join(runtime.Shutdown(ctx), runtime.Wait(ctx))
-}
-
-func (s *Server) runtime() (*dkdaemon.Runtime, *serverPublication, error) {
+func (s *Server) start(c daemonkit.Ctx) (daemonkit.Product, error) {
 	if err := paths.EnsureStateDir(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	if err := paths.EnsureLockDir(); err != nil {
-		return nil, nil, err
-	}
-	generation, err := proc.ProcessGeneration()
-	if err != nil {
-		return nil, nil, err
-	}
-	workerReaper := &proc.Reaper{
-		Store: &proc.FileStore{Path: paths.WorkerProcessStorePath()}, Generation: generation,
-	}
-	runtimeWorkers, err := worker.NewPool(worker.Config{
-		Capacity: 1, QueueCapacity: 1, MaxTotalRun: 5 * time.Second,
-		MaxStdinBytes: 1 << 20, MaxStdoutBytes: 1 << 20, MaxStderrBytes: 1 << 20,
-	}, workerReaper)
-	if err != nil {
-		return nil, nil, err
-	}
-	children, err := proc.NewManager(1, &proc.Reaper{
-		Store: &proc.FileStore{Path: paths.ChildProcessStorePath()}, Generation: generation,
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	s.children = children
-	policy, err := trust.NewTrustPolicy(trust.TrustPolicyConfig{
-		ExpectedUID: os.Geteuid(),
-		Roles: map[trust.PeerRole]trust.Requirement{
-			StopControlRoleID: {TeamID: releaseTeamID, SigningIdentifier: releaseSigningIdentifier},
-			LifecycleRoleID:   {TeamID: releaseTeamID, SigningIdentifier: releaseSigningIdentifier},
-		},
-		AllowUnprotected: true,
-		StopRoles:        []trust.PeerRole{StopControlRoleID},
-		ReceiptRoles:     []trust.PeerRole{LifecycleRoleID},
-		ReadinessRoles:   []trust.PeerRole{LifecycleRoleID},
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	wireServer := &wire.Server{WireBuild: WireBuild}
-	var runtime *dkdaemon.Runtime
-	runtime, err = wire.NewRuntime(wire.RuntimeConfig{
-		Socket: s.socket, RuntimeBuild: version.String(), RuntimeProtocol: int(wire.ProtocolVersion),
-		Wire: wireServer, TrustPolicy: policy,
-		StopControlStore: &proc.FileStore{Path: paths.ServiceProcessStorePath()},
-		Observations: []wire.ObservationRoute{{
-			Op: wire.Op(OpRuntimeHealth), MaxResponseBytes: 16 << 10,
-			Handler: func(ctx context.Context, request wire.ObservationRequest) (wire.ObservationResponse, error) {
-				if request.Tenant != "" {
-					return wire.ObservationResponse{}, errors.New("cc-squash control requests do not carry a tenant")
-				}
-				if err := decodeStrict(request.Payload, &EmptyRequest{}); err != nil {
-					return wire.ObservationResponse{}, err
-				}
-				health, err := runtime.Health(ctx)
-				if err != nil {
-					return wire.ObservationResponse{}, err
-				}
-				state, err := runtimeStateFromDaemon(health.State)
-				if err != nil {
-					return wire.ObservationResponse{}, err
-				}
-				payload, err := json.Marshal(Response{OK: true, RuntimeHealth: &RuntimeHealth{
-					RuntimeBuild: health.RuntimeBuild, RuntimeProtocol: health.RuntimeProtocol, PID: health.PID,
-					ProcessGeneration: health.ProcessGeneration.String(), Ready: health.Ready,
-					State: state, Draining: health.Draining, Busy: health.Busy,
-				}})
-				if err != nil {
-					return wire.ObservationResponse{}, fmt.Errorf("encode runtime health observation: %w", err)
-				}
-				return wire.ObservationResponse{Payload: payload}, nil
-			},
-		}},
-		Workers: runtimeWorkers, Children: children, ShutdownTimeout: shutdownTimeout,
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	publication := dkdaemon.NewPublicationSlot[*Server](runtime)
-	registerHandlers(wireServer, publication)
-	return runtime, publication, nil
-}
-
-func (s *Server) activate(activation dkdaemon.Activation) error {
-	recovery, err := activation.RecoveryCapability(proc.RecoveryTaskID)
-	if err != nil {
-		return err
-	}
-	if len(recovery.Receipt().Settled()) != 0 {
+	if len(c.Reclaimed) != 0 {
 		if err := clearRetiredProxyState(); err != nil {
-			return fmt.Errorf("clear retired proxy state: %w", err)
+			return nil, fmt.Errorf("clear retired proxy state: %w", err)
 		}
-	}
-	if err := recovery.Consume(); err != nil {
-		return err
 	}
 	cfg, err := config.Load()
 	if err != nil {
@@ -308,32 +123,89 @@ func (s *Server) activate(activation dkdaemon.Activation) error {
 		cfg = json.RawMessage("{}")
 	}
 	s.relayConfig = cfg
-	seam, err := proxyseam.NewServer(activation.Context(), s.log)
-	if err != nil {
-		return err
-	}
-	s.seam = seam
-	productCtx, productCancel := context.WithCancel(context.Background())
+	s.owner = c
+	s.seam = proxyseam.NewServer(s.log)
+	productCtx, productCancel := context.WithCancel(context.WithoutCancel(c.Context))
 	supervisorCtx, supervisorCancel := context.WithCancel(productCtx)
 	s.productCtx = productCtx
 	s.productCancel = productCancel
 	s.supervisorCancel = supervisorCancel
 	s.supervisorDone = make(chan struct{})
-	spawner := &proxySpawner{server: s, children: s.children}
-	s.spawner = spawner
-	s.policy = supervisor.NewProxyPolicy(seam, s.repushTokens, spawner.Stop, s.log)
-	s.log.Printf("daemon %s activated; socket=%s", version.String(), s.socket)
-	s.wg.Add(2)
-	go func() {
-		defer s.wg.Done()
-		seam.Start(productCtx, s.onRegister)
-	}()
+	s.spawner = &proxySpawner{server: s}
+	s.policy = supervisor.NewProxyPolicy(s.seam, s.repushTokens, s.spawner.Stop, s.log)
+	socket, _ := SocketPath()
+	s.log.Printf("daemon %s activated; socket=%s", version.String(), socket)
+	c.Report(s.healthDetail())
+	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		defer close(s.supervisorDone)
 		s.bringUp(supervisorCtx)
 	}()
-	return nil
+	return product{s}, nil
+}
+
+// healthDetail is cc-squash's half of daemonkit's health verb, which a launcher
+// reads back to order this daemon against its own build.
+func (s *Server) healthDetail() []byte {
+	detail, _ := json.Marshal(HealthDetail{RuntimeBuild: version.String()})
+	return detail
+}
+
+// product is the Server's daemonkit face: dispatch plus the two shutdown stages.
+type product struct{ s *Server }
+
+func (p product) Handle(ctx context.Context, req daemonkit.Request) (daemonkit.Reply, error) {
+	return p.s.handle(ctx, req)
+}
+
+func (p product) Drain(b daemonkit.Budget) error {
+	ctx, done := b.Context(context.Background())
+	defer done()
+	return p.s.closeProduct(ctx)
+}
+
+func (product) Close(daemonkit.Budget) error { return nil }
+
+func (s *Server) handle(ctx context.Context, req daemonkit.Request) (daemonkit.Reply, error) {
+	var response Response
+	switch Op(req.Op) {
+	case OpStatus:
+		if err := decodeStrict(req.Body, &EmptyRequest{}); err != nil {
+			return daemonkit.Reply{}, err
+		}
+		snapshot := s.snapshot()
+		response = Response{OK: true, Status: &snapshot}
+	case OpMint:
+		if err := decodeStrict(req.Body, &EmptyRequest{}); err != nil {
+			return daemonkit.Reply{}, err
+		}
+		response = s.handleMint(ctx)
+	case OpKill:
+		var message ToggleRequest
+		if err := decodeStrict(req.Body, &message); err != nil {
+			return daemonkit.Reply{}, err
+		}
+		response = s.handleKill(message.On)
+	case OpShadow:
+		var message ToggleRequest
+		if err := decodeStrict(req.Body, &message); err != nil {
+			return daemonkit.Reply{}, err
+		}
+		response = s.handleShadow(message.On)
+	case OpGc:
+		if err := decodeStrict(req.Body, &EmptyRequest{}); err != nil {
+			return daemonkit.Reply{}, err
+		}
+		response = s.handleGc()
+	default:
+		return daemonkit.Reply{}, &daemonkit.ProductError{Code: "unknown_op", Message: "unknown op: " + req.Op}
+	}
+	body, err := json.Marshal(response)
+	if err != nil {
+		return daemonkit.Reply{}, fmt.Errorf("encode %s reply: %w", req.Op, err)
+	}
+	return daemonkit.Reply{Body: body}, nil
 }
 
 func (s *Server) closeProduct(ctx context.Context) error {
@@ -379,84 +251,8 @@ func clearRetiredProxyState() error {
 	return errors.Join(errs...)
 }
 
-func registerHandlers(server *wire.Server, publication *serverPublication) {
-	server.Register(wire.HandlerSpec{Op: wire.Op(OpStatus), Concurrent: true, Handler: func(_ context.Context, request wire.Request) (any, error) {
-		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
-			return nil, err
-		}
-		product, err := publication.Value(request.Publication)
-		if err != nil {
-			return nil, err
-		}
-		snapshot := product.snapshot()
-		return Response{OK: true, Status: &snapshot}, nil
-	}})
-	server.Register(wire.HandlerSpec{Op: wire.Op(OpMint), Concurrent: true, Handler: func(ctx context.Context, request wire.Request) (any, error) {
-		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
-			return nil, err
-		}
-		product, err := publication.Value(request.Publication)
-		if err != nil {
-			return nil, err
-		}
-		return product.handleMint(ctx), nil
-	}})
-	server.Register(wire.HandlerSpec{Op: wire.Op(OpKill), Concurrent: true, Handler: func(_ context.Context, request wire.Request) (any, error) {
-		var message ToggleRequest
-		if err := decodeBusinessRequest(request, &message); err != nil {
-			return nil, err
-		}
-		product, err := publication.Value(request.Publication)
-		if err != nil {
-			return nil, err
-		}
-		return product.handleKill(message.On), nil
-	}})
-	server.Register(wire.HandlerSpec{Op: wire.Op(OpShadow), Concurrent: true, Handler: func(_ context.Context, request wire.Request) (any, error) {
-		var message ToggleRequest
-		if err := decodeBusinessRequest(request, &message); err != nil {
-			return nil, err
-		}
-		product, err := publication.Value(request.Publication)
-		if err != nil {
-			return nil, err
-		}
-		return product.handleShadow(message.On), nil
-	}})
-	server.Register(wire.HandlerSpec{Op: wire.Op(OpGc), Concurrent: true, Handler: func(_ context.Context, request wire.Request) (any, error) {
-		if err := decodeBusinessRequest(request, &EmptyRequest{}); err != nil {
-			return nil, err
-		}
-		product, err := publication.Value(request.Publication)
-		if err != nil {
-			return nil, err
-		}
-		return product.handleGc(), nil
-	}})
-}
-
-func decodeBusinessRequest(request wire.Request, target any) error {
-	if request.Tenant != "" {
-		return errors.New("cc-squash control requests do not carry a tenant")
-	}
-	return decodeStrict(request.Payload, target)
-}
-
-func runtimeStateFromDaemon(state dkdaemon.State) (RuntimeState, error) {
-	switch state {
-	case dkdaemon.StateHealthy:
-		return RuntimeStateHealthy, nil
-	case dkdaemon.StateDegraded:
-		return RuntimeStateDegraded, nil
-	case dkdaemon.StateFailed:
-		return RuntimeStateFailed, nil
-	default:
-		return "", fmt.Errorf("daemon runtime state %q is not exact", state)
-	}
-}
-
 // shutdownProxy makes one bounded graceful step-down request after supervision
-// has stopped. Daemonkit remains the sole exact child kill/reap authority.
+// has stopped. daemonkit remains the sole exact child kill/reap authority.
 func (s *Server) shutdownProxy(ctx context.Context) {
 	if s.policy == nil {
 		return
@@ -465,17 +261,16 @@ func (s *Server) shutdownProxy(ctx context.Context) {
 	defer cancel()
 	if err := s.policy.Shutdown(graceCtx); err != nil {
 		if errors.Is(err, proxyseam.ErrProxyNotConnected) {
-			return // no proxy connected; nothing to step down
+			return
 		}
 		s.log.Printf("shutdown proxy: %v", err)
 		return
 	}
 }
 
-// bringUp runs the deferred heavy startup off the accept path: it starts the
-// seam accept loop (capturing the proxy's register), spawns the data-plane
-// child, builds the supervisor, and drives the supervise loop until ctx is
-// cancelled.
+// bringUp runs the deferred heavy startup off the ready path: it spawns the
+// data-plane child, builds the supervisor, and drives the supervise loop until
+// ctx is cancelled.
 //
 // The supervise loop only starts once the first proxy has registered (or the
 // startup grace elapses): the spawn-and-wait here and the loop's revive are two
@@ -503,7 +298,7 @@ func (s *Server) bringUp(ctx context.Context) {
 
 // onRegister captures a freshly registered proxy's identity, publishes its port
 // (status mirror + port-file), and unblocks any OpMint waiting on the cold
-// start. Runs on the seam's accept goroutine.
+// start. Runs on the seam's session goroutine.
 func (s *Server) onRegister(reg proxyseam.Register) {
 	if want := supervisor.ProxyVersion(); reg.Version != want {
 		// The registered proxy is not the version this daemon supervises against, so
@@ -525,159 +320,108 @@ func (s *Server) onRegister(reg proxyseam.Register) {
 	s.readyOnce.Do(func() { close(s.proxyReady) })
 }
 
-type proxySpawner struct {
-	server   *Server
-	children *proc.Manager
-	timeout  time.Duration
+// proxyChild is the spawned data plane the seam speaks to: the handoff channel
+// plus the pid and the settlement daemonkit owns.
+type proxyChild interface {
+	PID() int
+	Conn() (net.Conn, error)
+	Stop(context.Context) (daemonkit.Exit, error)
+}
 
-	mu           sync.Mutex
-	process      *proc.PreparedChild
-	receipt      proc.ProcessReceipt
-	outputCancel context.CancelFunc
+type proxySpawner struct {
+	server  *Server
+	timeout time.Duration
+
+	mu    sync.Mutex
+	child proxyChild
 }
 
 func (p *proxySpawner) EnsureRunning(ctx context.Context) error {
 	if p.server.policy.Registered() {
 		return nil
 	}
-	if p.server.spawnProxy != nil {
-		if err := p.server.spawnProxy(p.server.seam.ExpectProcess); err != nil {
-			return fmt.Errorf("spawn proxy test child: %w", err)
-		}
-		return p.awaitReady(ctx)
-	}
-	bin, err := ProxyBinaryPath()
+	child, err := p.spawn(ctx)
 	if err != nil {
 		return err
 	}
-	logFile, err := os.OpenFile(paths.LogPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	conn, err := child.Conn()
 	if err != nil {
-		return fmt.Errorf("open proxy log: %w", err)
-	}
-	request, err := proc.NewSpawnRequest(proc.SpawnConfig{
-		RecoveryID: proc.RecoveryTaskID,
-		Executable: bin,
-		Args: []string{
-			"--socket", p.server.proxySock,
-			"--port", strconv.Itoa(p.server.currentProxyPort()),
-			"--refs-db", paths.RefsDbPath(),
-		},
-		Stdin: proc.StdioNull, Stdout: proc.StdioPipe, Stderr: proc.StdioPipe,
-	})
-	if err != nil {
-		_ = logFile.Close()
-		return err
-	}
-	process, receipt, err := p.children.Prepare(ctx, request)
-	if err != nil {
-		_ = logFile.Close()
-		return err
-	}
-	stdout, err := process.TakeStdout()
-	if err != nil {
-		_ = logFile.Close()
-		return errors.Join(err, stopPreparedChild(process))
-	}
-	stderr, err := process.TakeStderr()
-	if err != nil {
-		_ = stdout.Close()
-		_ = logFile.Close()
-		return errors.Join(err, stopPreparedChild(process))
-	}
-	expected := receipt.ProcessIdentity()
-	expected.Executable = receipt.ExpectedExecutable()
-	if err := p.server.seam.ExpectProcess(expected); err != nil {
-		_ = stdout.Close()
-		_ = stderr.Close()
-		_ = logFile.Close()
-		return errors.Join(err, stopPreparedChild(process))
-	}
-	outputCtx, outputCancel := context.WithCancel(p.server.productCtx)
-	p.server.captureProxyOutput(outputCtx, stdout, stderr, logFile)
-	if err := process.Start(ctx); err != nil {
-		outputCancel()
-		return errors.Join(err, stopPreparedChild(process))
+		return errors.Join(err, p.stopChild(child))
 	}
 	p.mu.Lock()
-	p.process = process
-	p.receipt = receipt
-	p.outputCancel = outputCancel
+	p.child = child
 	p.mu.Unlock()
+	p.server.wg.Add(1)
+	go func() {
+		defer p.server.wg.Done()
+		p.server.seam.Serve(p.server.productCtx, conn, p.server.onRegister)
+	}()
 	if err := p.awaitReady(ctx); err != nil {
-		outputCancel()
-		stopErr := stopPreparedChild(process)
-		p.clear(process)
+		stopErr := p.stopChild(child)
+		p.clear(child)
 		return errors.Join(err, stopErr)
 	}
 	return nil
 }
 
-func stopPreparedChild(process *proc.PreparedChild) error {
+func (p *proxySpawner) spawn(ctx context.Context) (proxyChild, error) {
+	if p.server.spawnProxy != nil {
+		return p.server.spawnProxy(ctx)
+	}
+	bin, err := ProxyBinaryPath()
+	if err != nil {
+		return nil, err
+	}
+	logFile, err := os.OpenFile(paths.LogPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open proxy log: %w", err)
+	}
+	spawnCtx, cancel := context.WithTimeout(ctx, spawnSetupTimeout)
+	defer cancel()
+	child, err := p.server.owner.Spawn(spawnCtx, daemonkit.Cmd{
+		Path: bin,
+		Args: []string{
+			"--port", strconv.Itoa(p.server.currentProxyPort()),
+			"--refs-db", paths.RefsDbPath(),
+		},
+		Session: true,
+		Exec:    daemonkit.ServingSameUser(),
+	}, daemonkit.ChannelHandoff, logFile)
+	if err != nil {
+		_ = logFile.Close()
+		return nil, err
+	}
+	return child, nil
+}
+
+func (p *proxySpawner) stopChild(child proxyChild) error {
 	ctx, cancel := context.WithTimeout(context.Background(), proxyShutdownGrace)
 	defer cancel()
-	return process.Stop(ctx)
+	_, err := child.Stop(ctx)
+	return err
 }
 
 func (p *proxySpawner) Stop(ctx context.Context) (int, error) {
 	p.mu.Lock()
-	process := p.process
-	receipt := p.receipt
-	outputCancel := p.outputCancel
+	child := p.child
 	p.mu.Unlock()
-	if process == nil {
+	if child == nil {
 		return 0, supervisor.ErrChildUnavailable
 	}
-	pid := receipt.ProcessIdentity().PID
-	if outputCancel != nil {
-		outputCancel()
-	}
-	if err := process.Stop(ctx); err != nil {
+	pid := child.PID()
+	if _, err := child.Stop(ctx); err != nil {
 		return 0, err
 	}
-	p.clear(process)
+	p.clear(child)
 	return pid, nil
 }
 
-func (p *proxySpawner) clear(process *proc.PreparedChild) {
+func (p *proxySpawner) clear(child proxyChild) {
 	p.mu.Lock()
-	if p.process == process {
-		p.process = nil
-		p.receipt = proc.ProcessReceipt{}
-		p.outputCancel = nil
+	if p.child == child {
+		p.child = nil
 	}
 	p.mu.Unlock()
-}
-
-func (s *Server) captureProxyOutput(ctx context.Context, stdout, stderr io.ReadCloser, logFile *os.File) {
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		defer logFile.Close()
-		var copies sync.WaitGroup
-		copies.Add(2)
-		go func() {
-			defer copies.Done()
-			defer stdout.Close()
-			_, _ = io.Copy(logFile, stdout)
-		}()
-		go func() {
-			defer copies.Done()
-			defer stderr.Close()
-			_, _ = io.Copy(logFile, stderr)
-		}()
-		copied := make(chan struct{})
-		go func() {
-			copies.Wait()
-			close(copied)
-		}()
-		select {
-		case <-ctx.Done():
-			_ = stdout.Close()
-			_ = stderr.Close()
-			<-copied
-		case <-copied:
-		}
-	}()
 }
 
 func (p *proxySpawner) Timeout() time.Duration {

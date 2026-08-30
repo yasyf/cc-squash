@@ -1,10 +1,11 @@
-// Package proxyseam also carries the Go server end of the proxy-v1.sock seam: the
-// control plane binds proxy-v1.sock and accepts the single connection the Rust
-// proxy child makes after it spawns. The child sends register once; thereafter
-// the control plane writes mint/evict/shadow/kill/shutdown control frames. The
-// seam is fail-open on both ends — a child that has not connected yet, a dropped
-// connection leaves the daemon up while the proxy reconnects. A non-v1 frame
-// closes that child session before it can mutate control state.
+// Package proxyseam also carries the Go server end of the proxy seam: the
+// control plane spawns the Rust proxy child over a daemonkit ChannelHandoff and
+// speaks this protocol on the inherited socketpair. The child sends register
+// once; thereafter the control plane writes mint/evict/shadow/kill/shutdown
+// control frames. The seam is fail-open on both ends — a child that has not
+// registered yet, or a dropped channel, leaves the daemon up while the
+// supervisor respawns. A non-v1 frame ends that child's session before it can
+// mutate control state.
 package proxyseam
 
 import (
@@ -12,187 +13,54 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
-	"os"
 	"sync"
-	"syscall"
 	"time"
-
-	"github.com/yasyf/cc-squash/go/internal/paths"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
 )
 
 // ErrProxyNotConnected is returned by the Server's send methods when no proxy
-// child has connected yet. It is a fail-open signal — the caller logs and
+// child channel is live. It is a fail-open signal — the caller logs and
 // continues rather than treating a missing data plane as fatal.
 var ErrProxyNotConnected = errors.New("proxyseam: no proxy child connected")
-
-var errProxyAlreadyServing = errors.New("proxyseam: another proxy listener is serving")
 
 const writeTimeout = 2 * time.Second
 
 type session struct {
 	conn      net.Conn
-	peer      wire.Peer
 	writeGate chan struct{}
 }
 
-// Server is the Go end of the proxy-v1.sock seam. It accepts one
-// proxy child connection at a time, and writes control frames to whichever
-// child is currently connected. A dropped child leaves the listener up so a
-// respawned child can reconnect.
+// Server is the Go end of the proxy seam. It serves one spawned proxy child's
+// handoff channel at a time and writes control frames to whichever child is
+// currently registered.
 type Server struct {
 	log *log.Logger
 
-	ln   net.Listener
-	lock *proc.FileLockHandle
-
 	mu        sync.Mutex
-	expected  proc.Identity
 	session   *session
-	accepted  map[net.Conn]struct{}
-	closeErr  error
+	live      map[net.Conn]struct{}
+	closed    bool
 	closeOnce sync.Once
+	closeErr  error
 }
 
-// NewServer binds proxy-v1.sock, removing any stale socket file first, and returns
-// a Server ready to accept the proxy child. Diagnostics go to logger.
-func NewServer(ctx context.Context, logger *log.Logger) (*Server, error) {
-	socket := paths.ProxySocketPath()
-	lock, err := (proc.FileLockSpec{
-		Path: socket + ".lock", Mode: proc.FileLockExclusive, Deadline: time.Second,
-	}).TryAcquire()
-	if errors.Is(err, proc.ErrLockBusy) {
-		return nil, errProxyAlreadyServing
-	}
-	if err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		_ = lock.Close()
-		return nil, err
-	}
-	conn, probeErr := net.DialTimeout("unix", socket, 100*time.Millisecond)
-	if probeErr == nil {
-		_ = conn.Close()
-		_ = lock.Close()
-		return nil, errProxyAlreadyServing
-	}
-	if !errors.Is(probeErr, os.ErrNotExist) && !errors.Is(probeErr, syscall.ENOENT) &&
-		!errors.Is(probeErr, syscall.ECONNREFUSED) {
-		_ = lock.Close()
-		return nil, fmt.Errorf("proxyseam: probe listener: %w", probeErr)
-	}
-	if err := os.Remove(socket); err != nil && !errors.Is(err, os.ErrNotExist) {
-		_ = lock.Close()
-		return nil, fmt.Errorf("proxyseam: remove stale listener: %w", err)
-	}
-	ln, err := net.Listen("unix", socket)
-	if err != nil {
-		_ = lock.Close()
-		return nil, err
-	}
-	if err := os.Chmod(socket, 0o600); err != nil {
-		_ = ln.Close()
-		_ = lock.Close()
-		return nil, err
-	}
-	return &Server{log: logger, ln: ln, lock: lock, accepted: make(map[net.Conn]struct{})}, nil
+// NewServer returns a seam with no child attached. Diagnostics go to logger.
+func NewServer(logger *log.Logger) *Server {
+	return &Server{log: logger, live: map[net.Conn]struct{}{}}
 }
 
-// ExpectProcess publishes the exact daemonkit-owned child identity allowed to
-// establish the next seam session. The caller combines the prepared wrapper's
-// PID/start/boot identity with the receipt's canonical target executable.
-func (s *Server) ExpectProcess(identity proc.Identity) error {
-	if _, err := proc.NewRecordDigest(identity); err != nil {
-		return fmt.Errorf("proxyseam: expected process: %w", err)
-	}
-	s.mu.Lock()
-	s.expected = identity
-	current := s.session
-	if current != nil && !matchesIdentity(current.peer, identity) {
-		s.session = nil
-	}
-	s.mu.Unlock()
-	if current != nil && !matchesIdentity(current.peer, identity) {
-		_ = current.conn.Close()
-	}
-	return nil
-}
-
-// Start accepts proxy child connections until ctx is cancelled or the listener
-// closes. For each connection it reads the register frame, calls onRegister,
-// then drains any further Rust->Go frames (Layer 1 expects none — they are
-// logged and ignored). A dropped connection is logged; the loop accepts the
-// next child. Run it in its own goroutine.
-func (s *Server) Start(ctx context.Context, onRegister func(Register)) {
-	go func() {
-		<-ctx.Done()
-		_ = s.Close()
-	}()
-	for {
-		conn, err := s.ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return
-			}
-			s.log.Printf("proxyseam: accept: %v", err)
-			continue
-		}
-		s.trackConn(conn)
-		s.serveConn(ctx, conn, onRegister)
-		s.untrackConn(conn)
-	}
-}
-
-// Close drains new accepts, closes the listener and authenticated session,
-// settles admitted work, and releases the single-entrant listener lock.
-func (s *Server) Close() error {
-	s.closeOnce.Do(func() {
-		listenerErr := s.ln.Close()
-		if errors.Is(listenerErr, net.ErrClosed) {
-			listenerErr = nil
-		}
-		s.closeConnections()
-		lockErr := s.lock.Close()
-		s.closeErr = errors.Join(listenerErr, lockErr)
-	})
-	return s.closeErr
-}
-
-// Connected reports whether a proxy child connection is currently live — the
-// liveness the supervisor's Policy reads to tell a registered, serving proxy
-// from one that has dropped its seam.
-func (s *Server) Connected() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.session != nil && matchesIdentity(s.session.peer, s.expected)
-}
-
-// serveConn admits a child only after its exact epoch-1 register frame. Rust
-// sends no later frames, so any subsequent input closes the session.
-func (s *Server) serveConn(ctx context.Context, conn net.Conn, onRegister func(Register)) {
-	unix, ok := conn.(*net.UnixConn)
-	if !ok {
-		s.log.Printf("proxyseam: reject non-unix peer")
+// Serve reads conn — the parent end of one spawned proxy's handoff socketpair —
+// admitting the child on its exact epoch-1 register frame, then holding the
+// session until the channel ends or ctx is cancelled. Rust sends no later
+// frames, so any subsequent input ends the session. Run it in its own goroutine.
+func (s *Server) Serve(ctx context.Context, conn net.Conn, onRegister func(Register)) {
+	if !s.track(conn) {
 		_ = conn.Close()
 		return
 	}
-	peer, err := wire.PeerFromConn(unix)
-	if err != nil {
-		s.log.Printf("proxyseam: reject unidentified peer: %v", err)
-		_ = conn.Close()
-		return
-	}
-	if peer.UID != os.Geteuid() || !s.expectedMatches(peer) {
-		s.log.Printf("proxyseam: reject unauthorized peer pid=%d uid=%d", peer.PID, peer.UID)
-		_ = conn.Close()
-		return
-	}
+	defer s.untrack(conn)
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -220,12 +88,8 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, onRegister func(R
 		s.log.Printf("proxyseam: first frame is %T, want Register", message)
 		return
 	}
-	if register.PID != peer.PID {
-		s.log.Printf("proxyseam: reject register pid=%d from peer pid=%d", register.PID, peer.PID)
-		return
-	}
-	if !s.setConn(conn, peer) {
-		s.log.Printf("proxyseam: reject superseded peer pid=%d", peer.PID)
+	if !s.setConn(conn) {
+		s.log.Printf("proxyseam: reject register on a closed seam")
 		return
 	}
 	defer s.clearConn(conn)
@@ -239,10 +103,41 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, onRegister func(R
 		return
 	}
 	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
-		s.log.Printf("proxyseam: proxy connection dropped: %v", err)
+		s.log.Printf("proxyseam: proxy channel dropped: %v", err)
 		return
 	}
 	s.log.Printf("proxyseam: proxy disconnected")
+}
+
+// Close drops every live child channel and refuses later Serve calls.
+func (s *Server) Close() error {
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		connections := make([]net.Conn, 0, len(s.live))
+		for conn := range s.live {
+			connections = append(connections, conn)
+		}
+		s.session = nil
+		s.mu.Unlock()
+		var errs []error
+		for _, conn := range connections {
+			if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				errs = append(errs, err)
+			}
+		}
+		s.closeErr = errors.Join(errs...)
+	})
+	return s.closeErr
+}
+
+// Connected reports whether a registered proxy child's channel is still live —
+// the liveness the supervisor's Policy reads to tell a registered, serving proxy
+// from one that has dropped its seam.
+func (s *Server) Connected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.session != nil
 }
 
 // SendMint hands the proxy a session token and its per-session relay config.
@@ -278,8 +173,8 @@ func (s *Server) SendShutdown(ctx context.Context) error {
 	return s.send(ctx, Shutdown{Type: MsgShutdown, Protocol: ProtocolVersion})
 }
 
-// send marshals a frame and writes it to the connected child under the write
-// lock. With no child connected it returns ErrProxyNotConnected — the fail-open
+// send marshals a frame and writes it to the registered child under the write
+// gate. With no child registered it returns ErrProxyNotConnected — the fail-open
 // signal the caller logs and continues past.
 func (s *Server) send(ctx context.Context, msg any) error {
 	frame, err := Encode(msg)
@@ -288,11 +183,10 @@ func (s *Server) send(ctx context.Context, msg any) error {
 	}
 	s.mu.Lock()
 	current := s.session
-	if current == nil || !matchesIdentity(current.peer, s.expected) {
-		s.mu.Unlock()
+	s.mu.Unlock()
+	if current == nil {
 		return ErrProxyNotConnected
 	}
-	s.mu.Unlock()
 	writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 	select {
@@ -302,7 +196,7 @@ func (s *Server) send(ctx context.Context, msg any) error {
 	}
 	defer func() { current.writeGate <- struct{}{} }()
 	s.mu.Lock()
-	live := s.session == current && matchesIdentity(current.peer, s.expected)
+	live := s.session == current
 	s.mu.Unlock()
 	if !live {
 		return ErrProxyNotConnected
@@ -330,67 +224,40 @@ func (s *Server) send(ctx context.Context, msg any) error {
 	return errors.Join(err, clearErr, writeCtx.Err())
 }
 
-func (s *Server) expectedMatches(peer wire.Peer) bool {
+func (s *Server) track(conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return matchesIdentity(peer, s.expected)
-}
-
-func (s *Server) trackConn(conn net.Conn) {
-	s.mu.Lock()
-	s.accepted[conn] = struct{}{}
-	s.mu.Unlock()
-}
-
-func (s *Server) untrackConn(conn net.Conn) {
-	s.mu.Lock()
-	delete(s.accepted, conn)
-	s.mu.Unlock()
-}
-
-func (s *Server) closeConnections() {
-	s.mu.Lock()
-	connections := make([]net.Conn, 0, len(s.accepted))
-	for conn := range s.accepted {
-		connections = append(connections, conn)
+	if s.closed {
+		return false
 	}
-	s.session = nil
-	s.mu.Unlock()
-	for _, conn := range connections {
-		_ = conn.Close()
-	}
+	s.live[conn] = struct{}{}
+	return true
 }
 
-func (s *Server) setConn(conn net.Conn, peer wire.Peer) bool {
+func (s *Server) untrack(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.live, conn)
+	s.mu.Unlock()
+}
+
+func (s *Server) setConn(conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !matchesIdentity(peer, s.expected) {
+	if s.closed {
 		return false
 	}
 	writeGate := make(chan struct{}, 1)
 	writeGate <- struct{}{}
-	s.session = &session{conn: conn, peer: peer, writeGate: writeGate}
+	s.session = &session{conn: conn, writeGate: writeGate}
 	return true
 }
 
-func matchesIdentity(peer wire.Peer, identity proc.Identity) bool {
-	return peer.PID == identity.PID && peer.StartTime != "" && peer.StartTime == identity.StartTime &&
-		peer.Boot != "" && peer.Boot == identity.Boot &&
-		peer.Executable != "" && peer.Executable == identity.Executable
-}
-
-// clearConn drops the connection from the write side and closes it. Safe to
-// call twice (serveConn's defer and Close): the second call sees a nil conn.
+// clearConn drops the connection from the write side. Safe to call twice
+// (Serve's defer and Close): the second call sees another or no session.
 func (s *Server) clearConn(expected net.Conn) {
 	s.mu.Lock()
-	current := s.session
-	if current != nil && (expected == nil || current.conn == expected) {
+	if s.session != nil && s.session.conn == expected {
 		s.session = nil
-	} else {
-		current = nil
 	}
 	s.mu.Unlock()
-	if current != nil {
-		_ = current.conn.Close()
-	}
 }

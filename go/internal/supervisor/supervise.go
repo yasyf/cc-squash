@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/version"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 // SuperviseInterval is the proxy supervision cadence: a crashed proxy is
@@ -55,7 +54,7 @@ func BuildSupervisor(spawn Spawner, policy Policy, myVersion string) *Supervisor
 		MyVersion:     myVersion,
 		Policy:        policy,
 		GoneWait:      goneWait,
-		SpawnBackoff:  proc.Backoff{Base: spawnBackoffBase, Cap: spawnBackoffCap},
+		SpawnBackoff:  Backoff{Base: spawnBackoffBase, Cap: spawnBackoffCap},
 		ReviveBreaker: reviveBreaker,
 	}
 	if err := sup.Validate(); err != nil {
@@ -64,10 +63,9 @@ func BuildSupervisor(spawn Spawner, policy Policy, myVersion string) *Supervisor
 	return sup
 }
 
-// SuperviseLoop drives sup.Tick on a fixed cadence until ctx is cancelled. proc
-// owns no ticker — the consumer drives the loop — so this is the proxy's
-// supervision heartbeat. The cadence is SuperviseInterval unless
-// CCS_SUPERVISE_INTERVAL shrinks it (test-only).
+// SuperviseLoop drives sup.Tick on a fixed cadence until ctx is cancelled. The
+// cadence is SuperviseInterval unless CCS_SUPERVISE_INTERVAL shrinks it
+// (test-only).
 func SuperviseLoop(ctx context.Context, sup *Supervisor) {
 	ticker := time.NewTicker(superviseInterval())
 	defer ticker.Stop()

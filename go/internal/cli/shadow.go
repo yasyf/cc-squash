@@ -24,7 +24,10 @@ request, so you can audit compaction against real traffic before trusting it.
 			if err != nil {
 				return err
 			}
-			client := control.NewClient()
+			client, err := control.NewClient()
+			if err != nil {
+				return err
+			}
 			defer client.Close()
 			resp, err := client.Shadow(cmd.Context(), on)
 			if err != nil {

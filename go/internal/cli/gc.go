@@ -14,11 +14,14 @@ func newGCCmd() *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			c := control.NewClient()
-			defer c.Close()
 			if err := ensureDaemonCurrent(cmd.Context(), proxyEnsureTimeout); err != nil {
 				return err
 			}
+			c, err := control.NewClient()
+			if err != nil {
+				return err
+			}
+			defer c.Close()
 			resp, err := c.Gc(cmd.Context())
 			if err != nil {
 				return err

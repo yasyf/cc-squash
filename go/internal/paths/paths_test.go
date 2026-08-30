@@ -7,30 +7,25 @@ import (
 
 func TestDerivedPaths(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	for name, path := range map[string]string{
-		"port":              PortFilePath(),
-		"proxy seam":        ProxySocketPath(),
-		"refs":              RefsDbPath(),
-		"status":            StatusPath(),
-		"mcp config":        MCPConfigPath(),
-		"worker processes":  WorkerProcessStorePath(),
-		"child processes":   ChildProcessStorePath(),
-		"services":          ServiceStatePath(),
-		"service processes": ServiceProcessStorePath(),
+	for name, want := range map[string]string{
+		"port":       "daemon-v1.port",
+		"refs":       "refs-v1.db",
+		"status":     "status-v1.json",
+		"mcp config": "mcp-v1.json",
+		"config":     "config.toml",
 	} {
+		path := map[string]string{
+			"port":       PortFilePath(),
+			"refs":       RefsDbPath(),
+			"status":     StatusPath(),
+			"mcp config": MCPConfigPath(),
+			"config":     ConfigPath(),
+		}[name]
 		if filepath.Dir(path) != StateDir() {
 			t.Fatalf("%s path = %q, outside %q", name, path, StateDir())
 		}
-	}
-	if filepath.Base(PortFilePath()) != "daemon-v1.port" ||
-		filepath.Base(ProxySocketPath()) != "proxy-v1.sock" ||
-		filepath.Base(RefsDbPath()) != "refs-v1.db" ||
-		filepath.Base(StatusPath()) != "status-v1.json" ||
-		filepath.Base(MCPConfigPath()) != "mcp-v1.json" ||
-		filepath.Base(WorkerProcessStorePath()) != "worker-processes-v1.db" ||
-		filepath.Base(ChildProcessStorePath()) != "child-processes-v1.db" ||
-		filepath.Base(ServiceStatePath()) != "services-v1.db" ||
-		filepath.Base(ServiceProcessStorePath()) != "service-processes-v1.db" {
-		t.Fatal("derived paths are not the exact epoch names")
+		if filepath.Base(path) != want {
+			t.Fatalf("%s path = %q, want base %q", name, path, want)
+		}
 	}
 }

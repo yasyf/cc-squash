@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	WireSchemaFingerprint = "7e33435fedbf3ee0e1f9f70910c56839a826e6b9a134f152e2144b10caa3c53f"
+	WireSchemaFingerprint = "f72603915fb9dde22235bf3ff9dec46801e4d9380c6e8ac8de1c35db505f0d54"
 	WireBuild             = "com.yasyf.cc-squash.control/" + WireSchemaFingerprint + "/v1"
 )
 
@@ -16,12 +16,11 @@ const StatusSchemaVersion = 1
 type Op string
 
 const (
-	OpRuntimeHealth Op = "cc-squash.runtime.health"
-	OpStatus        Op = "status"
-	OpMint          Op = "mint"
-	OpKill          Op = "kill"
-	OpShadow        Op = "shadow"
-	OpGc            Op = "gc"
+	OpStatus Op = "status"
+	OpMint   Op = "mint"
+	OpKill   Op = "kill"
+	OpShadow Op = "shadow"
+	OpGc     Op = "gc"
 )
 
 type EmptyRequest struct{}
@@ -30,23 +29,8 @@ type ToggleRequest struct {
 	On bool `json:"on"`
 }
 
-type RuntimeState string
-
-const (
-	RuntimeStateHealthy  RuntimeState = "healthy"
-	RuntimeStateDegraded RuntimeState = "degraded"
-	RuntimeStateFailed   RuntimeState = "failed"
-)
-
-type RuntimeHealth struct {
-	RuntimeBuild      string       `json:"runtime_build"`
-	RuntimeProtocol   int          `json:"runtime_protocol"`
-	PID               int          `json:"pid"`
-	ProcessGeneration string       `json:"process_generation"`
-	Ready             bool         `json:"ready"`
-	State             RuntimeState `json:"state"`
-	Draining          bool         `json:"draining"`
-	Busy              bool         `json:"busy"`
+type HealthDetail struct {
+	RuntimeBuild string `json:"runtime_build"`
 }
 
 type StatusSnapshot struct {
@@ -62,13 +46,12 @@ type StatusSnapshot struct {
 }
 
 type Response struct {
-	OK            bool            `json:"ok"`
-	Error         string          `json:"error,omitempty"`
-	Port          int             `json:"port,omitempty"`
-	MCPPort       int             `json:"mcp_port,omitempty"`
-	Token         string          `json:"token,omitempty"`
-	RuntimeHealth *RuntimeHealth  `json:"runtime_health,omitempty"`
-	Status        *StatusSnapshot `json:"status,omitempty"`
-	Kill          bool            `json:"kill,omitempty"`
-	Shadow        bool            `json:"shadow,omitempty"`
+	OK      bool            `json:"ok"`
+	Error   string          `json:"error,omitempty"`
+	Port    int             `json:"port,omitempty"`
+	MCPPort int             `json:"mcp_port,omitempty"`
+	Token   string          `json:"token,omitempty"`
+	Status  *StatusSnapshot `json:"status,omitempty"`
+	Kill    bool            `json:"kill,omitempty"`
+	Shadow  bool            `json:"shadow,omitempty"`
 }
