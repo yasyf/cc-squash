@@ -442,6 +442,12 @@ func (p *proxySpawner) awaitReady(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
+			// A child that registered between the last poll and the cancellation is
+			// ready: reporting it unavailable would make the caller stop a live proxy
+			// the seam is already serving, losing the graceful step-down.
+			if p.server.policy.Registered() {
+				return nil
+			}
 			return fmt.Errorf("%w: waiting for proxy: %w", supervisor.ErrChildUnavailable, ctx.Err())
 		case <-deadline.C:
 			return fmt.Errorf("%w: proxy did not register within %s", supervisor.ErrChildUnavailable, p.Timeout())

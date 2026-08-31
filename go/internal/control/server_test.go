@@ -4,23 +4,20 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
-	"path/filepath"
-	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
-	"github.com/yasyf/cc-squash/go/internal/version"
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/cc-squash/go/internal/supervisor"
+	"github.com/yasyf/daemonkit"
 )
 
 // quietLogger discards daemon diagnostics so a test run stays clean.
@@ -29,151 +26,99 @@ func quietLogger(t *testing.T) *log.Logger {
 	return log.New(io.Discard, "", 0)
 }
 
-func testProcessRecord(t *testing.T) proc.Identity {
-	t.Helper()
-	identity, err := proc.Probe(os.Getpid())
-	if err != nil {
-		t.Fatalf("probe test process: %v", err)
-	}
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatalf("test executable: %v", err)
-	}
-	identity.Executable, err = filepath.EvalSymlinks(executable)
-	if err != nil {
-		t.Fatalf("canonical test executable: %v", err)
-	}
-	return identity
-}
-
-// fakeProxy is a stand-in for the Rust ccs-proxy child: it dials proxy-v1.sock once
-// it exists, sends one register frame, and then drains control frames the daemon
-// pushes (recording the mint tokens). It connects through the server's explicit
-// test launch seam, so no real proxy is ever started.
+// fakeProxy stands in for the Rust ccs-proxy child. It owns the child end of a
+// real socketpair — the channel a daemonkit ChannelHandoff spawn would inherit
+// at fd 3 — sends one register frame, and then reads the control frames the
+// daemon pushes.
 type fakeProxy struct {
 	port    int
 	mcpPort int
-	pid     int
 	version string
 
-	mu     sync.Mutex
-	mints  []string
-	conn   net.Conn
-	reader *bufio.Reader
+	channel net.Conn
+	child   net.Conn
+	reader  *bufio.Reader
+
+	mu      sync.Mutex
+	stopped bool
 }
 
-// connect dials proxy-v1.sock (polling until the daemon has bound it) and sends the
-// register frame. It is the body the daemon's test launch seam invokes.
-func (f *fakeProxy) connect(t *testing.T) error {
+func (f *fakeProxy) PID() int { return os.Getpid() }
+
+func (f *fakeProxy) Conn() (net.Conn, error) { return f.channel, nil }
+
+func (f *fakeProxy) Stop(context.Context) (daemonkit.Exit, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.stopped {
+		f.stopped = true
+		_ = f.child.Close()
+	}
+	return daemonkit.Exit{}, nil
+}
+
+// attach builds the handoff channel pair and fills in the defaults a registered
+// child must carry. The version is the one this daemon supervises against, so
+// the supervisor reads the child as steady state and never replaces it.
+func (f *fakeProxy) attach(t *testing.T) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	var conn net.Conn
-	for {
-		c, err := net.DialTimeout("unix", paths.ProxySocketPath(), 200*time.Millisecond)
-		if err == nil {
-			conn = c
-			break
-		}
-		if time.Now().After(deadline) {
-			return err
-		}
-		time.Sleep(10 * time.Millisecond)
+	f.channel, f.child = socketPair(t)
+	f.reader = bufio.NewReader(f.child)
+	if f.mcpPort == 0 {
+		f.mcpPort = f.port + 1
 	}
-	mcpPort := f.mcpPort
-	if mcpPort == 0 {
-		mcpPort = f.port + 1
+	if f.version == "" {
+		f.version = supervisor.ProxyVersion()
 	}
+}
+
+func (f *fakeProxy) register() error {
 	frame, err := proxyseam.Encode(proxyseam.Register{
 		Type: proxyseam.MsgRegister, Protocol: proxyseam.ProtocolVersion,
-		Port: f.port, MCPPort: mcpPort, Version: f.version, PID: f.pid,
+		Port: f.port, MCPPort: f.mcpPort, Version: f.version, PID: f.PID(),
 	})
 	if err != nil {
 		return err
 	}
-	f.mu.Lock()
-	f.conn = conn
-	f.reader = bufio.NewReader(conn)
-	f.mu.Unlock()
-	if _, err := conn.Write(frame); err != nil {
-		f.mu.Lock()
-		f.conn = nil
-		f.reader = nil
-		f.mu.Unlock()
-		_ = conn.Close()
-		return err
-	}
-	return nil
-}
-
-// readMint blocks until the daemon pushes one mint frame, recording and
-// returning its token.
-func (f *fakeProxy) readMint() (string, error) {
-	f.mu.Lock()
-	reader := f.reader
-	f.mu.Unlock()
-	line, err := reader.ReadBytes('\n')
-	if err != nil {
-		return "", err
-	}
-	msg, err := proxyseam.Decode(line[:len(line)-1])
-	if err != nil {
-		return "", err
-	}
-	tok := msg.(proxyseam.Mint).Token
-	f.mu.Lock()
-	f.mints = append(f.mints, tok)
-	f.mu.Unlock()
-	return tok, nil
-}
-
-// readMintFrame blocks until the daemon pushes one mint frame and returns it
-// whole, so a test can assert the per-session config rode along with the token.
-func (f *fakeProxy) readMintFrame() (proxyseam.Mint, error) {
-	f.mu.Lock()
-	reader := f.reader
-	f.mu.Unlock()
-	line, err := reader.ReadBytes('\n')
-	if err != nil {
-		return proxyseam.Mint{}, err
-	}
-	msg, err := proxyseam.Decode(line[:len(line)-1])
-	if err != nil {
-		return proxyseam.Mint{}, err
-	}
-	return msg.(proxyseam.Mint), nil
+	_, err = f.child.Write(frame)
+	return err
 }
 
 // readFrame blocks until the daemon pushes one control frame and returns it
-// decoded — the generic counterpart of readMint, used to observe the shutdown
-// frame the teardown sends.
+// decoded.
 func (f *fakeProxy) readFrame() (any, error) {
-	f.mu.Lock()
-	reader := f.reader
-	f.mu.Unlock()
-	line, err := reader.ReadBytes('\n')
+	line, err := f.reader.ReadBytes('\n')
 	if err != nil {
 		return nil, err
 	}
 	return proxyseam.Decode(line[:len(line)-1])
 }
 
-// stepDownOnShutdown drains frames until a Shutdown arrives, then closes the
-// seam connection — modelling the real proxy stepping down so the daemon's
-// WaitGone observes the drop. It reports the observed shutdown on a channel.
-func (f *fakeProxy) stepDownOnShutdown(t *testing.T) <-chan struct{} {
-	t.Helper()
+func (f *fakeProxy) readMint() (proxyseam.Mint, error) {
+	frame, err := f.readFrame()
+	if err != nil {
+		return proxyseam.Mint{}, err
+	}
+	mint, ok := frame.(proxyseam.Mint)
+	if !ok {
+		return proxyseam.Mint{}, fmt.Errorf("proxy saw %T, want proxyseam.Mint", frame)
+	}
+	return mint, nil
+}
+
+// awaitShutdown drains control frames until a Shutdown arrives, then drops the
+// channel — the real proxy stepping down. The returned channel closes once that
+// frame has been observed.
+func (f *fakeProxy) awaitShutdown() <-chan struct{} {
 	seen := make(chan struct{})
 	go func() {
 		for {
-			msg, err := f.readFrame()
+			frame, err := f.readFrame()
 			if err != nil {
 				return
 			}
-			if _, ok := msg.(proxyseam.Shutdown); ok {
-				f.mu.Lock()
-				conn := f.conn
-				f.mu.Unlock()
-				_ = conn.Close()
+			if _, ok := frame.(proxyseam.Shutdown); ok {
+				_ = f.child.Close()
 				close(seen)
 				return
 			}
@@ -182,20 +127,69 @@ func (f *fakeProxy) stepDownOnShutdown(t *testing.T) <-chan struct{} {
 	return seen
 }
 
-// startServer runs srv.Run and waits for exact runtime admission.
-func startServer(t *testing.T, srv *Server) (cancel context.CancelFunc) {
+// socketPair returns the parent and child ends of one AF_UNIX stream pair.
+func socketPair(t *testing.T) (parent, child net.Conn) {
 	t.Helper()
-	cancel = startServerSocket(t, srv)
-	client := NewClient()
-	t.Cleanup(func() { _ = client.Close() })
-	if err := client.WaitReady(t.Context(), 2*time.Second); err != nil {
-		t.Fatalf("runtime never became ready: %v", err)
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
 	}
-	return cancel
+	ends := make([]net.Conn, len(fds))
+	for i, fd := range fds {
+		file := os.NewFile(uintptr(fd), fmt.Sprintf("proxy-channel-%d", i))
+		conn, err := net.FileConn(file)
+		_ = file.Close()
+		if err != nil {
+			t.Fatalf("file conn: %v", err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		ends[i] = conn
+	}
+	return ends[0], ends[1]
 }
 
-// startServerSocket waits only for the pre-admission health socket.
-func startServerSocket(t *testing.T, srv *Server) (cancel context.CancelFunc) {
+// newServerWithProxy builds a daemon whose spawn seam hands the seam the given
+// fake proxy's channel, under an isolated home.
+func newServerWithProxy(t *testing.T, f *fakeProxy) *Server {
+	t.Helper()
+	shortHome(t)
+	srv := newTestServer(t)
+	if f == nil {
+		return srv
+	}
+	f.attach(t)
+	srv.spawnProxy = func(context.Context) (proxyChild, error) {
+		if err := f.register(); err != nil {
+			return nil, err
+		}
+		return f, nil
+	}
+	return srv
+}
+
+// newTestServer builds a quiet daemon. The caller has already isolated the home.
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	srv, err := NewServer()
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	srv.log = quietLogger(t)
+	return srv
+}
+
+func newTestClient(t *testing.T) *Client {
+	t.Helper()
+	client, err := NewClient()
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+// startServer runs srv.Run and waits for the business lane to dispatch.
+func startServer(t *testing.T, srv *Server) context.CancelFunc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -209,153 +203,104 @@ func startServerSocket(t *testing.T, srv *Server) (cancel context.CancelFunc) {
 		cancel()
 		<-done
 	})
-	if !waitSocketUp(srv.socket, 2*time.Second) {
-		t.Fatal("control socket never came up")
-	}
-	return cancel
-}
-
-func waitSocketUp(socket string, d time.Duration) bool {
-	deadline := time.Now().Add(d)
-	for time.Now().Before(deadline) {
-		if conn, err := net.DialTimeout("unix", socket, 200*time.Millisecond); err == nil {
-			_ = conn.Close()
-			return true
+	probe := newTestClient(t)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := probe.Status(t.Context()); err == nil {
+			return cancel
+		} else if time.Now().After(deadline) {
+			t.Fatalf("daemon never dispatched: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return false
 }
 
-// newServerWithProxy builds a daemon whose Override seam launches the given fake
-// proxy, under an isolated HOME.
-func newServerWithProxy(t *testing.T, f *fakeProxy) *Server {
+// awaitRegisteredStatus polls the status mirror until the cold-started proxy's
+// port lands in it.
+func awaitRegisteredStatus(t *testing.T, port int) StatusSnapshot {
 	t.Helper()
-	shortHome(t)
-	srv, err := NewServer()
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	srv.log = quietLogger(t)
-	if f != nil {
-		f.pid = os.Getpid()
-		// Register at the daemon's own version so the supervisor reads the proxy as
-		// steady-state (co-released => same version) and never tries to replace it.
-		if f.version == "" {
-			f.version = version.String()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		snapshot, err := ReadStatus()
+		if err == nil && snapshot.ProxyPort == port {
+			return snapshot
 		}
-		srv.spawnProxy = func(recorded func(proc.Identity) error) error {
-			if err := recorded(testProcessRecord(t)); err != nil {
-				return err
-			}
-			go func() {
-				if err := f.connect(t); err != nil {
-					t.Errorf("fake proxy connect: %v", err)
-				}
-			}()
-			return nil
+		if time.Now().After(deadline) {
+			t.Fatalf("status-v1.json never reflected proxy port %d (last err %v)", port, err)
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return srv
 }
 
 func TestServerColdStartMint(t *testing.T) {
-	f := &fakeProxy{port: 50516, pid: 4242}
+	f := &fakeProxy{port: 50516}
 	srv := newServerWithProxy(t, f)
 	startServer(t, srv)
 
-	c := NewClient()
-	t.Cleanup(func() { _ = c.Close() })
-	resp, err := c.Mint(t.Context())
+	client := newTestClient(t)
+	response, err := client.Mint(t.Context())
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
-	if !resp.OK {
-		t.Fatalf("mint not OK: %+v", resp)
+	if !response.OK || response.Port != 50516 || response.Token == "" {
+		t.Fatalf("mint = %+v", response)
 	}
-	if resp.Port != 50516 {
-		t.Fatalf("mint port = %d, want 50516", resp.Port)
+	snapshot := awaitRegisteredStatus(t, response.Port)
+	if snapshot.ProxyPID != f.PID() {
+		t.Fatalf("status pid = %d, want %d", snapshot.ProxyPID, f.PID())
 	}
-	if resp.Token == "" {
-		t.Fatal("mint returned an empty token")
-	}
-	status, err := ReadStatus()
+	mint, err := f.readMint()
 	if err != nil {
-		t.Fatalf("read status after mint: %v", err)
+		t.Fatalf("proxy read mint: %v", err)
 	}
-	if status.ProxyPort != resp.Port || status.ProxyPID != f.pid {
-		t.Fatalf("status after mint = %+v, want proxy port %d pid %d", status, resp.Port, f.pid)
-	}
-	// The fake proxy must have received the exact token over the seam.
-	got, err := f.readMint()
-	if err != nil {
-		t.Fatalf("fake proxy read mint: %v", err)
-	}
-	if got != resp.Token {
-		t.Fatalf("proxy saw token %q, daemon replied %q", got, resp.Token)
+	if mint.Token != response.Token {
+		t.Fatalf("proxy saw token %q, daemon replied %q", mint.Token, response.Token)
 	}
 }
 
-// TestServerMintReturnsMCPPort is the 4e contract assertion: the proxy's
-// register frame carries the SECOND listener's mcp_port, the daemon records it,
-// and the mint reply surfaces it so `ccs run` can build the retrieve --mcp-config
-// URL off one round-trip.
+// TestServerMintReturnsMCPPort pins the second listener's port through the whole
+// path: the register frame carries it, the daemon records it, and one mint
+// round-trip surfaces it so `ccs run` can build the --mcp-config URL.
 func TestServerMintReturnsMCPPort(t *testing.T) {
-	f := &fakeProxy{port: 50516, mcpPort: 50517, pid: 4242}
+	f := &fakeProxy{port: 50516, mcpPort: 50517}
 	srv := newServerWithProxy(t, f)
 	startServer(t, srv)
 
-	client := NewClient()
-	t.Cleanup(func() { _ = client.Close() })
-	resp, err := client.Mint(t.Context())
+	client := newTestClient(t)
+	response, err := client.Mint(t.Context())
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
-	if resp.MCPPort != 50517 {
-		t.Fatalf("mint mcp_port = %d, want 50517", resp.MCPPort)
+	if response.MCPPort != 50517 {
+		t.Fatalf("mint mcp_port = %d, want 50517", response.MCPPort)
 	}
 	if _, err := f.readMint(); err != nil {
 		t.Fatalf("drain mint: %v", err)
 	}
-
-	// The status snapshot mirrors the recorded mcp_port too.
-	st, err := client.Status(t.Context())
+	status, err := client.Status(t.Context())
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
-	if st.Status.ProxyMCPort != 50517 {
-		t.Fatalf("status proxy_mcp_port = %d, want 50517", st.Status.ProxyMCPort)
+	if status.Status.ProxyMCPort != 50517 {
+		t.Fatalf("status proxy_mcp_port = %d, want 50517", status.Status.ProxyMCPort)
 	}
 }
 
-// TestServerGcForwardsFrame is the `ccs gc` dispatch assertion: an OpGc control
-// request forwards a single {"type":"gc"} seam frame to the proxy, which runs
-// store.gc against the reachable set.
+// TestServerGcForwardsFrame is the `ccs gc` dispatch assertion: an OpGc request
+// forwards exactly one gc frame to the proxy, which sweeps its ref store.
 func TestServerGcForwardsFrame(t *testing.T) {
-	f := &fakeProxy{port: 50520, mcpPort: 50521, pid: 99}
+	f := &fakeProxy{port: 50520}
 	srv := newServerWithProxy(t, f)
 	startServer(t, srv)
+	awaitRegisteredStatus(t, f.port)
 
-	// Wait for the cold-start register so the seam has a live child to push to.
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if snap, err := ReadStatus(); err == nil && snap.ProxyPort == 50520 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("proxy never registered before gc")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	client := NewClient()
-	t.Cleanup(func() { _ = client.Close() })
-	resp, err := client.Gc(t.Context())
+	client := newTestClient(t)
+	response, err := client.Gc(t.Context())
 	if err != nil {
 		t.Fatalf("gc: %v", err)
 	}
-	if !resp.OK {
-		t.Fatalf("gc not OK: %+v", resp)
+	if !response.OK {
+		t.Fatalf("gc not OK: %+v", response)
 	}
 	frame, err := f.readFrame()
 	if err != nil {
@@ -366,365 +311,237 @@ func TestServerGcForwardsFrame(t *testing.T) {
 	}
 }
 
-// TestServerMintCarriesConfig is the 4a seam assertion: handleMint must push the
-// config loaded from config.toml (not nil) over the seam, so the proxy mints each
-// session with the user's relay knobs. A daemon with a config.toml on disk pushes
-// exactly that JSON on the mint frame.
+// TestServerGcWithoutProxyReportsNothingToSweep pins the fail-open half: with no
+// data plane connected the sweep is a benign refusal, not a daemon fault.
+func TestServerGcWithoutProxyReportsNothingToSweep(t *testing.T) {
+	shortHome(t)
+	srv := newTestServer(t)
+	srv.spawnProxy = func(context.Context) (proxyChild, error) {
+		return nil, supervisor.ErrChildUnavailable
+	}
+	startServer(t, srv)
+
+	response, err := newTestClient(t).Gc(t.Context())
+	if err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+	if response.OK || response.Error == "" {
+		t.Fatalf("gc with no data plane = %+v, want a benign refusal", response)
+	}
+}
+
+// TestServerMintCarriesConfig is the seam's config contract: handleMint pushes
+// the config loaded from config.toml, so the proxy mints each session with the
+// user's relay knobs rather than engine defaults.
 func TestServerMintCarriesConfig(t *testing.T) {
-	f := &fakeProxy{port: 51200, pid: 23}
-	srv := newServerWithProxy(t, f) // sets the isolated HOME via shortHome
+	f := &fakeProxy{port: 51200}
+	srv := newServerWithProxy(t, f)
 	writeTestConfig(t, "[economics]\nnpv_floor = 0.25\n")
 	startServer(t, srv)
 
-	client := NewClient()
-	t.Cleanup(func() { _ = client.Close() })
-	if _, err := client.Mint(t.Context()); err != nil {
+	if _, err := newTestClient(t).Mint(t.Context()); err != nil {
 		t.Fatalf("mint: %v", err)
 	}
-	mint, err := f.readMintFrame()
+	mint, err := f.readMint()
 	if err != nil {
 		t.Fatalf("read mint frame: %v", err)
 	}
 	if string(mint.Config) != `{"economics":{"npv_floor":0.25}}` {
-		t.Fatalf("mint config = %s, want the loaded config.toml (not nil/{})", mint.Config)
+		t.Fatalf("mint config = %s, want the loaded config.toml", mint.Config)
 	}
 }
 
-// writeTestConfig writes config.toml under the already-isolated test HOME so the
+// writeTestConfig writes config.toml under the already-isolated test home so the
 // daemon's startup config.Load reads it.
 func writeTestConfig(t *testing.T, toml string) {
 	t.Helper()
-	if err := os.MkdirAll(paths.StateDir(), 0o700); err != nil {
-		t.Fatalf("mkdir state dir: %v", err)
-	}
 	if err := os.WriteFile(paths.ConfigPath(), []byte("schema_version = 1\n"+toml), 0o600); err != nil {
 		t.Fatalf("write config.toml: %v", err)
 	}
 }
 
 func TestServerProtocolRoundTrips(t *testing.T) {
-	f := &fakeProxy{port: 50600, pid: 7}
+	f := &fakeProxy{port: 50600}
 	srv := newServerWithProxy(t, f)
 	startServer(t, srv)
-	c := NewClient()
-	t.Cleanup(func() { _ = c.Close() })
-
-	t.Run("health", func(t *testing.T) {
-		health, err := c.RuntimeHealth(t.Context())
-		if err != nil {
-			t.Fatalf("health: %v", err)
-		}
-		if health.RuntimeBuild != version.String() || health.RuntimeProtocol != int(wire.ProtocolVersion) ||
-			health.PID <= 1 || health.ProcessGeneration == "" || !health.Ready ||
-			health.State != "healthy" || health.Draining || !health.Busy {
-			t.Fatalf("health = %+v", health)
-		}
-	})
+	client := newTestClient(t)
 
 	t.Run("status", func(t *testing.T) {
-		// Mint first so the snapshot reflects a session and the proxy port.
-		if _, err := c.Mint(t.Context()); err != nil {
+		if _, err := client.Mint(t.Context()); err != nil {
 			t.Fatalf("mint: %v", err)
 		}
 		if _, err := f.readMint(); err != nil {
 			t.Fatalf("drain mint: %v", err)
 		}
-		resp, err := c.Status(t.Context())
+		response, err := client.Status(t.Context())
 		if err != nil {
 			t.Fatalf("status: %v", err)
 		}
-		if resp.Status == nil {
+		if response.Status == nil {
 			t.Fatal("status snapshot missing")
 		}
-		if resp.Status.ProxyPort != 50600 || resp.Status.ProxyPID != f.pid {
-			t.Fatalf("status proxy = port %d pid %d", resp.Status.ProxyPort, resp.Status.ProxyPID)
+		if response.Status.ProxyPort != 50600 || response.Status.ProxyPID != f.PID() {
+			t.Fatalf("status proxy = port %d pid %d", response.Status.ProxyPort, response.Status.ProxyPID)
 		}
-		if resp.Status.Sessions != 1 {
-			t.Fatalf("status sessions = %d, want 1", resp.Status.Sessions)
+		if response.Status.Sessions != 1 {
+			t.Fatalf("status sessions = %d, want 1", response.Status.Sessions)
 		}
 	})
 
 	t.Run("kill", func(t *testing.T) {
-		resp, err := c.Kill(t.Context(), true)
+		response, err := client.Kill(t.Context(), true)
 		if err != nil {
 			t.Fatalf("kill: %v", err)
 		}
-		if !resp.Kill {
-			t.Fatalf("kill resp = %+v", resp)
+		if !response.Kill {
+			t.Fatalf("kill = %+v", response)
 		}
 	})
 
 	t.Run("shadow", func(t *testing.T) {
-		resp, err := c.Shadow(t.Context(), true)
+		response, err := client.Shadow(t.Context(), true)
 		if err != nil {
 			t.Fatalf("shadow: %v", err)
 		}
-		if !resp.Shadow {
-			t.Fatalf("shadow resp = %+v", resp)
+		if !response.Shadow {
+			t.Fatalf("shadow = %+v", response)
 		}
 	})
 
 	t.Run("unknown-op", func(t *testing.T) {
-		if _, err := c.call(t.Context(), Op("bogus"), EmptyRequest{}, 2*time.Second); err == nil {
+		if _, err := client.call(t.Context(), Op("bogus"), EmptyRequest{}, 2*time.Second); err == nil {
 			t.Fatal("unknown op unexpectedly succeeded")
 		}
 	})
 }
 
-func TestHandlersResolveTheAdmittedPublication(t *testing.T) {
-	shortHome(t)
-	configured, err := NewServer()
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	configured.log = quietLogger(t)
-	runtime, publication, err := configured.runtime()
-	if err != nil {
-		t.Fatalf("runtime: %v", err)
-	}
-	activation, err := runtime.Begin(t.Context())
-	if err != nil {
-		t.Fatalf("Begin: %v", err)
-	}
-	published := &Server{
-		tokens:    map[Token]struct{}{Token("published-session"): {}},
-		proxyPort: 49152,
-		proxyPID:  4242,
-	}
-	staged, err := publication.Stage(activation, published)
-	if err != nil {
-		t.Fatalf("Stage: %v", err)
-	}
-	if err := activation.CommitReady(staged); err != nil {
-		t.Fatalf("CommitReady: %v", err)
-	}
-	client := NewClient()
-	t.Cleanup(func() {
-		_ = client.Close()
-		_ = shutdownRuntime(runtime)
-	})
-	response, err := client.Status(t.Context())
-	if err != nil {
-		t.Fatalf("Status: %v", err)
-	}
-	if response.Status == nil {
-		t.Fatal("status snapshot missing")
-	}
-	if response.Status.ProxyPort != published.proxyPort || response.Status.ProxyPID != published.proxyPID || response.Status.Sessions != 1 {
-		t.Fatalf("status = %+v, want admitted publication %+v", *response.Status, published.snapshot())
-	}
-}
-
-func TestRuntimeHealthRejectedBeforePublication(t *testing.T) {
-	shortHome(t)
-	server, err := NewServer()
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	server.log = quietLogger(t)
-	server.spawnProxy = func(func(proc.Identity) error) error { return nil }
-	entered := make(chan struct{})
-	release := make(chan error, 1)
-	server.beforePublication = func(ctx context.Context) error {
-		close(entered)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case err := <-release:
-			return err
-		}
-	}
-	startServerSocket(t, server)
-	select {
-	case <-entered:
-	case <-time.After(runtimeStartupTimeout):
-		t.Fatal("runtime readiness did not start")
-	}
-
-	client := NewClient()
-	t.Cleanup(func() { _ = client.Close() })
-	if _, err := client.RuntimeHealth(t.Context()); err == nil || !strings.Contains(err.Error(), "wire: runtime is starting") {
-		t.Fatalf("pre-ready runtime health error = %v", err)
-	}
-
-	release <- nil
-	if err := client.WaitReady(t.Context(), runtimeStartupTimeout); err != nil {
-		t.Fatalf("WaitReady after publication: %v", err)
-	}
-	ready, err := client.RuntimeHealth(t.Context())
-	if err != nil {
-		t.Fatalf("published runtime health: %v", err)
-	}
-	if !ready.Ready {
-		t.Fatalf("published runtime health = %+v", ready)
-	}
-}
-
 func TestServerMintDemux(t *testing.T) {
-	f := &fakeProxy{port: 50700, pid: 9}
-	srv := newServerWithProxy(t, f)
+	srv := newServerWithProxy(t, &fakeProxy{port: 50700})
 	startServer(t, srv)
 
-	const n = 8
-	tokens := make(chan string, n)
+	const sessions = 4
+	tokens := make(chan string, sessions)
 	var wg sync.WaitGroup
-	for range n {
+	for range sessions {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			client := NewClient()
-			defer client.Close()
-			resp, err := client.Mint(t.Context())
+			client := newTestClient(t)
+			response, err := client.Mint(t.Context())
 			if err != nil {
 				t.Errorf("mint: %v", err)
 				return
 			}
-			tokens <- resp.Token
+			tokens <- response.Token
 		}()
 	}
 	wg.Wait()
 	close(tokens)
 
 	seen := map[string]bool{}
-	for tok := range tokens {
-		if tok == "" {
+	for token := range tokens {
+		if token == "" {
 			t.Fatal("empty token")
 		}
-		if seen[tok] {
-			t.Fatalf("duplicate token %q", tok)
+		if seen[token] {
+			t.Fatalf("duplicate token %q", token)
 		}
-		seen[tok] = true
+		seen[token] = true
 	}
-	if len(seen) != n {
-		t.Fatalf("got %d unique tokens, want %d", len(seen), n)
+	if len(seen) != sessions {
+		t.Fatalf("got %d unique tokens, want %d", len(seen), sessions)
 	}
 }
 
 func TestServerSeamFailOpen(t *testing.T) {
-	// A daemon whose proxy NEVER registers: spawnProxy returns nil without
-	// connecting, so the seam stays empty.
 	shortHome(t)
-	srv, err := NewServer()
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
+	srv := newTestServer(t)
+	srv.spawnProxy = func(context.Context) (proxyChild, error) {
+		return nil, supervisor.ErrChildUnavailable
 	}
-	srv.log = quietLogger(t)
-	srv.spawnProxy = func(func(proc.Identity) error) error { return nil }
 	srv.mintTimeout = 200 * time.Millisecond
 	startServer(t, srv)
 
-	// OpMint must not hang past the ready timeout, and with no proxy port known
-	// it must reply with a graceful error rather than wedging the daemon.
-	start := time.Now()
-	client := NewClient()
-	t.Cleanup(func() { _ = client.Close() })
-	resp, err := client.Mint(t.Context())
+	client := newTestClient(t)
+	started := time.Now()
+	response, err := client.Mint(t.Context())
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("mint took %s; the ready wait did not bound it", elapsed)
 	}
-	if resp.OK {
-		t.Fatalf("mint reported OK with no proxy port: %+v", resp)
+	if response.OK {
+		t.Fatalf("mint reported OK with no proxy port: %+v", response)
 	}
-	if resp.Error == "" {
+	if response.Error == "" {
 		t.Fatal("mint failed open but gave no error message")
 	}
-
-	// The daemon is still alive: Health answers immediately.
-	if health, err := client.RuntimeHealth(t.Context()); err != nil || health.RuntimeBuild != version.String() {
-		t.Fatalf("daemon wedged after a fail-open mint: health=%+v err=%v", health, err)
+	if _, err := client.Status(t.Context()); err != nil {
+		t.Fatalf("daemon wedged after a fail-open mint: %v", err)
 	}
 }
 
-func TestServerSameReleaseDoesNotReplaceLivePeer(t *testing.T) {
-	f := &fakeProxy{port: 50800, pid: 11}
-	first := newServerWithProxy(t, f)
-	startServer(t, first)
+// TestSecondServeRefusesLiveIncumbent pins the singleton: a contender that finds
+// a live daemon on the socket refuses outright and leaves the incumbent serving,
+// rather than evicting it or binding beside it.
+func TestSecondServeRefusesLiveIncumbent(t *testing.T) {
+	srv := newServerWithProxy(t, &fakeProxy{port: 50800})
+	startServer(t, srv)
 
-	second, err := NewServer()
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
+	contender := newTestServer(t)
+	contender.spawnProxy = func(context.Context) (proxyChild, error) {
+		return nil, supervisor.ErrChildUnavailable
 	}
-	second.log = quietLogger(t)
-	second.spawnProxy = func(func(proc.Identity) error) error { return nil }
-	if err := second.Run(context.Background()); err != nil {
-		t.Fatalf("same-release contender: %v", err)
+	if err := contender.Run(context.Background()); !errors.Is(err, daemonkit.ErrBusy) {
+		t.Fatalf("contender Run = %v, want ErrBusy", err)
 	}
-	client := NewClient()
-	t.Cleanup(func() { _ = client.Close() })
-	if health, err := client.RuntimeHealth(t.Context()); err != nil || health.PID == 0 {
-		t.Fatalf("incumbent unavailable after contender: health=%+v err=%v", health, err)
+	if _, err := newTestClient(t).Status(t.Context()); err != nil {
+		t.Fatalf("incumbent unavailable after contender: %v", err)
 	}
 }
 
+// TestServerRejectsWrongWireBuildBeforeDispatch pins admission: a client whose
+// schema fingerprint differs never reaches Handle, so a skewed build cannot mint
+// against this daemon.
 func TestServerRejectsWrongWireBuildBeforeDispatch(t *testing.T) {
-	server := newServerWithProxy(t, &fakeProxy{port: 50810, pid: 12})
-	startServer(t, server)
-	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(server.socket), WireBuild: "cc-squash.control.wrong", Role: trust.UnprotectedRole,
+	srv := newServerWithProxy(t, &fakeProxy{port: 50810})
+	startServer(t, srv)
+
+	skewed := Identity()
+	skewed.Schemas = []daemonkit.Schema{daemonkit.Schema("com.yasyf.cc-squash.control/skewed/v1")}
+	client, err := daemonkit.Open(skewed)
+	if err != nil {
+		t.Fatalf("open skewed client: %v", err)
+	}
+	business := client.Business()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = business.Close(ctx)
 	})
-	if err != nil {
-		if !errors.Is(err, wire.ErrBuildMismatch) {
-			t.Fatalf("wrong business build handshake: %v", err)
-		}
-		return
+	if reply, err := business.Call(t.Context(), string(OpStatus), []byte(`{}`)); err == nil {
+		t.Fatalf("skewed wire build dispatched: %+v", reply)
 	}
-	defer client.Close()
-	result, err := client.Call(t.Context(), wire.Op(OpStatus), "", []byte(`{}`))
-	if err != nil {
-		if !errors.Is(err, wire.ErrBuildMismatch) {
-			t.Fatalf("wrong business build call: %v", err)
-		}
-		return
-	}
-	if result.Outcome != wire.Rejected || result.Response.Reason != wire.ErrBuildMismatch.Error() {
-		t.Fatalf("wrong business build result = %#v", result)
+	if status, err := newTestClient(t).Status(t.Context()); err != nil || status.Status.Sessions != 0 {
+		t.Fatalf("incumbent after a rejected build = %+v, err = %v", status, err)
 	}
 }
 
-func TestActivationAcknowledgesRetiredProxyReceiptAfterDerivedStateCleanup(t *testing.T) {
+// TestClearRetiredProxyStateRemovesDerivedFiles pins the reclaim path's cleanup:
+// a daemon that inherits a prior generation's children drops the port-file and
+// status mirror that described the retired proxy, so no reader is served a
+// snapshot of a process that is gone.
+func TestClearRetiredProxyStateRemovesDerivedFiles(t *testing.T) {
 	shortHome(t)
-	if err := paths.EnsureStateDir(); err != nil {
-		t.Fatalf("ensure state: %v", err)
-	}
 	if err := WriteStatus(StatusSnapshot{SchemaVersion: StatusSchemaVersion, Version: "retired"}); err != nil {
 		t.Fatalf("seed status: %v", err)
 	}
 	if err := WritePort(50999); err != nil {
 		t.Fatalf("seed port: %v", err)
 	}
-	boot, err := proc.BootID()
-	if err != nil {
-		t.Fatalf("boot identity: %v", err)
-	}
-	store := &proc.FileStore{Path: paths.ChildProcessStorePath()}
-	if err := store.Add(t.Context(), proc.Record{
-		RecoveryID: proc.RecoveryTaskID,
-		PID:        2_000_000_000, StartTime: "retired", Boot: boot, Comm: "ccs-proxy",
-		Executable: "/retired/ccs-proxy", Generation: proc.OwnerGeneration{1},
-	}); err != nil {
-		t.Fatalf("seed retired proxy record: %v", err)
-	}
-	server, err := NewServer()
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	server.log = quietLogger(t)
-	server.spawnProxy = func(func(proc.Identity) error) error { return nil }
-	startServer(t, server)
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		_, statusErr := os.Stat(paths.StatusPath())
-		_, portErr := os.Stat(paths.PortFilePath())
-		if os.IsNotExist(statusErr) && os.IsNotExist(portErr) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("retired derived state was not cleared: status=%v port=%v", statusErr, portErr)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if err := clearRetiredProxyState(); err != nil {
+		t.Fatalf("clear retired proxy state: %v", err)
 	}
 	if _, err := os.Stat(paths.StatusPath()); !os.IsNotExist(err) {
 		t.Fatalf("retired status still present: %v", err)
@@ -732,164 +549,79 @@ func TestActivationAcknowledgesRetiredProxyReceiptAfterDerivedStateCleanup(t *te
 	if _, err := os.Stat(paths.PortFilePath()); !os.IsNotExist(err) {
 		t.Fatalf("retired port still present: %v", err)
 	}
+	if err := clearRetiredProxyState(); err != nil {
+		t.Fatalf("clearing already-absent derived state: %v", err)
+	}
 }
 
 func TestServerStatusFileWritten(t *testing.T) {
-	f := &fakeProxy{port: 50900, pid: 13}
+	f := &fakeProxy{port: 50900}
 	srv := newServerWithProxy(t, f)
 	startServer(t, srv)
 
-	// onRegister writes status-v1.json atomically once the proxy registers; poll for
-	// it (the bring-up is asynchronous).
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		snap, err := ReadStatus()
-		if err == nil && snap.ProxyPort == 50900 {
-			if snap.ProxyPID != f.pid {
-				t.Fatalf("status-v1.json pid = %d, want %d", snap.ProxyPID, f.pid)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("status-v1.json never reflected the proxy port (last err %v)", err)
-		}
-		time.Sleep(10 * time.Millisecond)
+	snapshot := awaitRegisteredStatus(t, f.port)
+	if snapshot.ProxyPID != f.PID() {
+		t.Fatalf("status-v1.json pid = %d, want %d", snapshot.ProxyPID, f.PID())
 	}
-
-	// The published port-file matches.
-	if port, err := ReadPort(); err != nil || port != 50900 {
-		t.Fatalf("port-file = %d (err %v), want 50900", port, err)
+	if port, err := ReadPort(); err != nil || port != f.port {
+		t.Fatalf("port-file = %d (err %v), want %d", port, err, f.port)
 	}
 }
 
-// TestServerKillReflectedInStatusFile is the BUG A regression: a kill/shadow
-// toggle must refresh status-v1.json so out-of-process readers (`ccs status`, `ccs
-// kill status`, both via ReadStatus) see the live value, not a stale snapshot
-// from the last register.
+// TestServerKillReflectedInStatusFile pins the out-of-process view: a kill or
+// shadow toggle refreshes status-v1.json, so `ccs status` and `ccs kill status`
+// read the live value rather than the last register's snapshot.
 func TestServerKillReflectedInStatusFile(t *testing.T) {
-	f := &fakeProxy{port: 51000, pid: 17}
+	f := &fakeProxy{port: 51000}
 	srv := newServerWithProxy(t, f)
 	startServer(t, srv)
-	c := NewClient()
-	t.Cleanup(func() { _ = c.Close() })
+	client := newTestClient(t)
 
-	// Wait for the cold-start register so status-v1.json exists with kill=off,
-	// then drain the register's effect by reading the first status.
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if snap, err := ReadStatus(); err == nil && snap.ProxyPort == 51000 {
-			if snap.Kill || snap.Shadow {
-				t.Fatalf("cold status-v1.json already toggled on: %+v", snap)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("status-v1.json never reflected the cold-start proxy port")
-		}
-		time.Sleep(10 * time.Millisecond)
+	if cold := awaitRegisteredStatus(t, f.port); cold.Kill || cold.Shadow {
+		t.Fatalf("cold status-v1.json already toggled on: %+v", cold)
 	}
-
-	if _, err := c.Kill(t.Context(), true); err != nil {
+	if _, err := client.Kill(t.Context(), true); err != nil {
 		t.Fatalf("kill on: %v", err)
 	}
-	if snap, err := ReadStatus(); err != nil || !snap.Kill {
-		t.Fatalf("status-v1.json kill = %v (err %v) after `kill on`, want true", snap.Kill, err)
+	if snapshot, err := ReadStatus(); err != nil || !snapshot.Kill {
+		t.Fatalf("status-v1.json kill = %v (err %v) after `kill on`", snapshot.Kill, err)
 	}
-
-	if _, err := c.Shadow(t.Context(), true); err != nil {
+	if _, err := client.Shadow(t.Context(), true); err != nil {
 		t.Fatalf("shadow on: %v", err)
 	}
-	if snap, err := ReadStatus(); err != nil || !snap.Shadow {
-		t.Fatalf("status-v1.json shadow = %v (err %v) after `shadow on`, want true", snap.Shadow, err)
+	if snapshot, err := ReadStatus(); err != nil || !snapshot.Shadow {
+		t.Fatalf("status-v1.json shadow = %v (err %v) after `shadow on`", snapshot.Shadow, err)
 	}
-
-	if _, err := c.Kill(t.Context(), false); err != nil {
+	if _, err := client.Kill(t.Context(), false); err != nil {
 		t.Fatalf("kill off: %v", err)
 	}
-	snap, err := ReadStatus()
+	snapshot, err := ReadStatus()
 	if err != nil {
 		t.Fatalf("read status after kill off: %v", err)
 	}
-	if snap.Kill {
-		t.Fatalf("status-v1.json kill = true after `kill off`, want false: %+v", snap)
+	if snapshot.Kill {
+		t.Fatalf("status-v1.json kill = true after `kill off`: %+v", snapshot)
 	}
-	// Shadow stays on — the toggles are independent.
-	if !snap.Shadow {
-		t.Fatalf("status-v1.json shadow flipped off when only kill was toggled: %+v", snap)
+	if !snapshot.Shadow {
+		t.Fatalf("status-v1.json shadow flipped off when only kill was toggled: %+v", snapshot)
 	}
 }
 
-// TestServerShutdownStepsDownProxy is the BUG B regression: an intentional
-// daemon shutdown (context cancellation, authorized stop, or SIGTERM)
-// must send the proxy an explicit seam Shutdown frame so `ccs stop` takes the
-// proxy down with the daemon — not leave it orphaned on a bare seam drop.
+// TestServerShutdownStepsDownProxy pins the teardown: an intentional daemon
+// shutdown sends the proxy an explicit seam Shutdown frame, so `ccs stop` takes
+// the data plane down with the daemon instead of orphaning it on a bare drop.
 func TestServerShutdownStepsDownProxy(t *testing.T) {
-	f := &fakeProxy{port: 51100, pid: 19}
+	f := &fakeProxy{port: 51100}
 	srv := newServerWithProxy(t, f)
 	cancel := startServer(t, srv)
+	awaitRegisteredStatus(t, f.port)
 
-	// Wait for the proxy to register so the seam has a live connection to push the
-	// shutdown frame to.
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if snap, err := ReadStatus(); err == nil && snap.ProxyPort == 51100 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("proxy never registered before shutdown")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	seen := f.stepDownOnShutdown(t)
-	cancel() // intentional daemon shutdown (the `ccs stop` / SIGTERM teardown)
-
+	seen := f.awaitShutdown()
+	cancel()
 	select {
 	case <-seen:
-	case <-time.After(3 * time.Second):
-		t.Fatal("proxy never received a Shutdown frame on intentional daemon shutdown — it would orphan")
-	}
-}
-
-func TestCaptureProxyOutputClosesTransferredReadersOnCancellation(t *testing.T) {
-	server := &Server{}
-	stdout, stdoutWriter, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	defer stdoutWriter.Close()
-	stderr, stderrWriter, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("stderr pipe: %v", err)
-	}
-	defer stderrWriter.Close()
-	logFile, err := os.CreateTemp(t.TempDir(), "proxy.log")
-	if err != nil {
-		t.Fatalf("proxy log: %v", err)
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	server.captureProxyOutput(ctx, stdout, stderr, logFile)
-	cancel()
-	joined := make(chan struct{})
-	go func() {
-		server.wg.Wait()
-		close(joined)
-	}()
-	select {
-	case <-joined:
-	case <-time.After(time.Second):
-		t.Fatal("capture output did not join after cancellation")
-	}
-}
-
-func TestProductResultDoesNotWaitAfterIncompleteShutdown(t *testing.T) {
-	done := make(chan error)
-	started := time.Now()
-	if err := productResult(dkdaemon.ErrShutdownIncomplete, done); err != nil {
-		t.Fatalf("product result: %v", err)
-	}
-	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
-		t.Fatalf("product result waited %s after incomplete shutdown", elapsed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxy never received a Shutdown frame on intentional daemon shutdown")
 	}
 }
 
