@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-31
+
 ### Changed
 - Move the control plane onto daemonkit v0.23. `ccs daemon` runs through
   `daemonkit.Serve` with the product as daemonkit's `Product`, clients reach it
@@ -82,7 +84,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hard-cut service convergence to daemonkit v0.10.0 with an exact canonical
   program and a fresh replacement-fenced controller-state epoch.
 
-[Unreleased]: https://github.com/yasyf/cc-squash/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/yasyf/cc-squash/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/yasyf/cc-squash/compare/v0.11.1...v0.12.0
 [0.11.0]: https://github.com/yasyf/cc-squash/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/yasyf/cc-squash/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/yasyf/cc-squash/compare/v0.10.0...v0.10.1
