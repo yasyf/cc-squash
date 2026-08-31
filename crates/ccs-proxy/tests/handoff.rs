@@ -1,11 +1,10 @@
 //! The fd-3 handoff boundary, driven against the real `ccs-proxy` binary: the
-//! Go control plane's daemonkit `ChannelHandoff` spawn dup2's the parent end of
-//! a socketpair onto fd 3 before exec, and `seam_channel` adopts it there.
-//! Nothing else in either suite crosses that boundary — `tests/seam.rs` and the
-//! Go seam tests both construct the stream in-process and call
-//! `run_seam`/`Serve` directly — so a regression in fd numbering, CLOEXEC
-//! handling, or the adoption itself breaks every real proxy launch with the
-//! rest of the suite green.
+//! child end of a socketpair is dup2'd onto fd 3 before exec, as daemonkit's
+//! `ChannelHandoff` spawn does, and `seam_channel` adopts it there. Nothing
+//! else in either suite crosses that boundary — `tests/seam.rs` and the Go seam
+//! tests construct the stream in-process and call `run_seam`/`Serve` directly —
+//! so a regression in fd numbering, CLOEXEC handling, or the adoption itself
+//! breaks every real proxy launch with the rest of the suite green.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
@@ -49,8 +48,9 @@ fn spawned_proxy_registers_over_the_inherited_fd3_channel() {
         });
     }
     let mut proxy = command.spawn().expect("spawn ccs-proxy");
-    // The parent must hold the only remaining copy of its end, so a proxy that
-    // never adopts fd 3 shows up as EOF rather than a hang.
+    // Drop this process's copy of the child end so the parent's reads depend
+    // solely on the spawned proxy; a proxy that never adopts fd 3 then fails the
+    // read deadline below instead of blocking forever.
     drop(child);
 
     parent

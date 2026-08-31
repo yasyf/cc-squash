@@ -14,8 +14,6 @@ import (
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
 )
 
-// socketPair is the kernel pair a daemonkit ChannelHandoff spawn establishes:
-// the parent end the seam serves, and the end the child inherits at fd 3.
 func socketPair(t *testing.T) (parent, child net.Conn) {
 	t.Helper()
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
