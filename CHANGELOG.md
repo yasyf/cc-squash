@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Move the control plane onto daemonkit v0.23. `ccs daemon` runs through
+  `daemonkit.Serve` with the product as daemonkit's `Product`, clients reach it
+  over one persistent `daemonkit.Open(...).Business()` session, and
+  `ccs service install` / `ccs service uninstall` converge through
+  `Client.Ensure` and `Client.Stop` instead of driving launchd themselves.
+- Publish the running release over daemonkit's trust-gated control lane, so a
+  launcher can order an incumbent against its own build without opening a
+  business session.
+- Spawn `ccs-proxy` over a daemonkit `ChannelHandoff`. The child inherits the
+  seam socketpair at fd 3 and no longer takes `--socket`, and the daemon serves
+  exactly one child channel at a time.
+- Move the daemon socket, ownership record, and start lock to
+  `~/.daemonkit/a/com.yasyf.cc-squash.daemon`; cc-squash's own state stays in
+  `~/.cc-squash`. Nothing migrates the old location, so stop the running daemon
+  before upgrading and then run `ccs service install`.
+
+### Removed
+- Drop the `proxy-v1.sock` listener, its file lock and single-entrant guard,
+  and the four-field peer-identity match run against every accepted child.
+  The handoff channel comes from the spawn itself, so nothing is left to dial,
+  lock, or re-identify.
+
 ## [0.11.0] - 2026-07-24
 
 ### Changed
