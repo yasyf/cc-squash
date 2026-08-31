@@ -6,12 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.12.2] - 2026-08-31
+## [0.12.3] - 2026-08-31
 
-Supersedes v0.12.0 and v0.12.1, both tagged but published nothing: their release
-smoke test could not bring the daemon up, so neither draft was promoted and no
-artifacts or formula ever shipped under either version. The tags remain because
-this repository forbids deleting one.
+Supersedes v0.12.0, v0.12.1, and v0.12.2, each tagged but publishing nothing:
+their release smoke test could not bring the daemon up under an isolated root,
+so no draft was promoted and no artifacts or formula ever shipped under any of
+them. The tags remain because this repository forbids deleting one.
 
 ### Changed
 - Move the control plane onto daemonkit v0.23. `ccs daemon` runs through
@@ -89,8 +89,8 @@ this repository forbids deleting one.
 - Hard-cut service convergence to daemonkit v0.10.0 with an exact canonical
   program and a fresh replacement-fenced controller-state epoch.
 
-[Unreleased]: https://github.com/yasyf/cc-squash/compare/v0.12.2...HEAD
-[0.12.2]: https://github.com/yasyf/cc-squash/compare/v0.11.1...v0.12.2
+[Unreleased]: https://github.com/yasyf/cc-squash/compare/v0.12.3...HEAD
+[0.12.3]: https://github.com/yasyf/cc-squash/compare/v0.11.1...v0.12.3
 [0.11.0]: https://github.com/yasyf/cc-squash/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/yasyf/cc-squash/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/yasyf/cc-squash/compare/v0.10.0...v0.10.1
