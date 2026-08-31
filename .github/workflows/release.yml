@@ -274,7 +274,7 @@ jobs:
           status="$(ccs status --json)"
           proxy_pid="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["proxy_pid"])' <<<"$status")"
           test "$proxy_pid" -gt 1
-          ccs stop
+          DAEMONKIT_HOME="$smoke_home" PATH="$unpack:$PATH" "$unpack/ccs" stop
           test ! -S "$daemon_sock"
           if kill -0 "$proxy_pid" 2>/dev/null; then
             echo "::error::signed ccs stop left proxy pid $proxy_pid alive"
