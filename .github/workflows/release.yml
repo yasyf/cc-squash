@@ -229,15 +229,36 @@ jobs:
             cat "$daemon_log" 2>/dev/null || true
             echo "::endgroup::"
           }
+          prior_daemonkit_home="$(launchctl getenv DAEMONKIT_HOME || true)"
+          prior_ccs_log_level="$(launchctl getenv CCS_LOG_LEVEL || true)"
+          restore_manager_env() {
+            if [ -n "$prior_daemonkit_home" ]; then
+              launchctl setenv DAEMONKIT_HOME "$prior_daemonkit_home" || true
+            else
+              launchctl unsetenv DAEMONKIT_HOME || true
+            fi
+            if [ -n "$prior_ccs_log_level" ]; then
+              launchctl setenv CCS_LOG_LEVEL "$prior_ccs_log_level" || true
+            else
+              launchctl unsetenv CCS_LOG_LEVEL || true
+            fi
+          }
+          # Only ever tear down a service whose program is this run's staged copy;
+          # the label is shared with any real installation on a non-ephemeral host.
+          bootout_smoke_service() {
+            program="$(launchctl print "$smoke_service" 2>/dev/null | awk -F' = ' '/^[[:space:]]*program = /{print $2}')" || true
+            case "$program" in
+              "$smoke_home"/*) launchctl bootout "$smoke_service" >/dev/null 2>&1 || true ;;
+            esac
+          }
           finish_smoke() {
             rc=$?
             if [ "$rc" -ne 0 ]; then
               dump_smoke_state
             fi
             ccs stop >/dev/null 2>&1 || true
-            launchctl bootout "$smoke_service" >/dev/null 2>&1 || true
-            launchctl unsetenv DAEMONKIT_HOME || true
-            launchctl unsetenv CCS_LOG_LEVEL || true
+            bootout_smoke_service
+            restore_manager_env
             pkill -9 -f "$unpack/ccs-proxy" >/dev/null 2>&1 || true
             rm -rf "$smoke_home"
             exit "$rc"

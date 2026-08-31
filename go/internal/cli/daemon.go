@@ -9,11 +9,6 @@ import (
 	"github.com/yasyf/cc-squash/go/internal/control"
 )
 
-// logLevelEnv selects the daemon's slog level, parsed by slog.Level
-// ("debug", "info", "warn", "error"); unset means info. daemonkit logs
-// through the default slog logger and never configures it, so the daemon
-// entry point does — the release smoke test sets debug through launchd to
-// surface wire-level admission rejections in the daemon log.
 const logLevelEnv = "CCS_LOG_LEVEL"
 
 // newDaemonCmd is the hidden entry point launched by the LaunchAgent: it runs
