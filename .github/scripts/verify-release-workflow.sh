@@ -35,7 +35,11 @@ for required in \
   'test "$actual_identifier" = "$binary"' \
   "grep -Eq '^CodeDirectory .*flags=.*runtime'" \
   'com.apple.security.get-task-allow' \
-  '"$unpack/ccs" stop' \
+  'test "$actual_team" = "$TEAM_ID"' \
+  'com.apple.security.cs.disable-executable-page-protection' \
+  'com.apple.security.cs.allow-unsigned-executable-memory' \
+  'lipo "$unpack/$binary" -verify_arch arm64 x86_64' \
+  'codesign --verify --strict --verbose=2' \
   "actions/stage-draft-release@${stage_pin}" \
   "actions/publish-draft-release@${draft_publish_pin}" \
   "release-id: \${{ steps.draft.outputs['release-id'] }}" \

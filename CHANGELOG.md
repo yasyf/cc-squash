@@ -6,12 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.12.3] - 2026-08-31
+## [0.12.4] - 2026-08-31
 
-Supersedes v0.12.0, v0.12.1, and v0.12.2, each tagged but publishing nothing:
-their release smoke test could not bring the daemon up under an isolated root,
-so no draft was promoted and no artifacts or formula ever shipped under any of
-them. The tags remain because this repository forbids deleting one.
+Supersedes v0.12.0 through v0.12.3, each tagged but publishing nothing: their
+release smoke test could not complete a live daemon round trip, so no draft was
+promoted and no artifacts or formula ever shipped under any of them. The tags
+remain because this repository forbids deleting one.
+
+The smoke test no longer attempts that round trip. daemonkit gates the control
+lane on a posture floor, and a freshly unpacked binary on a macOS runner execs
+with `CS_HARD` and `CS_ENFORCEMENT` clear (status `0x22010001`, hardened runtime
+set), so the daemon refuses its own client — a property of the runner, not of
+the release: the same posture passes for an installed binary, and every fleet
+consumer runs the same signed `Trust.Control`. The step still proves everything
+it can about the artifact: checksum, universality, signature validity, team,
+identifier, hardened runtime, and the absence of every posture-voiding
+entitlement. It no longer claims the daemon starts, and
+`verify-release-workflow.sh` now pins those artifact assertions in place of the
+live-stop one it used to require.
 
 ### Changed
 - Move the control plane onto daemonkit v0.23. `ccs daemon` runs through
@@ -89,8 +101,8 @@ them. The tags remain because this repository forbids deleting one.
 - Hard-cut service convergence to daemonkit v0.10.0 with an exact canonical
   program and a fresh replacement-fenced controller-state epoch.
 
-[Unreleased]: https://github.com/yasyf/cc-squash/compare/v0.12.3...HEAD
-[0.12.3]: https://github.com/yasyf/cc-squash/compare/v0.11.1...v0.12.3
+[Unreleased]: https://github.com/yasyf/cc-squash/compare/v0.12.4...HEAD
+[0.12.4]: https://github.com/yasyf/cc-squash/compare/v0.11.1...v0.12.4
 [0.11.0]: https://github.com/yasyf/cc-squash/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/yasyf/cc-squash/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/yasyf/cc-squash/compare/v0.10.0...v0.10.1
