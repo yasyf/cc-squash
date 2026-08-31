@@ -212,7 +212,9 @@ jobs:
             echo "::error::$smoke_service is already bootstrapped; smoke-testing would evict that installation"
             exit 1
           fi
-          smoke_home="$(mktemp -d /tmp/ccs-release-smoke.XXXXXX)"
+          # daemonkit Lstats every component of the program path and refuses a
+          # symlink (launchd/apply.go), and /tmp is one on macOS.
+          smoke_home="$(cd "$(mktemp -d /tmp/ccs-release-smoke.XXXXXX)" && pwd -P)"
           daemon_sock="$smoke_home/.daemonkit/a/$smoke_label/daemon.sock"
           daemon_log="$smoke_home/.cc-squash/daemon.log"
           ccs() { DAEMONKIT_HOME="$smoke_home" PATH="$unpack:$PATH" "$unpack/ccs" "$@"; }
