@@ -268,7 +268,9 @@ jobs:
           trap finish_smoke EXIT
           launchctl setenv DAEMONKIT_HOME "$smoke_home"
           launchctl setenv CCS_LOG_LEVEL debug
-          mkdir -p "$smoke_home/.cc-squash"
+          # launchd's install does a bare mkdir of <root>/Library/LaunchAgents, so
+          # the isolated root needs its parent to exist first.
+          mkdir -p "$smoke_home/.cc-squash" "$smoke_home/Library/LaunchAgents"
           printf 'schema_version = 1\n' > "$smoke_home/.cc-squash/config.toml"
           url="$(ccs url)"
           [[ "$url" =~ ^http://127\.0\.0\.1:[0-9]+/s/[^/]+$ ]]
