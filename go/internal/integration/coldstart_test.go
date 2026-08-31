@@ -11,7 +11,7 @@
 //
 // The test builds both binaries into one temp dir (so ProxyBinaryPath's
 // sibling-of-os.Executable resolution finds ccs-proxy next to ccs), points the
-// spawned processes at an isolated short HOME, and proves: a cold `ccs url`
+// spawned processes at an isolated short HOME and DAEMONKIT_HOME, and proves: a cold `ccs url`
 // prints a usable proxy URL backed by a listening ccs-proxy; a warm `ccs url`
 // reuses the same daemon and port with a fresh token; and a SIGKILLed proxy is
 // respawned by the supervisor on the SAME port, so previously-minted URLs keep
@@ -23,21 +23,35 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/yasyf/cc-squash/go/internal/control"
 )
 
 // urlPattern matches the exact `ccs url` stdout: the proxy base URL plus the
 // minted session token, nothing else. The capture groups are the port and token.
 var urlPattern = regexp.MustCompile(`^http://127\.0\.0\.1:(\d+)/s/([^/\n]+)\n$`)
+
+// daemonkitHomeEnv is daemonkit's home override. daemonkit resolves its state
+// root, socket, and LaunchAgent plist through the passwd database and ignores
+// HOME, so a harness that sets only HOME drives the developer's REAL
+// installation: it would install, replace, and stop the real cc-squash
+// LaunchAgent. Every spawned process gets this pointed at the temp home.
+const daemonkitHomeEnv = "DAEMONKIT_HOME"
 
 // superviseInterval is the shortened supervision cadence the spawned daemon runs
 // at (via CCS_SUPERVISE_INTERVAL), so a respawn is detected in well under a
@@ -63,6 +77,15 @@ type harness struct {
 }
 
 func TestColdStartTwoProcess(t *testing.T) {
+	// `ccs url` converges the daemon through launchd, and daemonkit.Daemon states
+	// no environment for the rendered plist, so the LaunchAgent-started daemon
+	// resolves its state root from the passwd database whatever DAEMONKIT_HOME the
+	// harness exports: it serves out of the developer's real ~/.daemonkit and
+	// evicts a real cc-squash agent. Measured against daemonkit v0.23 — the two
+	// guards below caught it. Delete this skip once daemonkit can carry
+	// DAEMONKIT_HOME into the plist, and they become the isolation assertion.
+	t.Skip("no isolation for a launchd-converged daemon: daemonkit.Daemon states no plist environment (v0.23)")
+
 	h := newHarness(t)
 
 	// Tear the daemon (and its proxy child) down no matter how the test exits, so
@@ -70,6 +93,7 @@ func TestColdStartTwoProcess(t *testing.T) {
 	t.Cleanup(h.stop)
 
 	port, token := h.coldStart()
+	h.assertStateUnderTempHome()
 	t.Logf("cold start: minted http://127.0.0.1:%d/s/%s", port, token)
 
 	// Durably listening, not just transiently up: a perpetual version-skew Replace
@@ -111,6 +135,7 @@ func newHarness(t *testing.T) *harness {
 		t.Fatalf("temp HOME: %v", err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	home = resolved(t, home)
 	stateDir := filepath.Join(home, ".cc-squash")
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		t.Fatalf("state dir: %v", err)
@@ -118,12 +143,16 @@ func newHarness(t *testing.T) *harness {
 	if err := os.WriteFile(filepath.Join(stateDir, "config.toml"), []byte("schema_version = 1\n"), 0o600); err != nil {
 		t.Fatalf("config: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(home, "Library", "LaunchAgents"), 0o755); err != nil {
+		t.Fatalf("LaunchAgents dir: %v", err)
+	}
 
 	dir, err := os.MkdirTemp("/tmp", "ccs-it-bin")
 	if err != nil {
 		t.Fatalf("temp bin dir: %v", err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir = resolved(t, dir)
 
 	ccsBin := filepath.Join(dir, "ccs")
 	build := exec.Command("go", "build", "-o", ccsBin, "./cmd/ccs")
@@ -142,6 +171,9 @@ func newHarness(t *testing.T) *harness {
 	}
 	copyExecutable(t, filepath.Join(cargoTarget, "debug", "ccs-proxy"), filepath.Join(dir, "ccs-proxy"))
 
+	guardPasswdHome(t, home)
+	guardLaunchdLabel(t)
+
 	return &harness{
 		t:    t,
 		dir:  dir,
@@ -149,9 +181,134 @@ func newHarness(t *testing.T) *harness {
 		ccs:  ccsBin,
 		env: append(os.Environ(),
 			"HOME="+home,
+			daemonkitHomeEnv+"="+home,
 			"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
 			"CCS_SUPERVISE_INTERVAL="+superviseInterval.String(),
 		),
+	}
+}
+
+// resolved is path with every symlink expanded. /tmp is a symlink to
+// /private/tmp on darwin, and launchd refuses a program path reached through
+// one, so the harness must hand daemonkit the real directory.
+func resolved(t *testing.T, path string) string {
+	t.Helper()
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", path, err)
+	}
+	return real
+}
+
+// passwdRoots are the three trees a cc-squash daemon owns under the home
+// daemonkit resolves from the passwd database: its own agent state (socket,
+// lock, owner record), cc-squash's product state, and the LaunchAgent plist.
+func passwdRoots(home string) []string {
+	label := string(control.DaemonRoleID)
+	return []string{
+		filepath.Join(home, ".daemonkit", "a", label),
+		filepath.Join(home, ".cc-squash"),
+		filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
+	}
+}
+
+// guardPasswdHome proves the harness cannot reach the developer's real
+// installation: the temp home must be outside the passwd home, and every tree a
+// cc-squash daemon owns under the passwd home must be byte-for-byte what it was
+// before the run — an absent one still absent, a live one untouched.
+func guardPasswdHome(t *testing.T, tempHome string) {
+	t.Helper()
+	current, err := user.Current()
+	if err != nil {
+		t.Fatalf("passwd entry: %v", err)
+	}
+	passwdHome := current.HomeDir
+	if passwdHome == "" {
+		t.Fatal("passwd entry has no home directory")
+	}
+	if passwdHome == tempHome || strings.HasPrefix(tempHome+string(filepath.Separator), passwdHome+string(filepath.Separator)) {
+		t.Fatalf("temp home %q is inside the passwd home %q", tempHome, passwdHome)
+	}
+	roots := passwdRoots(passwdHome)
+	before := make([]string, len(roots))
+	for i, root := range roots {
+		before[i] = fingerprint(t, root)
+	}
+	t.Cleanup(func() {
+		for i, root := range roots {
+			if after := fingerprint(t, root); after != before[i] {
+				t.Errorf("the harness mutated the real installation at %s\nbefore:\n%s\nafter:\n%s", root, before[i], after)
+			}
+		}
+	})
+}
+
+// guardLaunchdLabel refuses to run against a developer's live installation.
+// DAEMONKIT_HOME relocates every file this daemon owns, but launchd's domain is
+// per-user and the label is fixed, so converging here would bootout and replace
+// a real cc-squash agent — the one mutation no path fingerprint can see. It also
+// proves the harness leaves nothing bootstrapped behind.
+func guardLaunchdLabel(t *testing.T) {
+	t.Helper()
+	service := fmt.Sprintf("gui/%d/%s", os.Getuid(), control.DaemonRoleID)
+	if loaded(service) {
+		t.Fatalf("%s is already bootstrapped: this harness would evict the real cc-squash agent — run `ccs stop` first", service)
+	}
+	t.Cleanup(func() {
+		if loaded(service) {
+			t.Errorf("the harness left %s bootstrapped in the user's launchd domain", service)
+		}
+	})
+}
+
+// loaded reports whether launchd holds a service at this label.
+func loaded(service string) bool {
+	return exec.Command("launchctl", "print", service).Run() == nil
+}
+
+// fingerprint renders a tree as one sorted, comparable string: every entry's
+// path, mode, size, and modification time. An absent root renders as "absent",
+// so a tree the harness creates from nothing is caught too.
+func fingerprint(t *testing.T, root string) string {
+	t.Helper()
+	if _, err := os.Lstat(root); os.IsNotExist(err) {
+		return "absent"
+	}
+	var lines []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		lines = append(lines, fmt.Sprintf("%s\t%s\t%d\t%s", rel, info.Mode(), info.Size(), info.ModTime().UTC()))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("fingerprint %s: %v", root, err)
+	}
+	sort.Strings(lines)
+	return strings.Join(lines, "\n")
+}
+
+// assertStateUnderTempHome is the positive half of the isolation guard: the
+// daemon that just cold-started put its agent state and its product state under
+// the temp home, so DAEMONKIT_HOME actually took.
+func (h *harness) assertStateUnderTempHome() {
+	h.t.Helper()
+	for _, root := range passwdRoots(h.home) {
+		if filepath.Ext(root) == ".plist" {
+			continue
+		}
+		if _, err := os.Stat(root); err != nil {
+			h.t.Fatalf("daemon state is missing under the temp home at %s: %v", root, err)
+		}
 	}
 }
 

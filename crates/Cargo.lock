@@ -277,6 +277,7 @@ dependencies = [
  "failsafe",
  "futures-util",
  "http",
+ "libc",
  "memchr",
  "proptest",
  "reqwest 0.12.28",

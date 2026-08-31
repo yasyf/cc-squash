@@ -15,11 +15,10 @@ import (
 	"time"
 )
 
-// socketPair returns the two ends of one AF_UNIX stream pair: the parent end a
-// daemonkit ChannelHandoff spawn would hand the seam, and the child end the
-// Rust proxy would inherit at fd 3. A real socketpair (not net.Pipe) is what a
-// test needs here: the seam writes control frames while the test is elsewhere,
-// and an unbuffered pipe would deadlock those writes into their timeout.
+// socketPair returns the two ends of one AF_UNIX stream pair. A real socketpair
+// (not net.Pipe) is what a test needs here: the seam writes control frames while
+// the test is elsewhere, and an unbuffered pipe would deadlock those writes into
+// their timeout.
 func socketPair(t *testing.T) (parent, child net.Conn) {
 	t.Helper()
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
@@ -47,8 +46,6 @@ func newTestServer(t *testing.T) *Server {
 	return srv
 }
 
-// serveChild runs one Serve over a fresh channel pair and returns the child end
-// plus the goroutine's completion signal.
 func serveChild(t *testing.T, ctx context.Context, srv *Server, onRegister func(Register)) (net.Conn, <-chan struct{}) {
 	t.Helper()
 	parent, child := socketPair(t)
@@ -99,6 +96,23 @@ func waitConnected(srv *Server) error {
 
 func waitDisconnected(srv *Server) error {
 	return waitSession(srv, false, errors.New("proxyseam: child session never cleared"))
+}
+
+// waitTracked polls until Serve has entered the channel in the live set. Close
+// only terminates a tracked channel, so a test that races it against track
+// passes on a Close that drops nothing.
+func waitTracked(srv *Server) error {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		srv.mu.Lock()
+		tracked := len(srv.live)
+		srv.mu.Unlock()
+		if tracked == 1 {
+			return nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return errors.New("proxyseam: channel never reached the live set")
 }
 
 func waitSession(srv *Server, want bool, onTimeout error) error {
@@ -179,6 +193,12 @@ func TestServeRejectsNonV1Register(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("stale register did not end the session")
 	}
+	if err := child.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	if _, err := child.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("stale child channel read = %v, want io.EOF from a closed peer", err)
+	}
 	if srv.Connected() {
 		t.Fatal("stale proxy was admitted")
 	}
@@ -216,6 +236,9 @@ func TestServeRejectsPostRegisterFrame(t *testing.T) {
 func TestCloseDropsUnregisteredChannel(t *testing.T) {
 	srv := newTestServer(t)
 	child, done := serveChild(t, t.Context(), srv, func(Register) {})
+	if err := waitTracked(srv); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := srv.Close(); err != nil {
 		t.Fatalf("close: %v", err)
@@ -228,8 +251,8 @@ func TestCloseDropsUnregisteredChannel(t *testing.T) {
 	if err := child.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("deadline: %v", err)
 	}
-	if _, err := child.Read(make([]byte, 1)); err == nil {
-		t.Fatal("silent child channel remained readable after close")
+	if _, err := child.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("silent child channel read = %v, want io.EOF from a closed peer", err)
 	}
 }
 
@@ -307,8 +330,8 @@ func TestServeCancellationClosesRegisteredChild(t *testing.T) {
 	if err := child.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("deadline: %v", err)
 	}
-	if _, err := child.Read(make([]byte, 1)); err == nil {
-		t.Fatal("registered child remained readable after cancellation")
+	if _, err := child.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("registered child read = %v, want io.EOF from a closed peer", err)
 	}
 }
 

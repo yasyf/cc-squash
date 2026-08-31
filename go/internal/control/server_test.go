@@ -17,6 +17,7 @@ import (
 	"github.com/yasyf/cc-squash/go/internal/paths"
 	"github.com/yasyf/cc-squash/go/internal/proxyseam"
 	"github.com/yasyf/cc-squash/go/internal/supervisor"
+	"github.com/yasyf/cc-squash/go/internal/version"
 	"github.com/yasyf/daemonkit"
 )
 
@@ -26,10 +27,6 @@ func quietLogger(t *testing.T) *log.Logger {
 	return log.New(io.Discard, "", 0)
 }
 
-// fakeProxy stands in for the Rust ccs-proxy child. It owns the child end of a
-// real socketpair — the channel a daemonkit ChannelHandoff spawn would inherit
-// at fd 3 — sends one register frame, and then reads the control frames the
-// daemon pushes.
 type fakeProxy struct {
 	port    int
 	mcpPort int
@@ -127,7 +124,6 @@ func (f *fakeProxy) awaitShutdown() <-chan struct{} {
 	return seen
 }
 
-// socketPair returns the parent and child ends of one AF_UNIX stream pair.
 func socketPair(t *testing.T) (parent, child net.Conn) {
 	t.Helper()
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
@@ -148,8 +144,6 @@ func socketPair(t *testing.T) (parent, child net.Conn) {
 	return ends[0], ends[1]
 }
 
-// newServerWithProxy builds a daemon whose spawn seam hands the seam the given
-// fake proxy's channel, under an isolated home.
 func newServerWithProxy(t *testing.T, f *fakeProxy) *Server {
 	t.Helper()
 	shortHome(t)
@@ -207,6 +201,11 @@ func startServer(t *testing.T, srv *Server) context.CancelFunc {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if _, err := probe.Status(t.Context()); err == nil {
+			// The daemon admits Daemon.Concurrency (8 when zero) business sessions at
+			// once, so a retained readiness probe costs every caller one slot.
+			if err := probe.Close(); err != nil {
+				t.Fatalf("release readiness probe: %v", err)
+			}
 			return cancel
 		} else if time.Now().After(deadline) {
 			t.Fatalf("daemon never dispatched: %v", err)
@@ -419,7 +418,7 @@ func TestServerMintDemux(t *testing.T) {
 	srv := newServerWithProxy(t, &fakeProxy{port: 50700})
 	startServer(t, srv)
 
-	const sessions = 4
+	const sessions = 8
 	tokens := make(chan string, sessions)
 	var wg sync.WaitGroup
 	for range sessions {
@@ -501,6 +500,11 @@ func TestSecondServeRefusesLiveIncumbent(t *testing.T) {
 	}
 }
 
+// wireBuildMismatchReason is the text internal/wire.ErrBuildMismatch carries.
+// daemonkit exports no alias for that sentinel, so pinning the rejection's
+// classification means pinning the reason its handshake denial states.
+const wireBuildMismatchReason = "wire: client schema is not accepted by this server"
+
 // TestServerRejectsWrongWireBuildBeforeDispatch pins admission: a client whose
 // schema fingerprint differs never reaches Handle, so a skewed build cannot mint
 // against this daemon.
@@ -520,37 +524,211 @@ func TestServerRejectsWrongWireBuildBeforeDispatch(t *testing.T) {
 		defer cancel()
 		_ = business.Close(ctx)
 	})
-	if reply, err := business.Call(t.Context(), string(OpStatus), []byte(`{}`)); err == nil {
+	callCtx, callCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer callCancel()
+	reply, err := business.Call(callCtx, string(OpStatus), []byte(`{}`))
+	if err == nil {
 		t.Fatalf("skewed wire build dispatched: %+v", reply)
+	}
+	if !daemonkit.Undispatched(err) {
+		t.Fatalf("skewed wire build reached dispatch: %v", err)
+	}
+	if err.Error() != wireBuildMismatchReason {
+		t.Fatalf("skewed wire build rejected as %q, want the schema denial %q", err, wireBuildMismatchReason)
+	}
+	for _, unrelated := range []error{
+		context.DeadlineExceeded, daemonkit.ErrUntrusted, daemonkit.ErrNotReady,
+		daemonkit.ErrDraining, daemonkit.ErrAbsent, daemonkit.ErrLaneClosed,
+	} {
+		if errors.Is(err, unrelated) {
+			t.Fatalf("skewed wire build rejected as %v, not a schema mismatch", unrelated)
+		}
 	}
 	if status, err := newTestClient(t).Status(t.Context()); err != nil || status.Status.Sessions != 0 {
 		t.Fatalf("incumbent after a rejected build = %+v, err = %v", status, err)
 	}
 }
 
-// TestClearRetiredProxyStateRemovesDerivedFiles pins the reclaim path's cleanup:
-// a daemon that inherits a prior generation's children drops the port-file and
-// status mirror that described the retired proxy, so no reader is served a
-// snapshot of a process that is gone.
-func TestClearRetiredProxyStateRemovesDerivedFiles(t *testing.T) {
+// TestActivationClearsRetiredProxyStateOnlyWhenReclaiming drives the reclaim
+// path through activation: a daemon that inherits a prior generation's children
+// drops the port-file and status mirror that described the retired proxy, so no
+// reader is served a snapshot of a process that is gone — and a daemon that
+// inherits none leaves the derived state where it found it.
+func TestActivationClearsRetiredProxyStateOnlyWhenReclaiming(t *testing.T) {
+	tests := []struct {
+		name      string
+		reclaimed []daemonkit.Reclaimed
+		wantGone  bool
+	}{
+		{"reclaimed a prior generation", []daemonkit.Reclaimed{{PID: 2_000_000_000}}, true},
+		{"nothing to reclaim", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			shortHome(t)
+			if err := WriteStatus(StatusSnapshot{SchemaVersion: StatusSchemaVersion, Version: "retired"}); err != nil {
+				t.Fatalf("seed status: %v", err)
+			}
+			if err := WritePort(50999); err != nil {
+				t.Fatalf("seed port: %v", err)
+			}
+			srv := newTestServer(t)
+			srv.spawnProxy = func(context.Context) (proxyChild, error) {
+				return nil, supervisor.ErrChildUnavailable
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if _, err := srv.start(daemonkit.Ctx{
+				Context:   ctx,
+				Reclaimed: tt.reclaimed,
+				Report:    func([]byte) {},
+			}); err != nil {
+				t.Fatalf("start: %v", err)
+			}
+			t.Cleanup(func() {
+				closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer closeCancel()
+				if err := srv.closeProduct(closeCtx); err != nil {
+					t.Errorf("close product: %v", err)
+				}
+			})
+			_, statusErr := os.Stat(paths.StatusPath())
+			_, portErr := os.Stat(paths.PortFilePath())
+			gone := os.IsNotExist(statusErr) && os.IsNotExist(portErr)
+			if gone != tt.wantGone {
+				t.Fatalf("derived state cleared = %v, want %v (status err %v, port err %v)", gone, tt.wantGone, statusErr, portErr)
+			}
+		})
+	}
+}
+
+// TestActivationPublishesTheRunningBuildAsHealthDetail pins cc-squash's half of
+// daemonkit's health verb on a genuinely activated daemon: what start hands
+// c.Report is exactly the detail ReportedBuild accepts, carrying this build.
+//
+// The control-lane round trip past that is not reachable from a test binary:
+// Identity gates the control lane on Requirement{TeamID: SXKCTF23Q2,
+// SigningIdentifier: ccs}, so Client.Health against a daemon this suite starts
+// fails with ErrUntrusted — the peer is the unsigned test binary. A self-exec
+// child daemon is that same unsigned binary, so it does not lift the gate
+// either; only a Developer ID-signed build can, which is the integration
+// suite's ground, not this one's.
+func TestActivationPublishesTheRunningBuildAsHealthDetail(t *testing.T) {
 	shortHome(t)
-	if err := WriteStatus(StatusSnapshot{SchemaVersion: StatusSchemaVersion, Version: "retired"}); err != nil {
-		t.Fatalf("seed status: %v", err)
+	srv := newTestServer(t)
+	srv.spawnProxy = func(context.Context) (proxyChild, error) {
+		return nil, supervisor.ErrChildUnavailable
 	}
-	if err := WritePort(50999); err != nil {
-		t.Fatalf("seed port: %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reported := make(chan []byte, 1)
+	if _, err := srv.start(daemonkit.Ctx{
+		Context: ctx,
+		Report:  func(detail []byte) { reported <- detail },
+	}); err != nil {
+		t.Fatalf("start: %v", err)
 	}
-	if err := clearRetiredProxyState(); err != nil {
-		t.Fatalf("clear retired proxy state: %v", err)
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		if err := srv.closeProduct(closeCtx); err != nil {
+			t.Errorf("close product: %v", err)
+		}
+	})
+	select {
+	case detail := <-reported:
+		build, ok := ReportedBuild(daemonkit.Health{Detail: detail})
+		if !ok || build != version.String() {
+			t.Fatalf("activation reported build %q (reported %v), want %q", build, ok, version.String())
+		}
+	default:
+		t.Fatal("activation published no health detail")
 	}
-	if _, err := os.Stat(paths.StatusPath()); !os.IsNotExist(err) {
-		t.Fatalf("retired status still present: %v", err)
+}
+
+// registerOnDone is an already-cancelled context that registers the proxy the
+// moment awaitReady evaluates its select — the one interleaving the
+// cancellation branch's recheck exists for, and the only way to hit it without
+// a wall-clock race: Go evaluates every channel operand of a select before it
+// chooses a case, so Done runs after the loop's poll read "not registered" and
+// before the branch rechecks.
+type registerOnDone struct {
+	context.Context
+	once sync.Once
+	fire func()
+}
+
+func (c *registerOnDone) Done() <-chan struct{} {
+	c.once.Do(c.fire)
+	return c.Context.Done()
+}
+
+// TestAwaitReadyAcceptsAChildRegisteredAsTheWaitEnds pins the shutdown race: a
+// proxy that registers inside awaitReady's poll gap, as the wait is cancelled,
+// is ready. Reporting it unavailable makes EnsureRunning's caller stop a live
+// registered child the seam is already serving, losing the graceful step-down.
+func TestAwaitReadyAcceptsAChildRegisteredAsTheWaitEnds(t *testing.T) {
+	tests := []struct {
+		name       string
+		registers  bool
+		wantJoined error
+	}{
+		{"registered as the wait ends", true, nil},
+		{"never registered", false, supervisor.ErrChildUnavailable},
 	}
-	if _, err := os.Stat(paths.PortFilePath()); !os.IsNotExist(err) {
-		t.Fatalf("retired port still present: %v", err)
-	}
-	if err := clearRetiredProxyState(); err != nil {
-		t.Fatalf("clearing already-absent derived state: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			srv.seam = proxyseam.NewServer(srv.log)
+			t.Cleanup(func() { _ = srv.seam.Close() })
+			srv.policy = supervisor.NewProxyPolicy(srv.seam, srv.repushTokens, nil, srv.log)
+
+			// A live seam session with no NoteRegistered yet: Registered() is false
+			// purely because the policy has not seen the frame.
+			serveCtx, cancelServe := context.WithCancel(context.Background())
+			defer cancelServe()
+			parent, child := socketPair(t)
+			go srv.seam.Serve(serveCtx, parent, func(proxyseam.Register) {})
+			registered := proxyseam.Register{
+				Type: proxyseam.MsgRegister, Protocol: proxyseam.ProtocolVersion,
+				Port: 51400, MCPPort: 51401, Version: supervisor.ProxyVersion(), PID: os.Getpid(),
+			}
+			frame, err := proxyseam.Encode(registered)
+			if err != nil {
+				t.Fatalf("encode register: %v", err)
+			}
+			if _, err := child.Write(frame); err != nil {
+				t.Fatalf("write register: %v", err)
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for !srv.seam.Connected() {
+				if time.Now().After(deadline) {
+					t.Fatal("seam never admitted the child channel")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if srv.policy.Registered() {
+				t.Fatal("policy reported registered before it saw the frame")
+			}
+
+			cancelled, cancel := context.WithCancel(context.Background())
+			cancel()
+			waitCtx := &registerOnDone{Context: cancelled, fire: func() {
+				if tt.registers {
+					srv.policy.NoteRegistered(registered)
+				}
+			}}
+			err = (&proxySpawner{server: srv}).awaitReady(waitCtx)
+			if tt.wantJoined == nil {
+				if err != nil {
+					t.Fatalf("awaitReady = %v, want nil for a child registered as the wait ended", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.wantJoined) {
+				t.Fatalf("awaitReady = %v, want %v", err, tt.wantJoined)
+			}
+		})
 	}
 }
 

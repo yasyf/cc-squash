@@ -45,6 +45,9 @@ test-panic = []
 
 [dev-dependencies]
 wiremock = "0.6"
+# dup2/fcntl for tests/handoff.rs: the only way to place a socketpair end on the
+# exact fd daemonkit's ChannelHandoff spawn hands the proxy.
+libc = "0.2"
 proptest = { workspace = true }
 tempfile = { workspace = true }
 # The rmcp streamable-HTTP CLIENT drives the MCP route end-to-end in tests.
