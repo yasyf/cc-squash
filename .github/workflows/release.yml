@@ -206,28 +206,59 @@ jobs:
               fi
             done
           done
+          smoke_label="com.yasyf.cc-squash.daemon"
+          smoke_service="gui/$(id -u)/$smoke_label"
+          if launchctl print "$smoke_service" >/dev/null 2>&1; then
+            echo "::error::$smoke_service is already bootstrapped; smoke-testing would evict that installation"
+            exit 1
+          fi
           smoke_home="$(mktemp -d /tmp/ccs-release-smoke.XXXXXX)"
-          cleanup_smoke() {
-            HOME="$smoke_home" PATH="$unpack:$PATH" "$unpack/ccs" stop >/dev/null 2>&1 || true
+          daemon_sock="$smoke_home/.daemonkit/a/$smoke_label/daemon.sock"
+          daemon_log="$smoke_home/.cc-squash/daemon.log"
+          ccs() { DAEMONKIT_HOME="$smoke_home" PATH="$unpack:$PATH" "$unpack/ccs" "$@"; }
+          dump_smoke_state() {
+            echo "::group::smoke diagnostics"
+            launchctl print "$smoke_service" || true
+            daemon_pid="$(launchctl print "$smoke_service" 2>/dev/null | awk '/^[[:space:]]*pid = /{print $3}')" || true
+            if [ -n "${daemon_pid:-}" ]; then
+              ps -p "$daemon_pid" -o pid=,ppid=,comm=,args= || true
+            fi
+            ls -la "$smoke_home/.daemonkit/a/$smoke_label" "$smoke_home/.daemonkit/bin" "$smoke_home/.cc-squash" 2>/dev/null || true
+            cat "$smoke_home/.daemonkit/a/$smoke_label/daemon.records" 2>/dev/null || true
+            echo
+            cat "$daemon_log" 2>/dev/null || true
+            echo "::endgroup::"
+          }
+          finish_smoke() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              dump_smoke_state
+            fi
+            ccs stop >/dev/null 2>&1 || true
+            launchctl bootout "$smoke_service" >/dev/null 2>&1 || true
+            launchctl unsetenv DAEMONKIT_HOME || true
+            launchctl unsetenv CCS_LOG_LEVEL || true
             pkill -9 -f "$unpack/ccs-proxy" >/dev/null 2>&1 || true
             rm -rf "$smoke_home"
+            exit "$rc"
           }
-          trap cleanup_smoke EXIT
+          trap finish_smoke EXIT
+          launchctl setenv DAEMONKIT_HOME "$smoke_home"
+          launchctl setenv CCS_LOG_LEVEL debug
           mkdir -p "$smoke_home/.cc-squash"
           printf 'schema_version = 1\n' > "$smoke_home/.cc-squash/config.toml"
-          url="$(HOME="$smoke_home" PATH="$unpack:$PATH" "$unpack/ccs" url)"
+          url="$(ccs url)"
           [[ "$url" =~ ^http://127\.0\.0\.1:[0-9]+/s/[^/]+$ ]]
-          status="$(HOME="$smoke_home" PATH="$unpack:$PATH" "$unpack/ccs" status --json)"
+          test -S "$daemon_sock"
+          status="$(ccs status --json)"
           proxy_pid="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["proxy_pid"])' <<<"$status")"
           test "$proxy_pid" -gt 1
-          HOME="$smoke_home" PATH="$unpack:$PATH" "$unpack/ccs" stop
-          test ! -S "$smoke_home/.cc-squash/daemon.sock"
+          ccs stop
+          test ! -S "$daemon_sock"
           if kill -0 "$proxy_pid" 2>/dev/null; then
             echo "::error::signed ccs stop left proxy pid $proxy_pid alive"
             exit 1
           fi
-          trap - EXIT
-          rm -rf "$smoke_home"
 
       - name: Publish the verified release
         uses: yasyf/homebrew-tap/.github/actions/publish-draft-release@54e3e194bda69896894a82c17fcdb2822beefab5
