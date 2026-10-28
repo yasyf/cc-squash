@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-squash/go/internal/control"
+	"github.com/yasyf/cc-squash/go/internal/version"
 )
 
 func newGCCmd() *cobra.Command {
@@ -17,7 +18,7 @@ func newGCCmd() *cobra.Command {
 			if err := ensureDaemonCurrent(cmd.Context(), proxyEnsureTimeout); err != nil {
 				return err
 			}
-			c, err := control.NewClient()
+			c, err := control.NewClient(version.Running())
 			if err != nil {
 				return err
 			}

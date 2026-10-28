@@ -36,8 +36,6 @@ func shortHome(t *testing.T) {
 	}
 }
 
-// controlCtx bounds a control-lane call: daemonkit refuses a Control session on
-// a context with no deadline.
 func controlCtx(t *testing.T) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)

@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-squash/go/internal/control"
+	"github.com/yasyf/cc-squash/go/internal/version"
 	"github.com/yasyf/daemonkit"
 )
 
@@ -19,7 +20,7 @@ type daemonLauncher interface {
 	Close() error
 }
 
-var openDaemonLauncher = func() (daemonLauncher, error) { return control.NewClient() }
+var openDaemonLauncher = func() (daemonLauncher, error) { return control.NewClient(version.Running()) }
 
 func withDaemonLauncher(ctx context.Context, timeout time.Duration, run func(context.Context, daemonLauncher) error) error {
 	launcher, err := openDaemonLauncher()
@@ -108,7 +109,6 @@ func newServiceCmd() *cobra.Command {
 	return cmd
 }
 
-// healthTimeout bounds one control-lane health read.
 const healthTimeout = 5 * time.Second
 
 func phaseName(phase daemonkit.Phase) string {

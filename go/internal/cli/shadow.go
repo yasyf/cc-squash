@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-squash/go/internal/control"
+	"github.com/yasyf/cc-squash/go/internal/version"
 )
 
 func newShadowCmd() *cobra.Command {
@@ -24,7 +25,7 @@ request, so you can audit compaction against real traffic before trusting it.
 			if err != nil {
 				return err
 			}
-			client, err := control.NewClient()
+			client, err := control.NewClient(version.Running())
 			if err != nil {
 				return err
 			}

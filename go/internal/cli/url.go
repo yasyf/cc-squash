@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-squash/go/internal/control"
+	"github.com/yasyf/cc-squash/go/internal/version"
 )
 
 // proxyEnsureTimeout bounds the wait for an auto-spawned daemon's control socket
@@ -51,7 +52,7 @@ func resolveMint(ctx context.Context) (control.Response, error) {
 	if err := ensureDaemonCurrent(ctx, proxyEnsureTimeout); err != nil {
 		return control.Response{}, err
 	}
-	c, err := control.NewClient()
+	c, err := control.NewClient(version.Running())
 	if err != nil {
 		return control.Response{}, err
 	}
