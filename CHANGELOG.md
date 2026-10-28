@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection. The daemon is replaced when the release version changes, or
   when a development build's modification time does, instead of on a hash of
   the executable.
+- Builds against daemonkit 0.35.1 with Go 1.26.10.
 
 ## [0.12.4] - 2026-08-31
 
