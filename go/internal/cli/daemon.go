@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-squash/go/internal/control"
+	"github.com/yasyf/cc-squash/go/internal/version"
 )
 
 const logLevelEnv = "CCS_LOG_LEVEL"
@@ -29,7 +30,7 @@ func newDaemonCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return server.Run(cmd.Context())
+			return server.Run(cmd.Context(), version.Running())
 		},
 	}
 }

@@ -98,8 +98,8 @@ func NewServer() (*Server, error) {
 
 // Run is the entry point for `ccs daemon`: daemonkit's whole lifecycle — flock,
 // owner record, bind, product start, ready, serve, drain.
-func (s *Server) Run(ctx context.Context) error {
-	spec, err := Spec()
+func (s *Server) Run(ctx context.Context, build string) error {
+	spec, err := Spec(build)
 	if err != nil {
 		return err
 	}
@@ -385,7 +385,6 @@ func (p *proxySpawner) spawn(ctx context.Context) (proxyChild, error) {
 			"--refs-db", paths.RefsDbPath(),
 		},
 		Session: true,
-		Exec:    daemonkit.ServingSameUser(),
 	}, daemonkit.ChannelHandoff, logFile)
 	if err != nil {
 		_ = logFile.Close()

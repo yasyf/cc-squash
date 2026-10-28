@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Any process running as the same user can now connect to the cc-squash
+  daemon. Connecting clients and spawned proxy children no longer go through
+  signature or peer verification. Health checks use the client's one shared
+  connection. The daemon is replaced when the release version changes, or
+  when a development build's modification time does, instead of on a hash of
+  the executable.
+- Builds against daemonkit 0.35.1 with Go 1.26.10.
+
 ## [0.12.4] - 2026-08-31
 
 Supersedes v0.12.0 through v0.12.3, each tagged but publishing nothing: their

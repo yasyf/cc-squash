@@ -15,11 +15,8 @@ import (
 // ErrDaemonUnavailable means no daemon is listening on the control socket.
 var ErrDaemonUnavailable = daemonkit.ErrAbsent
 
-// closeTimeout bounds releasing a business session on Close.
 const closeTimeout = 2 * time.Second
 
-// Client reaches one cc-squash daemon: the business lane for product ops, the
-// trust-gated control lane for health, and daemonkit's own convergence verbs.
 type Client struct {
 	daemon   daemonkit.Daemon
 	client   *daemonkit.Client
@@ -28,8 +25,8 @@ type Client struct {
 
 // NewClient opens a lazy client for the daemon this build converges on. It
 // performs no I/O beyond resolving the executable Ensure places.
-func NewClient() (*Client, error) {
-	spec, err := Spec()
+func NewClient(build string) (*Client, error) {
+	spec, err := Spec(build)
 	if err != nil {
 		return nil, err
 	}
@@ -40,21 +37,14 @@ func NewClient() (*Client, error) {
 	return &Client{daemon: spec, client: client, business: client.Business()}, nil
 }
 
-// Close releases the business session.
 func (c *Client) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
-	return c.business.Close(ctx)
+	return errors.Join(c.business.Close(ctx), c.client.Close(ctx))
 }
 
-// Health reports the pinned incumbent over the trust-gated control lane.
 func (c *Client) Health(ctx context.Context) (daemonkit.Health, error) {
-	control, err := c.client.Control(ctx)
-	if err != nil {
-		return daemonkit.Health{}, err
-	}
-	defer func() { _ = control.Close(ctx) }()
-	return control.Health(ctx)
+	return c.client.Health(ctx)
 }
 
 // Ensure makes the daemon be the exact build of this executable, ready and
@@ -76,6 +66,7 @@ func (c *Client) Stop(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	defer client.Close(ctx)
 	if err := client.Stop(ctx); err != nil {
 		return fmt.Errorf("stop daemon: %w", err)
 	}

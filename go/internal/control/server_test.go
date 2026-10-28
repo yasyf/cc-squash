@@ -174,7 +174,7 @@ func newTestServer(t *testing.T) *Server {
 
 func newTestClient(t *testing.T) *Client {
 	t.Helper()
-	client, err := NewClient()
+	client, err := NewClient("test")
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -189,7 +189,7 @@ func startServer(t *testing.T, srv *Server) context.CancelFunc {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := srv.Run(ctx); err != nil {
+		if err := srv.Run(ctx, "test"); err != nil {
 			t.Errorf("Run: %v", err)
 		}
 	}()
@@ -492,7 +492,7 @@ func TestSecondServeRefusesLiveIncumbent(t *testing.T) {
 	contender.spawnProxy = func(context.Context) (proxyChild, error) {
 		return nil, supervisor.ErrChildUnavailable
 	}
-	if err := contender.Run(context.Background()); !errors.Is(err, daemonkit.ErrBusy) {
+	if err := contender.Run(context.Background(), "test"); !errors.Is(err, daemonkit.ErrBusy) {
 		t.Fatalf("contender Run = %v, want ErrBusy", err)
 	}
 	if _, err := newTestClient(t).Status(t.Context()); err != nil {
@@ -500,14 +500,8 @@ func TestSecondServeRefusesLiveIncumbent(t *testing.T) {
 	}
 }
 
-// wireBuildMismatchReason is the text internal/wire.ErrBuildMismatch carries.
-// daemonkit exports no alias for that sentinel, so pinning the rejection's
-// classification means pinning the reason its handshake denial states.
 const wireBuildMismatchReason = "wire: client schema is not accepted by this server"
 
-// TestServerRejectsWrongWireBuildBeforeDispatch pins admission: a client whose
-// schema fingerprint differs never reaches Handle, so a skewed build cannot mint
-// against this daemon.
 func TestServerRejectsWrongWireBuildBeforeDispatch(t *testing.T) {
 	srv := newServerWithProxy(t, &fakeProxy{port: 50810})
 	startServer(t, srv)
@@ -523,6 +517,7 @@ func TestServerRejectsWrongWireBuildBeforeDispatch(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		_ = business.Close(ctx)
+		_ = client.Close(ctx)
 	})
 	callCtx, callCancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer callCancel()
@@ -537,7 +532,7 @@ func TestServerRejectsWrongWireBuildBeforeDispatch(t *testing.T) {
 		t.Fatalf("skewed wire build rejected as %q, want the schema denial %q", err, wireBuildMismatchReason)
 	}
 	for _, unrelated := range []error{
-		context.DeadlineExceeded, daemonkit.ErrUntrusted, daemonkit.ErrNotReady,
+		context.DeadlineExceeded, daemonkit.ErrNotReady,
 		daemonkit.ErrDraining, daemonkit.ErrAbsent, daemonkit.ErrLaneClosed,
 	} {
 		if errors.Is(err, unrelated) {
@@ -605,14 +600,6 @@ func TestActivationClearsRetiredProxyStateOnlyWhenReclaiming(t *testing.T) {
 // TestActivationPublishesTheRunningBuildAsHealthDetail pins cc-squash's half of
 // daemonkit's health verb on a genuinely activated daemon: what start hands
 // c.Report is exactly the detail ReportedBuild accepts, carrying this build.
-//
-// The control-lane round trip past that is not reachable from a test binary:
-// Identity gates the control lane on Requirement{TeamID: SXKCTF23Q2,
-// SigningIdentifier: ccs}, so Client.Health against a daemon this suite starts
-// fails with ErrUntrusted — the peer is the unsigned test binary. A self-exec
-// child daemon is that same unsigned binary, so it does not lift the gate
-// either; only a Developer ID-signed build can, which is the integration
-// suite's ground, not this one's.
 func TestActivationPublishesTheRunningBuildAsHealthDetail(t *testing.T) {
 	shortHome(t)
 	srv := newTestServer(t)

@@ -11,9 +11,13 @@ var (
 	Commit = ""
 )
 
+func Running() string {
+	return dkversion.Running(Version)
+}
+
 // String returns the running build's display version.
 func String() string {
-	v := dkversion.Running(Version)
+	v := Running()
 	if Commit != "" {
 		v += " (" + Commit + ")"
 	}
