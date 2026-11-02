@@ -21,6 +21,7 @@ jobs:
           bash .github/scripts/verify-release-workflow.sh
 
   go:
+    if: github.event_name != 'pull_request'
     runs-on: macos-latest
     defaults:
       run:
@@ -89,6 +90,7 @@ jobs:
   # process-spawning run does not block them, but it runs on every push/PR. The
   # control plane is launchd-managed, so this end-to-end gate must run on macOS.
   integration:
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
