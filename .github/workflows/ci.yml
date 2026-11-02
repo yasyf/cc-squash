@@ -12,6 +12,7 @@ concurrency:
 jobs:
   workflow:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - name: Validate release workflow
@@ -23,6 +24,7 @@ jobs:
   go:
     if: github.event_name != 'pull_request'
     runs-on: macos-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: go
@@ -53,6 +55,7 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: crates
@@ -92,6 +95,7 @@ jobs:
   integration:
     if: github.event_name != 'pull_request'
     runs-on: macos-15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
